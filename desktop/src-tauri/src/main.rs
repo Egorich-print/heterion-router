@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    omniroute_desktop_lib::run();
+    heterion_router_desktop_lib::run();
 }

@@ -1,0 +1,13 @@
+[package]
+name = "heterion-router-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+aes-gcm = { workspace = true }
+scrypt = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+getrandom = { workspace = true }

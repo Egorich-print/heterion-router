@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "OmniRoute",
+  "productName": "Heterion Router",
   "version": "0.1.0",
-  "identifier": "com.omniroute.desktop",
+  "identifier": "com.heterion.router",
   "build": {
     "frontendDist": "../ui/dist",
     "devUrl": "http://localhost:5173",
@@ -30,7 +30,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/omniroute-gateway"],
+    "externalBin": ["binaries/heterion-router-gateway"],
     "android": {
       "debugApplicationIdSuffix": ".debug"
     }

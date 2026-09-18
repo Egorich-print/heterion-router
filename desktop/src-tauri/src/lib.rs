@@ -1,11 +1,11 @@
-//! OmniRoute desktop shell.
+//! Heterion Router desktop shell.
 //!
 //! Tauri v2 replaces the Electron shell. The window hosts the Svelte UI from
 //! `../ui` — the same bundle the gateway serves itself, so the desktop
 //! interface is identical to the web one.
 //!
 //! Production is self-contained: the shell spawns its own gateway sidecar
-//! (bundled `omniroute-gateway`, loopback-only on the gateway default port)
+//! (bundled `heterion-router-gateway`, loopback-only on the gateway default port)
 //! and injects its URL before any bundle code runs. The plugin kills the
 //! sidecar with the app. In dev the Vite proxy already points at a gateway,
 //! so no sidecar is spawned.
@@ -43,7 +43,7 @@ pub fn run() {
                 let gateway_url = format!("http://127.0.0.1:{port}");
                 let (mut events, child) = app
                     .shell()
-                    .sidecar("omniroute-gateway")?
+                    .sidecar("heterion-router-gateway")?
                     .env("OMNIROUTE_RUST_PORT", &port)
                     .spawn()?;
                 // The child is kept alive by the task; the plugin kills it
@@ -69,7 +69,7 @@ pub fn run() {
             }
 
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                .title("OmniRoute")
+                .title("Heterion Router")
                 .inner_size(1280.0, 860.0)
                 .resizable(true)
                 .initialization_script(&init_script)

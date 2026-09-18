@@ -1,0 +1,13 @@
+[package]
+name = "heterion-router-usage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+heterion-router-core = { workspace = true }
+heterion-router-db = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

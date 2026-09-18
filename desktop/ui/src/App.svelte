@@ -58,7 +58,7 @@
 
 {#if !key}
   <form class="login row-gap" onsubmit={unlock}>
-    <div class="brand" style="padding:0 0 6px">OmniRoute<small>Rust gateway</small></div>
+    <div class="brand" style="padding:0 0 6px">Heterion Router<small>Rust gateway</small></div>
     <p class="sub" style="margin:0">
       Paste an API key from <code>api_keys</code>. It is kept in this browser only and sent as a
       bearer token.
@@ -70,7 +70,7 @@
   <div class="layout">
     <aside class="sidebar">
       <div class="brand">
-        OmniRoute
+        Heterion Router
         <small>{health ? `${health.backend} · ${health.status}` : "checking…"}</small>
       </div>
       {#each TABS as [id, label]}

@@ -1,0 +1,324 @@
+//! DB-driven combo expansion.
+//!
+//! Ports the first slice of combo routing (`open-sse/services/combo.ts`):
+//! a combo name expands to its ordered model refs (`"provider/model"`),
+//! each resolved to a concrete `(backend, bare_model)` the gateway can
+//! serve. Strategies (`priority` vs `auto`) both follow listed order for
+//! now; scored auto-routing is deferred. Refs whose provider needs a
+//! backend or format we do not serve yet are skipped, never fabricated.
+
+use std::collections::{HashMap, HashSet};
+
+use heterion_router_providers::ProviderRegistry;
+use rusqlite::Connection;
+use serde_json::Value;
+
+/// One combo entry: a provider plus its bare model id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComboEntry {
+    /// Provider id, e.g. `"grok-cli"`.
+    pub provider: String,
+    /// Bare model id with the provider prefix stripped, e.g. `"grok-4.6"`.
+    pub model: String,
+}
+
+/// A parsed combo: ordered entries to try in sequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComboDef {
+    /// Combo name as requested by clients.
+    pub name: String,
+    /// Strategy as stored (`"priority"`, `"auto"`); order is honoured for both.
+    pub strategy: String,
+    /// Ordered entries.
+    pub entries: Vec<ComboEntry>,
+}
+
+/// Split a `"provider/model"` ref. A bare `"model"` yields an empty provider
+/// and the id unchanged.
+fn split_model_ref(model_ref: &str) -> (String, String) {
+    match model_ref.split_once('/') {
+        Some((provider, rest)) => (provider.to_string(), rest.to_string()),
+        None => (String::new(), model_ref.to_string()),
+    }
+}
+
+/// One combo entry with the dashboard metadata the router ignores.
+///
+/// `weight` steers the JS dashboard's autorouting; the Rust router honours
+/// listed order for every strategy, so it only round-trips the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RichEntry {
+    /// Provider plus bare model id, as the router sees them.
+    pub entry: ComboEntry,
+    /// Stable per-model id inside the combo (`""` when the row has none).
+    pub id: String,
+    /// Authoring weight (0..=100 by convention).
+    pub weight: i64,
+}
+
+/// Parse one combo row into its strategy plus rich entries.
+///
+/// Returns `None` when the row carries no usable model entries. This is the
+/// single parser; [`parse_combo`] strips it down to what routing needs.
+pub fn parse_combo_rich(data: &Value) -> Option<(String, Vec<RichEntry>)> {
+    let models = data.get("models")?.as_array()?;
+    let mut entries = Vec::new();
+    for item in models {
+        if item
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind != "model")
+        {
+            continue;
+        }
+        let model_ref = item.get("model").and_then(Value::as_str).unwrap_or("");
+        if model_ref.is_empty() {
+            continue;
+        }
+        let (split_provider, bare) = split_model_ref(model_ref);
+        let provider = item
+            .get("providerId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        let provider = if provider.is_empty() {
+            split_provider
+        } else {
+            provider.to_string()
+        };
+        if provider.is_empty() || bare.is_empty() {
+            continue;
+        }
+        entries.push(RichEntry {
+            entry: ComboEntry {
+                provider,
+                model: bare,
+            },
+            id: item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            weight: item.get("weight").and_then(Value::as_i64).unwrap_or(0),
+        });
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    let strategy = data
+        .get("strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("priority")
+        .to_string();
+    Some((strategy, entries))
+}
+
+/// Parse one combo row (`name`, `data` JSON) into a [`ComboDef`].
+///
+/// Returns `None` when the row carries no usable model entries.
+pub fn parse_combo(name: &str, data: &Value) -> Option<ComboDef> {
+    let (strategy, rich) = parse_combo_rich(data)?;
+    Some(ComboDef {
+        name: name.to_string(),
+        strategy,
+        entries: rich.into_iter().map(|item| item.entry).collect(),
+    })
+}
+
+/// Load every parseable combo, keyed by name.
+pub fn load_combos(conn: &Connection) -> HashMap<String, ComboDef> {
+    let mut map = HashMap::new();
+    let mut statement = match conn.prepare("SELECT name, data FROM combos") {
+        Ok(statement) => statement,
+        Err(_) => return map,
+    };
+    let rows = match statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return map,
+    };
+    for row in rows.flatten() {
+        let (name, data) = row;
+        if let Ok(json) = serde_json::from_str::<Value>(&data)
+            && let Some(combo) = parse_combo(&name, &json)
+        {
+            map.insert(name, combo);
+        }
+    }
+    map
+}
+
+/// Resolve a combo to ordered `(backend, model)` steps.
+///
+/// `available` holds the backend names the gateway actually runs. A ref maps
+/// to its own provider backend when one is configured, then to `grok-cli`
+/// for that provider, then to a shared `openai-compatible` endpoint when the
+/// registry reports an OpenAI wire format. Anything else is skipped.
+pub fn plan_steps(
+    combo: &ComboDef,
+    registry: &ProviderRegistry,
+    available: &HashSet<String>,
+) -> Vec<(String, String)> {
+    let mut steps = Vec::new();
+    for entry in &combo.entries {
+        if let Some(backend) = dispatch_backend(entry, registry, available) {
+            steps.push((backend.to_string(), entry.model.clone()));
+        }
+    }
+    steps
+}
+
+/// Backend that would serve one combo entry, given the live backends.
+///
+/// Backends are keyed by canonical provider id while combos may address a
+/// provider by alias (`ds`, `pol`, `kg`), and any OpenAI-format provider can
+/// fall back to the shared `openai-compatible` endpoint. This is the single
+/// place that decides, so the router and the admin UI never disagree.
+pub fn dispatch_backend<'a>(
+    entry: &'a ComboEntry,
+    registry: &'a ProviderRegistry,
+    available: &'a HashSet<String>,
+) -> Option<&'a str> {
+    let provider = registry
+        .canonical_id(&entry.provider)
+        .unwrap_or(entry.provider.as_str());
+    if available.contains(provider) {
+        return Some(provider);
+    }
+    if registry.is_openai_format(provider) && available.contains("openai-compatible") {
+        return Some("openai-compatible");
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn combo_json() -> Value {
+        json!({
+            "strategy": "priority",
+            "models": [
+                {"kind": "model", "model": "grok-cli/grok-4.6", "providerId": "grok-cli"},
+                {"kind": "model", "model": "openrouter/anthropic/claude-3-haiku", "providerId": "openrouter"},
+                {"kind": "other", "model": "x/y"},
+                {"kind": "model", "model": ""},
+            ],
+        })
+    }
+
+    #[test]
+    fn parses_entries_and_skips_unusable() {
+        let combo = parse_combo("c", &combo_json()).unwrap();
+        assert_eq!(combo.strategy, "priority");
+        assert_eq!(combo.entries.len(), 2);
+        assert_eq!(
+            combo.entries[0],
+            ComboEntry {
+                provider: "grok-cli".to_string(),
+                model: "grok-4.6".to_string(),
+            }
+        );
+        assert_eq!(
+            combo.entries[1],
+            ComboEntry {
+                provider: "openrouter".to_string(),
+                model: "anthropic/claude-3-haiku".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn alias_entries_dispatches_to_the_canonical_backend() {
+        let registry = ProviderRegistry::load();
+        let combo = parse_combo(
+            "c",
+            &json!({
+                "strategy": "priority",
+                "models": [
+                    {"kind": "model", "model": "pol/gemini", "providerId": "pol"},
+                    {"kind": "model", "model": "kg/kilo-auto/balanced", "providerId": "kg"},
+                    {"kind": "model", "model": "ds/deepseek-v4-flash", "providerId": "ds"},
+                ],
+            }),
+        )
+        .unwrap();
+
+        let available: HashSet<String> = ["pollinations", "kilo-gateway"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let steps = plan_steps(&combo, &registry, &available);
+
+        assert_eq!(
+            steps,
+            vec![
+                ("pollinations".to_string(), "gemini".to_string()),
+                ("kilo-gateway".to_string(), "kilo-auto/balanced".to_string()),
+            ],
+            "aliases must map onto canonical backend keys; `ds` has no executor yet"
+        );
+    }
+
+    #[test]
+    fn empty_combos_parse_to_none() {
+        assert_eq!(parse_combo("c", &json!({})), None);
+        assert_eq!(parse_combo("c", &json!({"models": []})), None);
+    }
+
+    #[test]
+    fn rich_entries_carry_id_and_weight() {
+        let (strategy, entries) = parse_combo_rich(
+            &json!({
+                "strategy": "auto",
+                "models": [
+                    {"kind": "model", "id": "m1", "model": "groq/openai/gpt-oss-20b", "providerId": "groq", "weight": 95},
+                    {"kind": "model", "model": "gemini/flash", "providerId": "gemini"},
+                    {"kind": "other", "model": "x/y"},
+                    {"kind": "model", "model": ""},
+                ],
+            }),
+        )
+        .unwrap();
+        assert_eq!(strategy, "auto");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "m1");
+        assert_eq!(entries[0].weight, 95);
+        assert_eq!(entries[0].entry.provider, "groq");
+        assert_eq!(entries[0].entry.model, "openai/gpt-oss-20b");
+        // Missing id/weight default to empty/zero rather than failing.
+        assert_eq!(entries[1].id, "");
+        assert_eq!(entries[1].weight, 0);
+    }
+
+    #[test]
+    fn plans_prefer_grok_cli_then_openai_compat() {
+        let registry = ProviderRegistry::load();
+        let combo = parse_combo("c", &combo_json()).unwrap();
+        let available: HashSet<String> = ["grok-cli", "openai-compatible", "echo"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let steps = plan_steps(&combo, &registry, &available);
+        assert_eq!(
+            steps,
+            vec![
+                ("grok-cli".to_string(), "grok-4.6".to_string()),
+                (
+                    "openai-compatible".to_string(),
+                    "anthropic/claude-3-haiku".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn plans_skip_missing_backends() {
+        let registry = ProviderRegistry::load();
+        let combo = parse_combo("c", &combo_json()).unwrap();
+        let available: HashSet<String> = ["echo"].into_iter().map(str::to_string).collect();
+        assert!(plan_steps(&combo, &registry, &available).is_empty());
+    }
+}

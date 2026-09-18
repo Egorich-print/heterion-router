@@ -1,21 +1,22 @@
-# OmniRoute Rust workspace.
+# Heterion Router workspace (axum + Tauri v2 + Svelte).
 #
-# This is the foundation of the JS -> Rust rewrite (axum + Tauri v2 + Svelte).
-# It lives next to the existing Next.js/Electron app so the port can proceed
-# crate by crate without breaking the shipping build.
+# Successor of the OmniRoute-Rust port: an OpenAI-compatible LLM gateway
+# with combo routing, a built-in dashboard and a Tauri desktop shell.
+# Sibling of Heterion (which it can target as a keyless local provider);
+# the frozen OmniRoute JS app remains the reference implementation.
 [workspace]
 resolver = "3"
 members = [
-    "crates/omniroute-config",
-    "crates/omniroute-core",
-    "crates/omniroute-crypto",
-    "crates/omniroute-db",
-    "crates/omniroute-gateway",
-    "crates/omniroute-http",
-    "crates/omniroute-providers",
-    "crates/omniroute-routing",
-    "crates/omniroute-translate",
-    "crates/omniroute-usage",
+    "crates/heterion-router-config",
+    "crates/heterion-router-core",
+    "crates/heterion-router-crypto",
+    "crates/heterion-router-db",
+    "crates/heterion-router-gateway",
+    "crates/heterion-router-http",
+    "crates/heterion-router-providers",
+    "crates/heterion-router-routing",
+    "crates/heterion-router-translate",
+    "crates/heterion-router-usage",
 ]
 # The Tauri desktop app is a heavy, standalone binary app: keep it out of the
 # fast gateway workspace/CI loop. Build it with `cargo tauri` in desktop/.
@@ -26,18 +27,18 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 license = "MIT"
-authors = ["OmniRoute Team"]
+authors = ["Heterion Router Contributors"]
 
 [workspace.dependencies]
-omniroute-config = { path = "crates/omniroute-config" }
-omniroute-core = { path = "crates/omniroute-core" }
-omniroute-crypto = { path = "crates/omniroute-crypto" }
-omniroute-db = { path = "crates/omniroute-db" }
-omniroute-http = { path = "crates/omniroute-http" }
-omniroute-providers = { path = "crates/omniroute-providers" }
-omniroute-routing = { path = "crates/omniroute-routing" }
-omniroute-translate = { path = "crates/omniroute-translate" }
-omniroute-usage = { path = "crates/omniroute-usage" }
+heterion-router-config = { path = "crates/heterion-router-config" }
+heterion-router-core = { path = "crates/heterion-router-core" }
+heterion-router-crypto = { path = "crates/heterion-router-crypto" }
+heterion-router-db = { path = "crates/heterion-router-db" }
+heterion-router-http = { path = "crates/heterion-router-http" }
+heterion-router-providers = { path = "crates/heterion-router-providers" }
+heterion-router-routing = { path = "crates/heterion-router-routing" }
+heterion-router-translate = { path = "crates/heterion-router-translate" }
+heterion-router-usage = { path = "crates/heterion-router-usage" }
 
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }

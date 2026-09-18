@@ -1,8 +1,8 @@
 {
-  "name": "omniroute-desktop",
+  "name": "heterion-router-desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "OmniRoute desktop shell (Tauri v2) over desktop/ui",
+  "description": "Heterion Router desktop shell (Tauri v2) over desktop/ui",
   "scripts": {
     "dev:ui": "npm --prefix ui run dev",
     "build:ui": "npm --prefix ui run build",

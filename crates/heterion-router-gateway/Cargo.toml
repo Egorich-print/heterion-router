@@ -1,0 +1,40 @@
+[package]
+name = "heterion-router-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+heterion-router-config = { workspace = true }
+heterion-router-core = { workspace = true }
+heterion-router-crypto = { workspace = true }
+heterion-router-db = { workspace = true }
+heterion-router-http = { workspace = true }
+heterion-router-providers = { workspace = true }
+heterion-router-routing = { workspace = true }
+heterion-router-translate = { workspace = true }
+heterion-router-usage = { workspace = true }
+axum = { workspace = true }
+rusqlite = { workspace = true }
+getrandom = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+[[bin]]
+name = "heterion-router-gateway"
+path = "src/main.rs"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+wiremock = { workspace = true }
+reqwest = { workspace = true }

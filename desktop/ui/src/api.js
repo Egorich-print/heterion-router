@@ -1,4 +1,4 @@
-const KEY_STORAGE = "omniroute_key";
+const KEY_STORAGE = "heterion_router_key";
 
 export function loadKey() {
   try {
@@ -22,7 +22,7 @@ export function saveKey(value) {
  * Same origin by default (the gateway serves this bundle itself). Inside the
  * Tauri shell there is no same origin — the shell injects its sidecar URL as
  * `window.__OMNIROUTE_GATEWAY_URL__` before any bundle code runs.
- * Precedence: build-time `VITE_GATEWAY_URL`, manual `omniroute_gateway_url`
+ * Precedence: build-time `VITE_GATEWAY_URL`, manual `heterion_router_gateway_url`
  * in localStorage (for custom ports or remote gateways), the injected
  * sidecar URL, Tauri loopback default, same origin.
  */
@@ -30,7 +30,7 @@ export function apiBase() {
   const built = import.meta.env.VITE_GATEWAY_URL;
   if (built) return built.replace(/\/$/, "");
   try {
-    const override = localStorage.getItem("omniroute_gateway_url");
+    const override = localStorage.getItem("heterion_router_gateway_url");
     if (override && override.trim()) return override.trim().replace(/\/$/, "");
   } catch {
     /* private mode: no overrides */
