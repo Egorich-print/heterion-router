@@ -1,0 +1,57 @@
+# On-demand release: gateway binaries as release assets.
+# Manual only (`workflow_dispatch`); the Tauri desktop bundle stays a local
+# build (`cargo tauri build` needs macOS for real .app/.dmg artifacts).
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build"
+        default: main
+      tag:
+        description: "Release tag (empty = gateway-YYYYMMDD-<sha>)"
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  gateway:
+    name: gateway binary (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release -p heterion-router-gateway
+      - name: Package + publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_IN: ${{ inputs.tag }}
+        run: |
+          set -eu
+          TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$TRIPLE" || { echo "cannot determine host triple"; exit 1; }
+          OUT="heterion-router-gateway-${TRIPLE}.tar.gz"
+          tar -czf "$OUT" -C target/release heterion-router-gateway
+          sha256sum "$OUT" > "${OUT}.sha256"
+          ls -la "$OUT" "${OUT}.sha256"
+          if [ -z "$TAG_IN" ]; then
+            TAG="gateway-$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+          else
+            TAG="$TAG_IN"
+          fi
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$OUT" "${OUT}.sha256" -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$OUT" "${OUT}.sha256" -R "$GITHUB_REPOSITORY" \
+              --title "Gateway ${TAG}" \
+              --notes "heterion-router-gateway binary (${TRIPLE}). Built from ${{ inputs.ref }}."
+          fi

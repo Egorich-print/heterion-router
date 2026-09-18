@@ -25,7 +25,7 @@ launchctl kickstart -k gui/$(id -u)/com.heterion.router
 
 ```sh
 npm --prefix desktop/ui install && npm --prefix desktop/ui run build
-cargo tauri --manifest-path desktop/src-tauri/Cargo.toml build
+(cd desktop && cargo tauri build)
 ```
 
 ## Как это устроено

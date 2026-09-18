@@ -1,0 +1,59 @@
+# Heterion Router CI: fast gates only. The Tauri desktop app is excluded
+# (heavy, platform-specific, needs a macOS runner for real bundles);
+# build it locally with `cargo tauri` in desktop/. Release artifacts
+# (gateway binaries) come from `release.yml` on demand.
+name: ci
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "desktop/ui/**"
+      - "rust-toolchain.toml"
+      - "scripts/ci/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**"
+      - "desktop/ui/**"
+      - "rust-toolchain.toml"
+      - "scripts/ci/**"
+      - ".github/workflows/ci.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: fmt / clippy / test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Gates (same script as local)
+        run: scripts/ci/check.sh
+
+  ui:
+    name: dashboard build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: desktop/ui/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: desktop/ui
+      - run: npm run build
+        working-directory: desktop/ui
