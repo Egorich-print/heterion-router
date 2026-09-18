@@ -1,7 +1,8 @@
-# ADR — OmniRoute-Rust
+# ADR — Heterion Router (ранее OmniRoute-Rust, см. 008)
 
 Решения, определившие архитектуру Rust-версии. Формат: контекст → решение →
-следствия. Один файл — одно решение.
+следствия. Один файл — одно решение. ADR-001..007 — фиксация фактов эпохи
+OmniRoute, не переписываются.
 
 Дата старта: 2026-09-18.
 
@@ -14,6 +15,7 @@
 | [005](ADR-005-api-keys-rust-issued.md)          | API-ключи выпускаются в Rust в JS-форме                       |
 | [006](ADR-006-supervised-restart-only.md)       | Рестарт — только под супервизором                             |
 | [007](ADR-007-desktop-sidecar-shared-bundle.md) | Десктоп — sidecar + тот же бандл                              |
+| [008](ADR-008-rename-to-heterion-router.md)     | Переименование в Heterion Router, новый репозиторий           |
 
 ## Отклонённые / отложенные
 

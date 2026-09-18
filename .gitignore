@@ -1,0 +1,28 @@
+# Rust (lockfiles of this binary workspace stay tracked by design)
+/target/
+**/target/
+**/*.rs.bk
+
+# Tauri
+desktop/src-tauri/binaries/
+*.app
+*.dmg
+*.AppImage
+
+# Node (desktop/ui only — no JS toolchain at the root by design)
+desktop/ui/node_modules/
+desktop/ui/dist/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs / OS / IDE
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
