@@ -21,7 +21,8 @@ export function saveKey(value) {
  *
  * Same origin by default (the gateway serves this bundle itself). Inside the
  * Tauri shell there is no same origin — the shell injects its sidecar URL as
- * `window.__OMNIROUTE_GATEWAY_URL__` before any bundle code runs.
+ * `window.__HETERION_ROUTER_GATEWAY_URL__` (legacy
+ * `window.__OMNIROUTE_GATEWAY_URL__` still honored) before any bundle code runs.
  * Precedence: build-time `VITE_GATEWAY_URL`, manual `heterion_router_gateway_url`
  * in localStorage (for custom ports or remote gateways), the injected
  * sidecar URL, Tauri loopback default, same origin.
@@ -35,8 +36,10 @@ export function apiBase() {
   } catch {
     /* private mode: no overrides */
   }
-  if (typeof window !== "undefined" && window.__OMNIROUTE_GATEWAY_URL__) {
-    return String(window.__OMNIROUTE_GATEWAY_URL__).replace(/\/$/, "");
+  if (typeof window !== "undefined") {
+    const injected =
+      window.__HETERION_ROUTER_GATEWAY_URL__ ?? window.__OMNIROUTE_GATEWAY_URL__;
+    if (injected) return String(injected).replace(/\/$/, "");
   }
   if (typeof window !== "undefined" && window.__TAURI_INTERNALS__) {
     return "http://127.0.0.1:20128";

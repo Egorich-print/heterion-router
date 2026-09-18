@@ -9,11 +9,22 @@
 use std::process::Stdio;
 
 /// launchd label of this service. Overridable for tests and custom installs.
+/// `HETERION_ROUTER_SERVICE_LABEL` wins; `OMNIROUTE_SERVICE_LABEL` is the
+/// one-cycle fallback for operators migrating from OmniRoute.
 pub fn service_label() -> String {
-    std::env::var("OMNIROUTE_SERVICE_LABEL")
-        .ok()
-        .filter(|label| !label.trim().is_empty())
-        .unwrap_or_else(|| "com.heterion-router.rust".to_string())
+    service_label_from(&|key| std::env::var(key).ok())
+}
+
+/// Pure precedence core (tested without touching the process environment).
+fn service_label_from(get: &dyn Fn(&str) -> Option<String>) -> String {
+    for key in ["HETERION_ROUTER_SERVICE_LABEL", "OMNIROUTE_SERVICE_LABEL"] {
+        if let Some(label) = get(key)
+            && !label.trim().is_empty()
+        {
+            return label;
+        }
+    }
+    "com.heterion.router".to_string()
 }
 
 /// Numeric uid of the current user, via `id -u`.
@@ -73,9 +84,33 @@ mod tests {
     #[test]
     fn bogus_label_is_not_supervised() {
         assert!(!is_supervised(
-            "com.heterion-router.definitely-not-a-job",
+            "com.heterion.router.definitely-not-a-job",
             "0"
         ));
+    }
+
+    #[test]
+    fn label_prefers_new_name_then_legacy_then_default() {
+        use std::collections::HashMap;
+        fn label(pairs: &[(&str, &str)]) -> String {
+            let vars: HashMap<String, String> = pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+            service_label_from(&|key| vars.get(key).cloned())
+        }
+        assert_eq!(label(&[]), "com.heterion.router");
+        assert_eq!(
+            label(&[("OMNIROUTE_SERVICE_LABEL", "com.omniroute.rust")]),
+            "com.omniroute.rust"
+        );
+        assert_eq!(
+            label(&[
+                ("HETERION_ROUTER_SERVICE_LABEL", "com.heterion.router"),
+                ("OMNIROUTE_SERVICE_LABEL", "com.omniroute.rust"),
+            ]),
+            "com.heterion.router"
+        );
     }
 
     #[test]

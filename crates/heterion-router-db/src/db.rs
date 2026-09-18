@@ -60,15 +60,20 @@ impl Db {
         Self::from_connection(conn)
     }
 
-    /// Resolve the data directory with the same precedence as the JS server:
-    /// `DATA_DIR` env → legacy `~/.heterion-router` if it exists →
-    /// `$XDG_CONFIG_HOME/heterion-router` → `~/.heterion-router` (`%APPDATA%/heterion-router`
-    /// on Windows).
+    /// Resolve the data directory with the same precedence as the JS server,
+    /// renamed for Heterion Router: `HETERION_ROUTER_DATA_DIR` → `DATA_DIR` →
+    /// `~/.heterion-router` if it exists → legacy `~/.omniroute` (the frozen
+    /// OmniRoute reference) if it exists → `$XDG_CONFIG_HOME/heterion-router`
+    /// → `~/.heterion-router` (`%APPDATA%/heterion-router` on Windows).
+    /// The legacy step means a migrated binary keeps working against an
+    /// unmigrated directory; the cutover copies the data instead.
     pub fn data_dir() -> PathBuf {
-        if let Ok(value) = std::env::var("DATA_DIR")
-            && !value.trim().is_empty()
-        {
-            return PathBuf::from(value);
+        for key in ["HETERION_ROUTER_DATA_DIR", "DATA_DIR"] {
+            if let Ok(value) = std::env::var(key)
+                && !value.trim().is_empty()
+            {
+                return PathBuf::from(value);
+            }
         }
 
         #[cfg(windows)]
@@ -84,7 +89,11 @@ impl Db {
         #[cfg(not(windows))]
         {
             if let Ok(home) = std::env::var("HOME") {
-                let legacy = Path::new(&home).join(".heterion-router");
+                let current = Path::new(&home).join(".heterion-router");
+                if current.is_dir() {
+                    return current;
+                }
+                let legacy = Path::new(&home).join(".omniroute");
                 if legacy.is_dir() {
                     return legacy;
                 }
@@ -95,7 +104,7 @@ impl Db {
                 return Path::new(&xdg).join("heterion-router");
             }
             if let Ok(home) = std::env::var("HOME") {
-                return Path::new(&home).join("heterion-router");
+                return Path::new(&home).join(".heterion-router");
             }
             PathBuf::from(".heterion-router")
         }
@@ -121,12 +130,27 @@ mod tests {
 
     #[test]
     fn data_dir_prefers_env() {
+        for key in ["HETERION_ROUTER_DATA_DIR", "DATA_DIR"] {
+            unsafe { std::env::remove_var(key) };
+        }
         unsafe { std::env::set_var("DATA_DIR", "/tmp/heterion-router-test-dir") };
         assert_eq!(
             Db::data_dir(),
             PathBuf::from("/tmp/heterion-router-test-dir")
         );
-        unsafe { std::env::remove_var("DATA_DIR") };
+        unsafe {
+            std::env::set_var(
+                "HETERION_ROUTER_DATA_DIR",
+                "/tmp/heterion-router-primary-dir",
+            )
+        };
+        assert_eq!(
+            Db::data_dir(),
+            PathBuf::from("/tmp/heterion-router-primary-dir")
+        );
+        for key in ["HETERION_ROUTER_DATA_DIR", "DATA_DIR"] {
+            unsafe { std::env::remove_var(key) };
+        }
     }
 
     #[test]

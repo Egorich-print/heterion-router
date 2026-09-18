@@ -4,8 +4,8 @@
 //! origin as the API so the "main page" keeps living at the gateway's own
 //! address (`http://localhost:20128/`) exactly like the JS dashboard did.
 //!
-//! Set `OMNIROUTE_UI_DIR` to point at another build. When the directory is
-//! missing the gateway stays API-only and `/` explains how to build the UI,
+//! Set `HETERION_ROUTER_UI_DIR` (`OMNIROUTE_UI_DIR` still honored) to point
+//! at another build. When the directory is missing the gateway stays API-only and `/` explains how to build the UI,
 //! rather than 404ing silently.
 
 use std::path::{Path, PathBuf};
@@ -20,10 +20,12 @@ use crate::AppState;
 
 /// Resolve the UI directory: explicit env var, else the build in this repo.
 pub fn ui_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("OMNIROUTE_UI_DIR")
-        && !dir.trim().is_empty()
-    {
-        return Some(PathBuf::from(dir));
+    for key in ["HETERION_ROUTER_UI_DIR", "OMNIROUTE_UI_DIR"] {
+        if let Ok(dir) = std::env::var(key)
+            && !dir.trim().is_empty()
+        {
+            return Some(PathBuf::from(dir));
+        }
     }
     let default = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../desktop/ui/dist");
     default.is_dir().then_some(default)
@@ -36,7 +38,7 @@ pub async fn serve(State(state): State<AppState>, uri: Uri) -> Response {
             StatusCode::NOT_FOUND,
             [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
             "dashboard not built: run `npm install && npm run build` in desktop/ui, \
-             or set OMNIROUTE_UI_DIR",
+             or set HETERION_ROUTER_UI_DIR",
         )
             .into_response();
     };

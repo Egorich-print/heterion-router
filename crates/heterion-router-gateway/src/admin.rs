@@ -369,7 +369,8 @@ async fn set_key_revoked(state: AppState, id: &str, revoked: bool) -> (StatusCod
 ///
 /// The dashboard offers this after connection activity changes, which only
 /// take effect on restart. Succeeds only when launchd supervises us
-/// (`OMNIROUTE_SERVICE_LABEL`, default `com.heterion-router.rust`): elsewhere it
+/// (`HETERION_ROUTER_SERVICE_LABEL`, legacy `OMNIROUTE_SERVICE_LABEL`,
+/// default `com.heterion.router`): elsewhere it
 /// answers 409 so a dev-process operator never kills their own shell by
 /// accident. The restart re-execs the same binary ~2s after the 202, so
 /// in-flight requests are dropped — call it from a quiet moment.

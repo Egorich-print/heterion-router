@@ -15,13 +15,18 @@ use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::CommandEvent;
 
 /// Sidecar port: the gateway's own default. The launchd service overrides to
-/// 20128, so the two never collide. Overridable via `OMNIROUTE_SIDECAR_PORT`.
+/// 20128, so the two never collide. Overridable via `HETERION_ROUTER_SIDECAR_PORT`
+/// (`OMNIROUTE_SIDECAR_PORT` still honored).
 const SIDECAR_PORT: &str = "20129";
 
 fn sidecar_port() -> String {
-    std::env::var("OMNIROUTE_SIDECAR_PORT")
-        .ok()
-        .filter(|port| !port.trim().is_empty())
+    ["HETERION_ROUTER_SIDECAR_PORT", "OMNIROUTE_SIDECAR_PORT"]
+        .iter()
+        .find_map(|key| {
+            std::env::var(key)
+                .ok()
+                .filter(|port| !port.trim().is_empty())
+        })
         .unwrap_or_else(|| SIDECAR_PORT.to_string())
 }
 
@@ -44,6 +49,7 @@ pub fn run() {
                 let (mut events, child) = app
                     .shell()
                     .sidecar("heterion-router-gateway")?
+                    .env("HETERION_ROUTER_PORT", &port)
                     .env("OMNIROUTE_RUST_PORT", &port)
                     .spawn()?;
                 // The child is kept alive by the task; the plugin kills it
@@ -65,7 +71,8 @@ pub fn run() {
                         }
                     }
                 });
-                init_script = format!("window.__OMNIROUTE_GATEWAY_URL__={gateway_url:?};");
+                init_script =
+                    format!("window.__HETERION_ROUTER_GATEWAY_URL__={gateway_url:?};");
             }
 
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))

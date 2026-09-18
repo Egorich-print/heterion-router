@@ -47,7 +47,8 @@ fn grok_tokens(db: &Db, data_dir: &std::path::Path) -> Vec<String> {
 /// model: combo names expand from the database, `provider/model` ids map to
 /// the provider backend, `grok-*` prefers grok-cli, and everything else uses
 /// an explicit OpenAI-compatible endpoint. The echo backend is a test double
-/// and is only registered when `OMNIROUTE_ENABLE_ECHO=1` — it must never
+/// and is only registered when `HETERION_ROUTER_ENABLE_ECHO=1`
+/// (`OMNIROUTE_ENABLE_ECHO` still honored) — it must never
 /// silently answer production traffic.
 type Selected = (Arc<dyn ChatBackend>, Arc<ProviderRegistry>, Vec<String>);
 
@@ -56,8 +57,11 @@ fn select_backend(
     data_dir: &std::path::Path,
 ) -> Result<Selected, Box<dyn std::error::Error>> {
     let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
-    let echo_enabled = std::env::var("OMNIROUTE_ENABLE_ECHO")
-        .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"));
+    let echo_enabled = ["HETERION_ROUTER_ENABLE_ECHO", "OMNIROUTE_ENABLE_ECHO"]
+        .iter()
+        .any(|key| {
+            std::env::var(key).is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes"))
+        });
     if echo_enabled {
         backends.insert("echo".to_string(), Arc::new(EchoBackend));
     }
