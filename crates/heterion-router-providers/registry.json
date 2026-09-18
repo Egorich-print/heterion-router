@@ -2786,6 +2786,17 @@
     ]
   },
   {
+    "id": "heterion-local",
+    "alias": "heterion",
+    "format": "openai",
+    "executor": "default",
+    "auth_type": "none",
+    "base_url": "http://127.0.0.1:8080/v1",
+    "models": [
+      { "id": "default", "target_format": null }
+    ]
+  },
+  {
     "id": "huggingchat",
     "alias": "huggingchat",
     "format": "openai",

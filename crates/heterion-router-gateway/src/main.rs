@@ -52,6 +52,22 @@ fn grok_tokens(db: &Db, data_dir: &std::path::Path) -> Vec<String> {
 /// silently answer production traffic.
 type Selected = (Arc<dyn ChatBackend>, Arc<ProviderRegistry>, Vec<String>);
 
+/// Base URL for a provider: `HETERION_LOCAL_BASE_URL` overrides the registry
+/// entry for `heterion-local` (a same-machine Heterion server rarely listens
+/// on the default port); every other provider comes from the registry as-is.
+fn provider_base_url_from(
+    registry: &ProviderRegistry,
+    provider: &str,
+    local_override: Option<&str>,
+) -> Option<String> {
+    if provider == "heterion-local"
+        && let Some(url) = local_override.filter(|url| !url.trim().is_empty())
+    {
+        return Some(url.to_string());
+    }
+    registry.base_url(provider).map(str::to_string)
+}
+
 fn select_backend(
     db: Arc<Db>,
     data_dir: &std::path::Path,
@@ -111,7 +127,12 @@ fn select_backend(
         if backends.contains_key(&provider) {
             continue;
         }
-        let Some(base_url) = registry.base_url(&provider) else {
+        let local_override = (provider == "heterion-local")
+            .then(|| std::env::var("HETERION_LOCAL_BASE_URL").ok())
+            .flatten();
+        let Some(base_url) =
+            provider_base_url_from(&registry, &provider, local_override.as_deref())
+        else {
             continue;
         };
 
@@ -202,7 +223,7 @@ fn select_backend(
             continue;
         }
         let count = tokens.len();
-        match ProviderOpenAiBackend::new(provider.clone(), resolve_chat_url(base_url), tokens) {
+        match ProviderOpenAiBackend::new(provider.clone(), resolve_chat_url(&base_url), tokens) {
             Ok(backend) => {
                 if count == 0 {
                     tracing::info!("backend available: {provider} ({base_url}, keyless)");
@@ -284,4 +305,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("heterion-router-gateway listening on http://{addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn registry() -> ProviderRegistry {
+        ProviderRegistry::load()
+    }
+
+    #[test]
+    fn heterion_local_url_prefers_env_then_registry() {
+        let registry = registry();
+        assert_eq!(
+            provider_base_url_from(&registry, "heterion-local", None).as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
+        assert_eq!(
+            provider_base_url_from(
+                &registry,
+                "heterion-local",
+                Some("http://192.168.1.10:8080/v1")
+            )
+            .as_deref(),
+            Some("http://192.168.1.10:8080/v1")
+        );
+        assert_eq!(
+            provider_base_url_from(&registry, "heterion-local", Some("  ")).as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
+    }
+
+    #[test]
+    fn other_providers_ignore_the_heterion_override() {
+        let registry = registry();
+        let from_registry = provider_base_url_from(&registry, "openai", None);
+        assert_eq!(
+            provider_base_url_from(&registry, "openai", Some("http://192.168.1.10:8080/v1")),
+            from_registry
+        );
+    }
 }

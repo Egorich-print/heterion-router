@@ -232,6 +232,23 @@ mod tests {
     }
 
     #[test]
+    fn heterion_local_is_a_keyless_openai_sibling() {
+        let registry = registry();
+        let entry = registry
+            .get("heterion-local")
+            .expect("heterion-local registered");
+        assert_eq!(entry.format.as_deref(), Some("openai"));
+        assert_eq!(entry.executor.as_deref(), Some("default"));
+        assert!(registry.allows_keyless("heterion-local"));
+        assert!(registry.is_openai_format("heterion-local"));
+        assert_eq!(registry.canonical_id("heterion"), Some("heterion-local"));
+        assert_eq!(
+            registry.base_url("heterion-local"),
+            Some("http://127.0.0.1:8080/v1")
+        );
+    }
+
+    #[test]
     fn registry_loads_and_is_nontrivial() {
         let registry = registry();
         assert!(registry.len() >= 200, "len = {}", registry.len());
