@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Added
+- **`POST /v1/responses`** — поверхность Responses API, чтобы Responses-only
+  клиенты (grok CLI, Codex) могли указать на шлюз: перевод запроса
+  (instructions, input-строка/массив, function_call/_output, Responses-tools)
+  в чат-форму, тот же бэкенд-механизм, стрим как `response.*`-события.
 - Провайдер `heterion-local`: keyless OpenAI-совместимый бэкенд на Heterion-сервер
   (`http://127.0.0.1:8080/v1`, override `HETERION_LOCAL_BASE_URL`); model id — транзит.
 - `HETERION_ROUTER_*` env; `HETERION_LOCAL_BASE_URL`; data dir `~/.heterion-router`;

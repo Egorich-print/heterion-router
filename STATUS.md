@@ -20,6 +20,8 @@ License: MIT
 - **Шлюз** (`heterion-router-gateway`, axum): OpenAI-совместимые `/v1/chat/completions`
   и `/v1/models`, стриминг SSE, роутинг по комбо из БД, breaker-классификация
   (4xx не роняет провайдера), failover по кандидатам.
+- **`/v1/responses`** — поверхность Responses API (grok CLI / Codex клиенты):
+  перевод туда-обратно, стрим как `response.*`-события; проверено живьём через комбо.
 - **Бэкенды:** `openai`-совместимые, `gemini` (персистентные thought signatures),
   `openai-responses` (deepseek), keyless-провайдеры, `grok-cli`,
   **`heterion-local`** (keyless на Heterion-сервер, нативная поддержка v1).
