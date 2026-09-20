@@ -618,6 +618,7 @@ dependencies = [
  "heterion-router-usage",
  "hex",
  "http-body-util",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

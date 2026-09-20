@@ -25,7 +25,10 @@ License: MIT
   **`heterion-local`** (keyless на Heterion-сервер, нативная поддержка v1).
 - **Дашборд** (Svelte 5): Overview, Combos, Providers, Keys, Usage, Logs, Playground.
 - **Admin-API:** `/api/overview|combos|connections|keys|usage|logs|restart` (см. ADR-004).
-- **Десктоп** (Tauri v2, `com.heterion.router`): тот же бандл + sidecar шлюза на `:20129`.
+- **Десктоп** (Tauri v2, `com.heterion.router`): тот же бандл + sidecar шлюза
+  на `:20129`. Single-instance guard (второй запуск фокусирует окно);
+  parent-watch — sidecar сам выходит, когда приложение умерло (quit,
+  force-quit, краш), утёкших шлюзов на порту больше нет.
 - **Сервис:** launchd `com.heterion.router`, порт `20128`, данные `~/.heterion-router`
   (legacy `~/.omniroute` резолвится автоматически).
 
@@ -45,9 +48,11 @@ cargo fmt --all -- --check    чисто
 
 ## Ближайшие шаги
 
-1. Single-instance guard для десктопа (второй инстанс упирается в занятый порт sidecar'а).
-2. Cutover рантайма: копия `~/.omniroute` → `~/.heterion-router`, смена plist (Stage 3).
-3. Уборка копии данных после burn-in — только с явного подтверждения.
+1. Подключить `heterion-local` в живую БД (Heterion-сервер был down;
+   SQL для wiring — в README).
+2. Уборка копии данных (`~/.omniroute` 2.3 ГБ) после burn-in — только
+   с явного подтверждения.
+3. Parent-watch в шлюзе для launchd-сервиса не нужен (маркер не ставится).
 
 ## Документы
 

@@ -7,6 +7,16 @@
   (`http://127.0.0.1:8080/v1`, override `HETERION_LOCAL_BASE_URL`); model id — транзит.
 - `HETERION_ROUTER_*` env; `HETERION_LOCAL_BASE_URL`; data dir `~/.heterion-router`;
   сервис `com.heterion.router`.
+- **Single-instance guard** (`tauri-plugin-single-instance`, первый плагин):
+  второй запуск фокусирует существующее окно и не доходит до spawn sidecar'а.
+- **Parent-watch шлюза**: sidecar получает pid приложения
+  (`HETERION_ROUTER_PARENT_PID`) и сам выходит, когда родитель умер — quit,
+  force-quit и краш больше не оставляют утёкший gateway на `:20129`.
+
+### Fixed
+- Второй инстанс десктопа падал на `AddrInUse` sidecar'а (порт занят).
+- Quit приложения оставлял утёкший sidecar-шлюз без родителя (воспроизведено
+  на живой системе; следствием был сломанный дашборд при следующем запуске).
 
 ### Changed
 - Проект переименован: OmniRoute-Rust → Heterion Router (ADR-008). Крейты

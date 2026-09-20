@@ -6,11 +6,12 @@
 //!
 //! Production is self-contained: the shell spawns its own gateway sidecar
 //! (bundled `heterion-router-gateway`, loopback-only on the gateway default port)
-//! and injects its URL before any bundle code runs. The plugin kills the
-//! sidecar with the app. In dev the Vite proxy already points at a gateway,
-//! so no sidecar is spawned.
+//! and injects its URL before any bundle code runs. The sidecar gets this
+//! process's pid and exits on its own once the parent is gone, so no app
+//! death leaves an orphaned gateway holding the sidecar port. In dev the
+//! Vite proxy already points at a gateway, so no sidecar is spawned.
 
-use tauri::{WebviewUrl, WebviewWindowBuilder};
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_shell::ShellExt;
 use tauri_plugin_shell::process::CommandEvent;
 
@@ -34,6 +35,14 @@ fn sidecar_port() -> String {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Must stay the FIRST plugin: a second launch never reaches `setup`,
+        // so it cannot spawn a duplicate sidecar whose port is already taken
+        // (the pre-guard crash was `AddrInUse` on the sidecar port).
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             app.handle().plugin(
@@ -51,6 +60,7 @@ pub fn run() {
                     .sidecar("heterion-router-gateway")?
                     .env("HETERION_ROUTER_PORT", &port)
                     .env("OMNIROUTE_RUST_PORT", &port)
+                    .env("HETERION_ROUTER_PARENT_PID", std::process::id().to_string())
                     .spawn()?;
                 // The child is kept alive by the task; the plugin kills it
                 // with the app. Its output streams into the log.

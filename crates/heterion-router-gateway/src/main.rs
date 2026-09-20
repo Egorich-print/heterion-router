@@ -260,6 +260,38 @@ fn select_backend(
     Ok((Arc::new(routing), registry, names))
 }
 
+/// When spawned as a Tauri sidecar, the app passes its pid; the gateway exits
+/// once the parent is gone, so no app death (quit, force-quit, crash) leaves
+/// an orphaned gateway holding the sidecar port. Not set under launchd — the
+/// service must outlive unrelated processes.
+fn watch_parent() {
+    let Some(pid) = std::env::var("HETERION_ROUTER_PARENT_PID")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+    else {
+        return;
+    };
+    std::thread::spawn(move || {
+        tracing::info!("watching parent {pid} every 2s");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            if parent_gone(pid) {
+                // No logging here: the parent's death usually took the log
+                // pipe with it, and a write to that pipe from this thread
+                // must never delay the exit.
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+/// POSIX liveness probe: `kill(pid, 0)` fails with ESRCH once the process is
+/// gone; any other failure (e.g. EPERM) still means "alive".
+fn parent_gone(pid: u32) -> bool {
+    let status = unsafe { libc::kill(pid as i32, 0) };
+    status != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayConfig::from_env();
@@ -271,6 +303,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with_target(false)
         .init();
+
+    watch_parent();
 
     let db_path = config.data_dir.join("storage.sqlite");
     let db = Db::open(&db_path)?;
@@ -345,5 +379,27 @@ mod tests {
             provider_base_url_from(&registry, "openai", Some("http://192.168.1.10:8080/v1")),
             from_registry
         );
+    }
+}
+
+#[cfg(test)]
+mod parent_watch_tests {
+    use super::*;
+
+    #[test]
+    fn live_process_is_not_gone() {
+        assert!(!parent_gone(std::process::id()));
+    }
+
+    #[test]
+    fn absent_process_is_gone() {
+        assert!(parent_gone(999_999_999));
+    }
+
+    #[test]
+    fn watch_parent_without_marker_is_a_no_op() {
+        // No HETERION_ROUTER_PARENT_PID in the environment: the call must not
+        // spawn anything and must return immediately.
+        watch_parent();
     }
 }

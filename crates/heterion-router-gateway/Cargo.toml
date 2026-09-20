@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+libc = "0.2"
 heterion-router-config = { workspace = true }
 heterion-router-core = { workspace = true }
 heterion-router-crypto = { workspace = true }
