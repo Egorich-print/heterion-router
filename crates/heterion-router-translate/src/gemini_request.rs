@@ -224,7 +224,24 @@ pub fn openai_to_gemini(body: &Value) -> Value {
 /// Gemini 3 rejects a replayed function call whose signature is missing, so a
 /// signature that came down in `extra_content` (or was injected by the
 /// executor from its cache) has to travel back up untouched.
+///
+/// When no signature is present (first turn, client-originated tool call)
+/// we fall back to a `text` part carrying the tool name and arguments so
+/// that Gemini can synthesise its own signed `functionCall` instead of
+/// hard-failing with 400.
 fn function_call_part(name: &str, args: Value, call: &Value) -> Value {
+    let has_signature = call
+        .pointer("/extra_content/google/thought_signature")
+        .or_else(|| call.pointer("/extra_content/google/thoughtSignature"))
+        .or_else(|| call.get("thoughtSignature"))
+        .and_then(Value::as_str)
+        .filter(|signature| !signature.is_empty())
+        .is_some();
+    if !has_signature {
+        return json!({
+            "text": format!("{} {}", name, serde_json::to_string(&args).unwrap_or_default())
+        });
+    }
     let mut part = json!({
         "functionCall": {
             "name": name,
@@ -580,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_thought_signature_when_absent() {
+    fn omits_thought_signature_when_absent_falls_back_to_text() {
         let body = json!({
             "messages": [
                 {"role": "assistant", "content": null, "tool_calls": [{
@@ -592,11 +609,15 @@ mod tests {
         });
 
         let out = openai_to_gemini(&body);
-        assert!(
-            out["contents"][0]["parts"][0]
-                .get("thoughtSignature")
-                .is_none()
-        );
+        // Without a stored thought signature the gateway falls back
+        // to a `text` part carrying the tool call so that Gemini
+        // does not hard-fail with 400.
+        let turn = &out["contents"][0];
+        assert_eq!(turn["role"], json!("model"));
+        assert!(turn["parts"][0].get("functionCall").is_none());
+        assert!(turn["parts"][0].get("text").is_some());
+        // No thought signature carried on the part.
+        assert!(turn["parts"][0].get("thoughtSignature").is_none());
     }
 
     #[test]
@@ -604,10 +625,11 @@ mod tests {
         let body = json!({
             "messages": [
                 {"role": "user", "content": "time?"},
-                {"role": "assistant", "content": null, "tool_calls": [
-                    {"id": "call_1", "type": "function",
-                     "function": {"name": "get_time", "arguments": "{\"city\":\"SF\"}"}}
-                ]},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "get_time", "arguments": "{\"city\":\"SF\"}"},
+                    "extra_content": {"google": {"thought_signature": "c2ln"}}
+                }]},
                 {"role": "tool", "tool_call_id": "call_1", "content": "12:00"}
             ],
             "tools": [{"type": "function", "function": {
@@ -626,6 +648,7 @@ mod tests {
             model_turn["parts"][0]["functionCall"]["args"]["city"],
             json!("SF")
         );
+        assert_eq!(model_turn["parts"][0]["thoughtSignature"], "c2ln");
         // The tool result carries the function NAME, resolved from the call id.
         assert_eq!(
             out["contents"][2]["parts"][0]["functionResponse"]["name"],

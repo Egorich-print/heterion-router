@@ -31,6 +31,11 @@ pub struct GeminiBackend {
     tokens: Vec<String>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     signatures: std::sync::Arc<ThoughtSignatures>,
+    /// `message_id` from the last Gemini `message_start`, used to form
+    /// the `{message_id}-{index}` ids that `record_signatures` mints
+    /// and `inject_signatures` looks up when the client's own
+    /// `call.id` is absent from the store.
+    last_message_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 /// Tool-call id → Gemini thought signature, kept across a tool round trip.
@@ -185,7 +190,11 @@ impl ThoughtSignatures {
 }
 
 /// Remember the signatures carried by translated tool calls.
-fn record_signatures(chunk: &Value, signatures: &ThoughtSignatures) {
+/// Returns the `message_id` extracted from the first tool call id
+/// (`{message_id}-{index}`), so callers can feed it back into
+/// `inject_signatures` for the next round trip.
+fn record_signatures(chunk: &Value, signatures: &ThoughtSignatures) -> Option<String> {
+    let mut message_id: Option<String> = None;
     let calls = chunk["choices"][0]["delta"]["tool_calls"]
         .as_array()
         .into_iter()
@@ -198,12 +207,28 @@ fn record_signatures(chunk: &Value, signatures: &ThoughtSignatures) {
         ) else {
             continue;
         };
+        // id = "{message_id}-{index}"; extract the message_id once.
+        if message_id.is_none() {
+            message_id = id.rsplit_once('-').map(|(m, _)| m.to_string());
+        }
         signatures.record(id, signature);
     }
+    message_id
 }
 
 /// Fill in signatures a client dropped from replayed tool calls.
-fn inject_signatures(request: &mut ChatCompletionRequest, signatures: &ThoughtSignatures) {
+///
+/// The client's own `call.id` is tried first (it matches when the
+/// client faithfully echoed the gateway-generated id). When it does
+/// not, the store is also probed with the gateway-minted form
+/// `{message_id}-{index}` so that signatures survived from a
+/// previous gateway turn are recovered even when the client rebuilt
+/// its tool calls with fresh ids.
+fn inject_signatures(
+    request: &mut ChatCompletionRequest,
+    signatures: &ThoughtSignatures,
+    last_message_id: Option<String>,
+) {
     for message in &mut request.messages {
         if message.role != "assistant" {
             continue;
@@ -211,18 +236,21 @@ fn inject_signatures(request: &mut ChatCompletionRequest, signatures: &ThoughtSi
         let Some(calls) = message.tool_calls.as_mut().and_then(Value::as_array_mut) else {
             continue;
         };
-        for call in calls {
+        for (index, call) in calls.iter_mut().enumerate() {
             let carried = call
                 .pointer("/extra_content/google/thought_signature")
                 .or_else(|| call.get("thoughtSignature"))
                 .is_some();
-            let Some(id) = call.get("id").and_then(Value::as_str) else {
-                continue;
-            };
             if carried {
                 continue;
             }
-            let Some(signature) = signatures.get(id) else {
+            let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+            let signature = signatures.get(id).or_else(|| {
+                last_message_id
+                    .as_ref()
+                    .and_then(|mid| signatures.get(&format!("{mid}-{index}")))
+            });
+            let Some(signature) = signature else {
                 continue;
             };
             if let Some(object) = call.as_object_mut() {
@@ -269,6 +297,7 @@ impl GeminiBackend {
             tokens,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             signatures,
+            last_message_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -303,7 +332,11 @@ impl GeminiBackend {
         if request.messages.is_empty() {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
-        inject_signatures(&mut request, &self.signatures);
+        inject_signatures(
+            &mut request,
+            &self.signatures,
+            self.last_message_id.lock().unwrap().clone(),
+        );
         let body = Self::gemini_body(&request);
         let url = self.method_url(&request.model, true);
         let key = self.next_token().to_string();
@@ -330,7 +363,8 @@ impl GeminiBackend {
                     Err(_) => continue,
                 };
                 for chunk_json in convert_event(&mut translator, &data, ids::unix_seconds()) {
-                    record_signatures(&chunk_json, &self.signatures);
+                    *self.last_message_id.lock().unwrap() =
+                        record_signatures(&chunk_json, &self.signatures);
                     if let Some(stream_chunk) = openai_chunk_to_stream_chunk(&chunk_json)
                         && tx.send(Ok(stream_chunk)).await.is_err()
                     {
@@ -359,7 +393,11 @@ impl ChatBackend for GeminiBackend {
         if request.messages.is_empty() {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
-        inject_signatures(&mut request, &self.signatures);
+        inject_signatures(
+            &mut request,
+            &self.signatures,
+            self.last_message_id.lock().unwrap().clone(),
+        );
         let body = Self::gemini_body(&request);
         let url = self.method_url(&request.model, false);
 
@@ -392,7 +430,12 @@ impl ChatBackend for GeminiBackend {
                 last_error = Some(GatewayError::Upstream(message.to_string()));
                 continue;
             }
-            return Ok(collapse_chunks(&request.model, &payload, &self.signatures));
+            return Ok(collapse_chunks(
+                &request.model,
+                &payload,
+                &self.signatures,
+                self.last_message_id.as_ref(),
+            ));
         }
         Err(last_error.unwrap_or_else(|| {
             GatewayError::Upstream("gemini: all credentials failed".to_string())
@@ -417,11 +460,20 @@ fn collapse_chunks(
     model: &str,
     payload: &Value,
     signatures: &ThoughtSignatures,
+    last_message_id: &std::sync::Mutex<Option<String>>,
 ) -> ChatCompletionResponse {
     let mut state = GeminiState::default();
     let chunks = convert_event(&mut state, payload, ids::unix_seconds());
+    let mut message_id: Option<String> = None;
     for chunk in &chunks {
-        record_signatures(chunk, signatures);
+        if message_id.is_none() {
+            message_id = record_signatures(chunk, signatures);
+        } else {
+            record_signatures(chunk, signatures);
+        }
+    }
+    if let Some(message_id) = message_id {
+        *last_message_id.lock().unwrap() = Some(message_id);
     }
 
     let mut text = String::new();
