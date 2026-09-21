@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Added
+- **Gemini thought-signature replay**: `GeminiBackend` хранит
+  `thoughtSignature` из upstream `message_start`/`functionCall`
+  в персистентном `gemini-thought-signatures.jsonl`. При replay
+  tool_calls подбирает signature по клиенскому id **и** по
+  мятному `{message_id}-{index}`. Когда signature нет (первый
+  вызов) — `functionCall` заменяется на `text`-часть, чтобы
+  Gemini не отказывал с `400 INVALID_ARGUMENT`.
 - **`POST /v1/responses`** — поверхность Responses API, чтобы Responses-only
   клиенты (grok CLI, Codex) могли указать на шлюз: перевод запроса
   (instructions, input-строка/массив, function_call/_output, Responses-tools)

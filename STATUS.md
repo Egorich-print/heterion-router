@@ -22,9 +22,12 @@ License: MIT
   (4xx не роняет провайдера), failover по кандидатам.
 - **`/v1/responses`** — поверхность Responses API (grok CLI / Codex клиенты):
   перевод туда-обратно, стрим как `response.*`-события; проверено живьём через комбо.
-- **Бэкенды:** `openai`-совместимые, `gemini` (персистентные thought signatures),
-  `openai-responses` (deepseek), keyless-провайдеры, `grok-cli`,
-  **`heterion-local`** (keyless на Heterion-сервер, нативная поддержка v1).
+- **Gemini thought-signatures**: `GeminiBackend` хранит `thoughtSignature`
+  из `message_start`/`functionCall` в персистентном
+  `gemini-thought-signatures.jsonl` и подбирает их при replay
+  tool_calls по клиенскому id **и** по мятному `{message_id}-{index}`.
+  Когда signature нет (первый вызов) — `functionCall`
+  заменяется на `text`-часть, чтобы Gemini не отказывал с 400.
 - **Дашборд** (Svelte 5): Overview, Combos, Providers, Keys, Usage, Logs, Playground.
 - **Admin-API:** `/api/overview|combos|connections|keys|usage|logs|restart` (см. ADR-004).
 - **Десктоп** (Tauri v2, `com.heterion.router`): тот же бандл + sidecar шлюза
