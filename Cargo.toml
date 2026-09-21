@@ -49,6 +49,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 thiserror = "2"
 tempfile = "2"
 tracing = "0.1"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 futures = "0.3"

@@ -55,6 +55,7 @@ pub struct AppState {
     pub(crate) prices: PriceTable,
     pub(crate) registry: Option<Arc<ProviderRegistry>>,
     pub(crate) backend_names: Vec<String>,
+    pub(crate) data_dir: Option<std::path::PathBuf>,
     /// Built dashboard bundle, when one is present.
     pub(crate) ui_dir: Option<std::path::PathBuf>,
     /// Unix time the process built this state: lets the dashboard tell a
@@ -80,6 +81,7 @@ impl AppState {
             prices: PriceTable::with_defaults(),
             registry: None,
             backend_names: Vec::new(),
+            data_dir: None,
             ui_dir: None,
             started_unix: now_unix(),
         }
@@ -94,6 +96,7 @@ impl AppState {
             prices: PriceTable::with_defaults(),
             registry: None,
             backend_names: Vec::new(),
+            data_dir: None,
             ui_dir: None,
             started_unix: now_unix(),
         }
@@ -114,6 +117,12 @@ impl AppState {
     /// Serve the dashboard bundle from `dir`.
     pub fn with_ui_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
         self.ui_dir = dir;
+        self
+    }
+
+    /// Set the data directory (used for log file paths).
+    pub fn with_data_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.data_dir = Some(dir);
         self
     }
 
@@ -141,6 +150,7 @@ pub fn build_router_with_state(state: AppState) -> Router {
         .route("/api/connections/{id}", patch(admin::update_connection))
         .route("/api/usage", get(admin::usage))
         .route("/api/logs", get(admin::logs))
+        .route("/api/logs/app", get(admin::logs_app))
         .route("/api/keys", get(admin::keys).post(admin::create_key))
         .route("/api/keys/{id}/revoke", post(admin::revoke_key))
         .route("/api/keys/{id}/restore", post(admin::restore_key))

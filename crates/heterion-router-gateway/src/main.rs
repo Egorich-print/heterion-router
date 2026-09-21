@@ -296,14 +296,20 @@ fn parent_gone(pid: u32) -> bool {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayConfig::from_env();
 
+    let log_path = config.data_dir.join("gateway.log");
+    let file_appender = tracing_appender::rolling::daily(&config.data_dir, "gateway.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(config.log_filter.clone())),
         )
         .with_target(false)
+        .with_writer(non_blocking)
         .init();
 
+    tracing::info!("log file: {}", log_path.display());
     watch_parent();
 
     let db_path = config.data_dir.join("storage.sqlite");
@@ -329,7 +335,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState::with_db(backend, db)
         .with_require_auth(config.require_auth)
         .with_catalog(registry, backend_names)
-        .with_ui_dir(ui_dir);
+        .with_ui_dir(ui_dir)
+        .with_data_dir(config.data_dir.clone());
     let app = build_router_with_state(state);
 
     let ip: std::net::IpAddr = config.host.parse()?;

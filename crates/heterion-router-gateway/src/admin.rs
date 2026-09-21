@@ -479,6 +479,42 @@ pub async fn logs(
     Json(json!({ "logs": logs }))
 }
 
+/// `GET /api/logs/app?limit=50` — recent application/tracing log lines.
+pub async fn logs_app(
+    State(state): State<AppState>,
+    Query(query): Query<LogAppQuery>,
+) -> Json<Value> {
+    let Some(data_dir) = state.data_dir.as_ref() else {
+        return Json(json!({ "lines": [] }));
+    };
+    let log_path = data_dir.join("gateway.log");
+    let limit = query.limit().min(1000) as usize;
+
+    let lines = match std::fs::read_to_string(&log_path) {
+        Ok(content) => {
+            let all: Vec<String> = content.lines().map(String::from).collect();
+            let start = all.len().saturating_sub(limit);
+            all[start..].to_vec()
+        }
+        Err(_) => vec![],
+    };
+
+    Json(json!({ "lines": lines }))
+}
+
+/// Query for the application log endpoint.
+#[derive(Debug, Deserialize)]
+pub struct LogAppQuery {
+    /// Maximum lines to return (clamped to 1..=1000). Defaults to 50.
+    pub limit: Option<u32>,
+}
+
+impl LogAppQuery {
+    fn limit(&self) -> u32 {
+        self.limit.unwrap_or(50).clamp(1, 1000)
+    }
+}
+
 /// Read the `isHidden` flag out of a combo `data` blob.
 ///
 /// A corrupt or non-object blob counts as visible: hiding must be explicit.
