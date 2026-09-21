@@ -20,7 +20,8 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{ChatBackend, ChunkStream};
-use crate::combos::{load_combos, plan_steps};
+use crate::combos::{load_combos, plan_steps, ComboConfig};
+use std::collections::HashMap as StdHashMap;
 
 /// Backend router with failover.
 #[derive(Clone)]
@@ -30,6 +31,7 @@ pub struct RoutingBackend {
     breakers: Arc<Mutex<BreakerSet>>,
     db: Option<Arc<Db>>,
     registry: Option<Arc<ProviderRegistry>>,
+    combo_configs: Arc<StdHashMap<String, ComboConfig>>,
 }
 
 /// Whether a failure means the backend itself is unhealthy.
@@ -95,13 +97,22 @@ impl RoutingBackend {
             breakers: Arc::new(Mutex::new(BreakerSet::new(threshold, cooldown_secs))),
             db: None,
             registry: None,
+            combo_configs: Arc::new(StdHashMap::new()),
         }
     }
 
     /// Attach a database + registry for combo-name expansion.
     pub fn with_combo_source(mut self, db: Arc<Db>, registry: Arc<ProviderRegistry>) -> Self {
+        let guard = db.connection();
+        let combos = load_combos(&guard);
+        let mut configs = StdHashMap::new();
+        for (name, combo) in &combos {
+            configs.insert(name.clone(), combo.config.clone());
+        }
+        drop(guard);
         self.db = Some(db);
         self.registry = Some(registry);
+        self.combo_configs = Arc::new(configs);
         self
     }
 
@@ -109,6 +120,32 @@ impl RoutingBackend {
         self.breakers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Get retry config for a model, falling back to defaults.
+    fn combo_config(&self, model: &str) -> ComboConfig {
+        if let Some(db) = self.db.as_ref() {
+            let guard = db.connection();
+            let combos = load_combos(&guard);
+            if let Some(combo) = combos.get(model) {
+                return combo.config.clone();
+            }
+        }
+        ComboConfig::default()
+    }
+
+    /// Whether the error is transient and worth retrying.
+    fn is_transient(error: &GatewayError) -> bool {
+        match error {
+            GatewayError::Upstream(msg) => {
+                if let Some(status) = upstream_status(msg) {
+                    status == 429 || status >= 500
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        }
     }
 
     /// Ordered `(backend, model)` attempts for a requested model name.
@@ -165,29 +202,47 @@ impl ChatBackend for RoutingBackend {
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         let model = request.model.clone();
+        let config = self.combo_config(&model);
         let mut last_error: Option<GatewayError> = None;
         let mut tripped = false;
+        let plan = self.plan(&model);
 
-        for (name, target_model) in self.plan(&model) {
-            if !self.lock_breakers().allow(&name, Instant::now()) {
-                tripped = true;
-                continue;
-            }
-            let Some(backend) = self.backends.get(&name) else {
-                continue;
-            };
-            let mut attempt = request.clone();
-            attempt.model = target_model;
-            match backend.complete(attempt).await {
-                Ok(response) => {
-                    self.lock_breakers().record_success(&name);
-                    return Ok(response);
+        for (name, target_model) in &plan {
+            let mut retry_count = 0;
+            loop {
+                if !self.lock_breakers().allow(name, Instant::now()) {
+                    tripped = true;
+                    break;
                 }
-                Err(error) => {
-                    if is_backend_outage(&error) {
-                        self.lock_breakers().record_failure(&name, Instant::now());
+                let Some(backend) = self.backends.get(name) else {
+                    break;
+                };
+                let mut attempt = request.clone();
+                attempt.model = target_model.clone();
+                match backend.complete(attempt).await {
+                    Ok(response) => {
+                        self.lock_breakers().record_success(name);
+                        return Ok(response);
                     }
-                    last_error = Some(error);
+                    Err(error) => {
+                        if is_backend_outage(&error) {
+                            self.lock_breakers().record_failure(name, Instant::now());
+                        }
+                        last_error = Some(error);
+                        if retry_count < config.max_retries && Self::is_transient(last_error.as_ref().unwrap()) {
+                            retry_count += 1;
+                            if config.failover_before_retry {
+                                break;
+                            }
+                            if config.retry_delay_ms > 0 {
+                                tokio::time::sleep(
+                                    std::time::Duration::from_millis(config.retry_delay_ms),
+                                ).await;
+                            }
+                            continue;
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -204,52 +259,64 @@ impl ChatBackend for RoutingBackend {
     fn stream(&self, request: ChatCompletionRequest) -> ChunkStream {
         let this = self.clone();
         let model = request.model.clone();
+        let config = this.combo_config(&model);
         let (tx, rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
             let mut last_error: Option<GatewayError> = None;
             let mut tripped = false;
+            let plan = this.plan(&model);
 
-            for (name, target_model) in this.plan(&model) {
-                if !this.lock_breakers().allow(&name, Instant::now()) {
-                    tripped = true;
-                    continue;
-                }
-                let Some(backend) = this.backends.get(&name).cloned() else {
-                    continue;
-                };
-                let mut attempt = request.clone();
-                attempt.model = target_model;
-                let mut stream = backend.stream(attempt);
+            for (name, target_model) in &plan {
+                let mut retry_count = 0;
+                loop {
+                    if !this.lock_breakers().allow(name, Instant::now()) {
+                        tripped = true;
+                        break;
+                    }
+                    let Some(backend) = this.backends.get(name).cloned() else {
+                        break;
+                    };
+                    let mut attempt = request.clone();
+                    attempt.model = target_model.clone();
+                    let mut stream = backend.stream(attempt);
 
-                // Pull the first item before committing to this backend: a
-                // free tier answering 503 has emitted nothing, so the combo
-                // can still hop to the next model instead of failing the
-                // whole request.
-                match stream.next().await {
-                    Some(Ok(first)) => {
-                        this.lock_breakers().record_success(&name);
-                        if tx.send(Ok(first)).await.is_err() {
-                            return; // client gone
-                        }
-                        while let Some(item) = stream.next().await {
-                            if tx.send(item).await.is_err() {
+                    match stream.next().await {
+                        Some(Ok(first)) => {
+                            this.lock_breakers().record_success(name);
+                            if tx.send(Ok(first)).await.is_err() {
                                 return;
                             }
+                            while let Some(item) = stream.next().await {
+                                if tx.send(item).await.is_err() {
+                                    return;
+                                }
+                            }
+                            return;
                         }
-                        return; // stream finished normally
-                    }
-                    Some(Err(error)) => {
-                        if is_backend_outage(&error) {
-                            this.lock_breakers().record_failure(&name, Instant::now());
+                        Some(Err(error)) => {
+                            if is_backend_outage(&error) {
+                                this.lock_breakers().record_failure(name, Instant::now());
+                            }
+                            last_error = Some(error);
+                            if retry_count < config.max_retries && Self::is_transient(last_error.as_ref().unwrap()) {
+                                retry_count += 1;
+                                if config.failover_before_retry {
+                                    break;
+                                }
+                                if config.retry_delay_ms > 0 {
+                                    tokio::time::sleep(
+                                        std::time::Duration::from_millis(config.retry_delay_ms),
+                                    ).await;
+                                }
+                                continue;
+                            }
+                            break;
                         }
-                        last_error = Some(error);
-                        continue;
-                    }
-                    None => {
-                        // Empty stream: acceptable, nothing to fall back to.
-                        this.lock_breakers().record_success(&name);
-                        return;
+                        None => {
+                            this.lock_breakers().record_success(name);
+                            return;
+                        }
                     }
                 }
             }

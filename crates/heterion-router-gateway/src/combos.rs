@@ -13,6 +13,33 @@ use heterion_router_providers::ProviderRegistry;
 use rusqlite::Connection;
 use serde_json::Value;
 
+/// Retry/failover configuration for a combo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComboConfig {
+    /// Max retries per candidate on transient errors (429, 503).
+    pub max_retries: u32,
+    /// Delay in ms before retrying the same candidate.
+    pub retry_delay_ms: u64,
+    /// If true, try the next candidate before retrying the failed one.
+    pub failover_before_retry: bool,
+    /// Max retries per candidate set.
+    pub max_set_retries: u32,
+    /// Delay in ms between candidate-set retries.
+    pub set_retry_delay_ms: u64,
+}
+
+impl Default for ComboConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 0,
+            retry_delay_ms: 0,
+            failover_before_retry: true,
+            max_set_retries: 0,
+            set_retry_delay_ms: 0,
+        }
+    }
+}
+
 /// One combo entry: a provider plus its bare model id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComboEntry {
@@ -31,6 +58,8 @@ pub struct ComboDef {
     pub strategy: String,
     /// Ordered entries.
     pub entries: Vec<ComboEntry>,
+    /// Retry/failover configuration.
+    pub config: ComboConfig,
 }
 
 /// Split a `"provider/model"` ref. A bare `"model"` yields an empty provider
@@ -118,11 +147,35 @@ pub fn parse_combo_rich(data: &Value) -> Option<(String, Vec<RichEntry>)> {
 /// Returns `None` when the row carries no usable model entries.
 pub fn parse_combo(name: &str, data: &Value) -> Option<ComboDef> {
     let (strategy, rich) = parse_combo_rich(data)?;
+    let config = parse_combo_config(data);
     Some(ComboDef {
         name: name.to_string(),
         strategy,
         entries: rich.into_iter().map(|item| item.entry).collect(),
+        config,
     })
+}
+
+/// Extract retry/failover config from combo `data["config"]`.
+fn parse_combo_config(data: &Value) -> ComboConfig {
+    let cfg = data.get("config").and_then(Value::as_object);
+    let cfg = match cfg {
+        Some(c) => c,
+        None => return ComboConfig::default(),
+    };
+    ComboConfig {
+        max_retries: cfg.get("maxRetries").and_then(Value::as_u64).unwrap_or(0) as u32,
+        retry_delay_ms: cfg.get("retryDelayMs").and_then(Value::as_u64).unwrap_or(0),
+        failover_before_retry: cfg
+            .get("failoverBeforeRetry")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        max_set_retries: cfg.get("maxSetRetries").and_then(Value::as_u64).unwrap_or(0) as u32,
+        set_retry_delay_ms: cfg
+            .get("setRetryDelayMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    }
 }
 
 /// Load every parseable combo, keyed by name.
