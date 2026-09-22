@@ -12,7 +12,7 @@ use heterion_router_gateway::{
     build_router_with_state,
     credentials::{active_providers, load_credentials},
     gemini::{GeminiBackend, ThoughtSignatures},
-    grok_cli::GrokCliBackend,
+    grok_cli::{Credential as GrokCredential, GrokCliBackend},
     openai::{OpenAiBackend, ProviderOpenAiBackend, resolve_chat_url},
     responses::ResponsesBackend,
     routing::RoutingBackend,
@@ -91,9 +91,16 @@ fn select_backend(
             "backend available: grok-cli ({base_url}, {} credential(s))",
             tokens.len()
         );
+        let credentials = tokens
+            .into_iter()
+            .map(|token| GrokCredential {
+                token,
+                refresh_token: None,
+            })
+            .collect();
         backends.insert(
             "grok-cli".to_string(),
-            Arc::new(GrokCliBackend::with_tokens(base_url, tokens)?),
+            Arc::new(GrokCliBackend::with_credentials(base_url, credentials)?),
         );
         grok_present = true;
     }

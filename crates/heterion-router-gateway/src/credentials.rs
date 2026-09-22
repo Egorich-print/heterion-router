@@ -19,6 +19,8 @@ pub struct Credential {
     pub provider: String,
     /// Decrypted bearer token (OAuth access token or API key).
     pub token: String,
+    /// Decrypted refresh token, if available.
+    pub refresh_token: Option<String>,
 }
 
 /// Pick the token column: OAuth access tokens first, then API keys.
@@ -40,7 +42,7 @@ pub fn load_credentials(
     crypto: Option<&FieldCrypto>,
 ) -> Result<Vec<Credential>> {
     let mut statement = conn.prepare(
-        "SELECT id, provider, access_token, api_key, expires_at \
+        "SELECT id, provider, access_token, api_key, expires_at, refresh_token \
          FROM provider_connections \
          WHERE is_active = 1 AND provider = ?1 \
          ORDER BY priority DESC, id ASC",
@@ -52,13 +54,16 @@ pub fn load_credentials(
             row.get::<_, Option<String>>(2)?,
             row.get::<_, Option<String>>(3)?,
             row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
         ))
     })?;
 
     let mut credentials = Vec::new();
     for row in rows {
-        let (connection_id, provider, access_token, api_key, expires_at) = row?;
-        if is_expired(expires_at.as_deref()) {
+        let (connection_id, provider, access_token, api_key, expires_at, refresh_token_raw) = row?;
+        // Skip expired credentials ONLY when no refresh_token is available.
+        // With a refresh token, the GrokCliBackend can attempt a refresh.
+        if is_expired(expires_at.as_deref()) && refresh_token_raw.is_none() {
             continue;
         }
         let Some(raw) = token_source(access_token.as_deref(), api_key.as_deref()) else {
@@ -79,10 +84,18 @@ pub fn load_credentials(
         if token.is_empty() {
             continue;
         }
+        let refresh_token = match (crypto, refresh_token_raw) {
+            (Some(crypto), Some(raw)) => crypto.decrypt(&raw),
+            (None, Some(raw)) => {
+                if FieldCrypto::looks_encrypted(&raw) { None } else { Some(raw) }
+            }
+            _ => None,
+        };
         credentials.push(Credential {
             connection_id,
             provider,
             token,
+            refresh_token,
         });
     }
     Ok(credentials)

@@ -73,8 +73,15 @@ fn session_headers<'a>(
 pub struct GrokCliBackend {
     http: HttpClient,
     base_url: String,
-    tokens: Vec<String>,
+    credentials: Vec<Credential>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One credential for rotation: access token + optional refresh token.
+#[derive(Debug, Clone)]
+pub struct Credential {
+    pub token: String,
+    pub refresh_token: Option<String>,
 }
 
 impl GrokCliBackend {
@@ -84,16 +91,15 @@ impl GrokCliBackend {
         base_url: String,
         token: String,
     ) -> Result<Self, heterion_router_http::client::HttpError> {
-        Self::with_tokens(base_url, vec![token])
+        Self::with_credentials(base_url, vec![Credential { token, refresh_token: None }])
     }
 
-    /// Build with a rotation pool of tokens (ordered by priority). An empty
-    /// pool yields an error: a credential-less executor cannot serve.
-    pub fn with_tokens(
+    /// Build with a rotation pool of credentials.
+    pub fn with_credentials(
         base_url: String,
-        tokens: Vec<String>,
+        credentials: Vec<Credential>,
     ) -> Result<Self, heterion_router_http::client::HttpError> {
-        if tokens.is_empty() {
+        if credentials.is_empty() {
             return Err(heterion_router_http::client::HttpError::Status {
                 status: 0,
                 body: "grok-cli: no credentials".to_string(),
@@ -102,21 +108,73 @@ impl GrokCliBackend {
         Ok(Self {
             http: HttpClient::new(600)?,
             base_url: base_url.trim_end_matches('/').to_string(),
-            tokens,
+            credentials,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
-    /// Pool size (number of rotated credentials).
-    pub fn token_count(&self) -> usize {
-        self.tokens.len()
+    /// Pool size.
+    pub fn credential_count(&self) -> usize {
+        self.credentials.len()
     }
 
-    /// Round-robin token selection.
-    fn next_token(&self) -> &str {
+    /// Round-robin credential selection.
+    fn next_credential(&self) -> &Credential {
         let index =
-            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.tokens.len();
-        self.tokens[index].as_str()
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.credentials.len();
+        &self.credentials[index]
+    }
+
+    /// Call the upstream, refreshing on 401 if possible.
+    async fn call_with_refresh(
+        &self,
+        url: &str,
+        token: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<Value, GatewayError> {
+        let response = self
+            .http
+            .post_json_with_headers(url, Some(token), headers, body)
+            .await
+            .map_err(|error| GatewayError::Upstream(error.to_string()))?;
+        let status = response.status().as_u16();
+        let payload: Value = response
+            .json()
+            .await
+            .map_err(|error| GatewayError::Upstream(error.to_string()))?;
+        if status == 401 {
+            if let Some(refresh) = &self.next_credential().refresh_token {
+                if let Ok(refreshed) = self.refresh_token(refresh).await {
+                    return Ok(refreshed);
+                }
+            }
+            return Err(GatewayError::Upstream(
+                "upstream status 401: token expired and no refresh token".to_string(),
+            ));
+        }
+        if let Some(message) = payload
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+        {
+            return Err(GatewayError::Upstream(message.to_string()));
+        }
+        Ok(payload)
+    }
+
+    async fn refresh_token(&self, refresh_token: &str) -> Result<Value, GatewayError> {
+        self.http
+            .post_json(
+                &format!("{}/token/refresh", self.base_url),
+                None,
+                &serde_json::json!({ "refresh_token": refresh_token }),
+            )
+            .await
+            .map_err(|_| GatewayError::Upstream("refresh failed".to_string()))?
+            .json()
+            .await
+            .map_err(|error| GatewayError::Upstream(error.to_string()))
     }
 
     fn responses_url(&self) -> String {
@@ -140,8 +198,8 @@ impl GrokCliBackend {
             .http
             .post_json_with_headers(
                 &self.responses_url(),
-                Some(self.next_token()),
-                &headers,
+                Some(&self.next_credential().token),
+                &headers.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
                 &upstream,
             )
             .await
@@ -218,45 +276,25 @@ impl ChatBackend for GrokCliBackend {
         upstream["stream"] = Value::from(false);
         let user_agent = grok_user_agent();
         let headers = session_headers(&request.model, false, &user_agent);
+        let headers_vec: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, *v)).collect();
 
-        // Try each pooled credential once; a dead/exhausted token should not
-        // fail the request while others are available.
         let mut last_error: Option<GatewayError> = None;
-        for _ in 0..self.tokens.len() {
-            let response = match self
-                .http
-                .post_json_with_headers(
+        for _ in 0..self.credentials.len() {
+            match self
+                .call_with_refresh(
                     &self.responses_url(),
-                    Some(self.next_token()),
-                    &headers,
+                    &self.next_credential().token,
+                    &headers_vec,
                     &upstream,
                 )
                 .await
             {
-                Ok(response) => response,
+                Ok(payload) => return Ok(response_to_completion(&request.model, &payload)),
                 Err(error) => {
-                    last_error = Some(GatewayError::Upstream(error.to_string()));
+                    last_error = Some(error);
                     continue;
                 }
-            };
-            let payload: Value = match response.json().await {
-                Ok(payload) => payload,
-                Err(error) => {
-                    last_error = Some(GatewayError::Upstream(error.to_string()));
-                    continue;
-                }
-            };
-            // The upstream may answer errors as JSON with an `error` member
-            // even on 200; surface those instead of an empty completion.
-            if let Some(message) = payload
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-            {
-                last_error = Some(GatewayError::Upstream(message.to_string()));
-                continue;
             }
-            return Ok(response_to_completion(&request.model, &payload));
         }
         Err(last_error.unwrap_or_else(|| {
             GatewayError::Upstream("grok-cli: all credentials failed".to_string())
@@ -630,9 +668,12 @@ mod rotation_tests {
             .await;
 
         let backend =
-            GrokCliBackend::with_tokens(server.uri(), vec!["bad".to_string(), "good".to_string()])
-                .unwrap();
-        assert_eq!(backend.token_count(), 2);
+            GrokCliBackend::with_credentials(server.uri(), vec![
+                Credential { token: "bad".to_string(), refresh_token: None },
+                Credential { token: "good".to_string(), refresh_token: None },
+            ])
+            .unwrap();
+        assert_eq!(backend.credential_count(), 2);
 
         let request = ChatCompletionRequest {
             model: "grok-4.6".to_string(),
@@ -651,7 +692,7 @@ mod rotation_tests {
 
     #[test]
     fn empty_pool_is_rejected() {
-        assert!(GrokCliBackend::with_tokens("http://x".to_string(), vec![]).is_err());
+        assert!(GrokCliBackend::with_credentials("http://x".to_string(), vec![]).is_err());
     }
 }
 
