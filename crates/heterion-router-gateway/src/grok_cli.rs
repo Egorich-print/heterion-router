@@ -69,6 +69,17 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+/// Does this upstream rejection mean the OAuth credential is stale and owes
+/// a refresh + retry?
+///
+/// A 401 is the canonical signal. The grok-cli chat proxy additionally
+/// answers an expired token with HTTP 400 and the `client_id is required`
+/// description (observed 2026-10-14) — without treating that body as stale,
+/// every request dies before the refresh flow ever runs.
+fn is_stale_oauth(status: u16, body: &str) -> bool {
+    status == 401 || (status == 400 && body.contains("client_id is required"))
+}
+
 fn refresh_expiry(payload: &Value) -> Option<String> {
     if let Some(expiry) = payload.get("expires_at") {
         if let Some(expiry) = expiry.as_str() {
@@ -316,7 +327,10 @@ impl GrokCliBackend {
             .await
         {
             Ok(response) => response,
-            Err(heterion_router_http::client::HttpError::Status { status: 401, .. }) => {
+            Err(heterion_router_http::client::HttpError::Status {
+                status,
+                body: error_body,
+            }) if is_stale_oauth(status, &error_body) => {
                 let refreshed = self.refresh_after_unauthorized(index, credential).await?;
                 self.http
                     .post_json_with_headers(url, Some(&refreshed.token), headers, body)
@@ -402,7 +416,10 @@ impl GrokCliBackend {
             .await
         {
             Ok(response) => Ok(response),
-            Err(heterion_router_http::client::HttpError::Status { status: 401, .. }) => {
+            Err(heterion_router_http::client::HttpError::Status {
+                status,
+                body: error_body,
+            }) if is_stale_oauth(status, &error_body) => {
                 let refreshed = self.refresh_after_unauthorized(index, credential).await?;
                 self.http
                     .post_json_with_headers(
@@ -922,6 +939,67 @@ mod rotation_tests {
             "the retry must replay the original request body"
         );
         assert_eq!(responses[1].headers["authorization"], "Bearer fresh");
+    }
+
+    #[tokio::test]
+    async fn a_400_client_id_required_body_refreshes_like_a_401() {
+        // Observed 2026-10-14: the chat proxy answers an expired OAuth token
+        // with 400 `client_id is required` instead of 401 — the refresh flow
+        // must fire all the same, or every request dies unrefreshed.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer bad"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error": "invalid_request",
+                "error_description": "client_id is required"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "fresh",
+                "refresh_token": "refresh-2",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer fresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_refreshed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = GrokCliBackend::with_credentials(
+            server.uri(),
+            vec![Credential {
+                connection_id: None,
+                token: "bad".to_string(),
+                refresh_token: Some("refresh-1".to_string()),
+                expires_at: Some("2000-01-01T00:00:00.000Z".to_string()),
+            }],
+        )
+        .unwrap()
+        .with_oauth_endpoint(format!("{}/oauth2/token", server.uri()));
+
+        let request = ChatCompletionRequest {
+            model: "grok-4.6".to_string(),
+            messages: vec![ChatMessage::plain("user".to_string(), "hi".to_string())],
+            stream: false,
+            ..Default::default()
+        };
+        let response = backend.complete(request).await.unwrap();
+        assert_eq!(response.choices[0].message.text(), "ok");
+        server.verify().await;
     }
 
     #[tokio::test]

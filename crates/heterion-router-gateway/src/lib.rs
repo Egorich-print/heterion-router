@@ -11,6 +11,7 @@ pub mod auth;
 pub mod backend;
 pub mod budgets;
 pub mod cache;
+pub mod claude;
 pub mod claude_endpoint;
 pub mod combos;
 pub mod cors;

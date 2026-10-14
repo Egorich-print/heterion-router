@@ -12,6 +12,7 @@ use heterion_router_gateway::{
     backend::ChatBackend,
     backend::EchoBackend,
     build_router_with_state,
+    claude::ClaudeBackend,
     credentials::load_credentials,
     gemini::{GeminiBackend, ThoughtSignatures},
     grok_cli::{Credential as GrokCredential, GrokCliBackend, RefreshCallback},
@@ -330,6 +331,37 @@ fn select_backend(
                             "backend available: {provider} (responses, {base_url}, {count} credential(s))"
                         );
                     }
+                    backends.insert(provider.clone(), status_aware(Arc::new(backend)));
+                }
+                Err(error) => tracing::warn!("backend {provider} skipped: {error}"),
+            }
+            continue;
+        }
+
+        // Claude-wire protocol (Anthropic `/v1/messages` dialect: zai,
+        // agentrouter, kimi-coding, wafer, …).
+        if registry
+            .get(provider)
+            .and_then(|entry| entry.format.as_deref())
+            == Some("claude")
+        {
+            let tokens: Vec<String> = {
+                let guard = db.connection();
+                load_credentials(&guard, provider, crypto.as_ref())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|credential| credential.token)
+                    .collect()
+            };
+            if tokens.is_empty() && !registry.allows_keyless(provider) {
+                continue;
+            }
+            let count = tokens.len();
+            match ClaudeBackend::new(provider.clone(), base_url.to_string(), tokens) {
+                Ok(backend) => {
+                    tracing::info!(
+                        "backend available: {provider} (claude, {base_url}, {count} credential(s))"
+                    );
                     backends.insert(provider.clone(), status_aware(Arc::new(backend)));
                 }
                 Err(error) => tracing::warn!("backend {provider} skipped: {error}"),
@@ -937,7 +969,9 @@ mod tests {
     /// same way and must be reported too.
     #[test]
     fn unsupported_formats_are_reported_with_connection_counts() {
-        let db = db_with_connections(&[("c1", "claude", "sk-claude"), ("k1", "kiro", "sk-kiro")]);
+        // `claude` gained a real executor; these two formats are still
+        // without one and must keep being reported.
+        let db = db_with_connections(&[("k1", "kiro", "sk-kiro"), ("c2", "cursor", "sk-cursor")]);
         let data_dir = empty_data_dir("unsupported");
 
         let logs = capture_warnings(|| {
@@ -945,8 +979,8 @@ mod tests {
         });
 
         assert_eq!(logs.matches("are not served").count(), 1, "got {logs}");
-        assert!(logs.contains("claude=1"), "got {logs}");
         assert!(logs.contains("kiro=1"), "got {logs}");
+        assert!(logs.contains("cursor=1"), "got {logs}");
         let _ = std::fs::remove_dir_all(&data_dir);
     }
 
