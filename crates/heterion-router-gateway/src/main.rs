@@ -14,6 +14,7 @@ use heterion_router_gateway::{
     build_router_with_state,
     claude::ClaudeBackend,
     credentials::load_credentials,
+    exa::ExaBackend,
     gemini::{GeminiBackend, ThoughtSignatures},
     grok_cli::{Credential as GrokCredential, GrokCliBackend, RefreshCallback},
     openai::{OpenAiBackend, ProviderOpenAiBackend, resolve_chat_url, resolve_responses_url},
@@ -331,6 +332,38 @@ fn select_backend(
                             "backend available: {provider} (responses, {base_url}, {count} credential(s))"
                         );
                     }
+                    backends.insert(provider.clone(), status_aware(Arc::new(backend)));
+                }
+                Err(error) => tracing::warn!("backend {provider} skipped: {error}"),
+            }
+            continue;
+        }
+
+        // Exa-style search providers (`executor: "exa"`): the last user
+        // message is the query, results come back cited. A search tool on
+        // the chat surface — never a chat combo member (ADR-016).
+        if registry
+            .get(provider)
+            .and_then(|entry| entry.executor.as_deref())
+            == Some("exa")
+        {
+            let tokens: Vec<String> = {
+                let guard = db.connection();
+                load_credentials(&guard, provider, crypto.as_ref())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|credential| credential.token)
+                    .collect()
+            };
+            if tokens.is_empty() && !registry.allows_keyless(provider) {
+                continue;
+            }
+            let count = tokens.len();
+            match ExaBackend::new(provider.clone(), base_url.to_string(), tokens) {
+                Ok(backend) => {
+                    tracing::info!(
+                        "backend available: {provider} (exa, {base_url}, {count} credential(s))"
+                    );
                     backends.insert(provider.clone(), status_aware(Arc::new(backend)));
                 }
                 Err(error) => tracing::warn!("backend {provider} skipped: {error}"),
@@ -937,10 +970,12 @@ mod tests {
     /// many connections each one accounts for — never an account email.
     #[test]
     fn unknown_providers_are_reported_once_with_connection_counts() {
+        // `exa-search` gained a real executor; a provider absent from the
+        // registry entirely is the unknown case now.
         let db = db_with_connections(&[
-            ("e1", "exa-search", "sk-a"),
-            ("e2", "exa-search", "sk-b"),
-            ("e3", "exa-search", "sk-c"),
+            ("e1", "ghost-provider", "sk-a"),
+            ("e2", "ghost-provider", "sk-b"),
+            ("e3", "ghost-provider", "sk-c"),
             ("o1", "openai", "sk-openai"),
         ]);
         let data_dir = empty_data_dir("unknown");
@@ -958,8 +993,8 @@ mod tests {
             1,
             "expected exactly one aggregated line, got {lines:?}"
         );
-        assert!(lines[0].contains("exa-search=3"), "got {}", lines[0]);
-        assert!(!lines[0].contains("exa-search=1"), "count is wrong");
+        assert!(lines[0].contains("ghost-provider=3"), "got {}", lines[0]);
+        assert!(!lines[0].contains("ghost-provider=1"), "count is wrong");
         assert!(!logs.contains("owner0@example.com"), "email leaked");
         assert!(!logs.contains("sk-a"), "secret leaked");
         let _ = std::fs::remove_dir_all(&data_dir);

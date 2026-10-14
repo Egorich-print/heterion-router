@@ -4,7 +4,34 @@
 `openrouter-free` и main-комбо с приоритетом «баланс × качество», разбитые по
 размеру контекста.
 
-## Итоговый список (living DB)
+## GLM-5.3-Flash: подтверждённые факты (2026-10-14, 4 источника)
+
+| Источник | Данные |
+|----------|--------|
+| OpenRouter API | `z-ai/glm-5.3-flash`: ctx **1 048 576**, $0.04/M in, $0.90/M out |
+| Artificial Analysis | ctx **1M**, Intelligence Index **42 (#4/116)**, $0.15/$0.50 (Z.AI), 320B MoE (18B active), MIT, reasoning |
+| Z.AI docs (via exa) | «support for a 1M-token context window» |
+| Cloudflare docs (via exa) | «Context Window: 1,048,576 tokens», reasoning low/high/max, $0.15/M |
+
+Вывод: glm-5.3-flash — дешёвая, сильная модель с 1M контекстом → голова
+main-262k/main-128k и вторая ступень main-1m.
+
+## Итоговый список (living DB) — пересобран 2026-10-14 по фактам
+
+| Комбо | Цепочка (priority) |
+|-------|--------------------|
+| `main-1m` | grok-cli/grok-4.6 → zai/glm-5.3-flash → openrouter/grok-4.6 → pollinations |
+| `main-262k` | zai/glm-5.3-flash → openrouter/grok-4.6 → groq → mistral/small → pollinations |
+| `main-128k` | zai/glm-5.3-flash → groq → mistral/codestral → mistral/small → pollinations |
+| `google`, `openrouter-free` | без изменений |
+
+## Exa (ADR-019)
+
+- Исполнитель реализован; base_url реестра исправлен на `https://api.exa.ai`
+  (без `/v1` — иначе 404).
+- Реальный поиск проверен: 5 результатов с контентом (цитированный ответ).
+- `exa-search/exa-search` — прямой вызов моделью, НЕ в чат-комбо.
+
 
 | Комбо | sort | context | Цепочка (priority) | Статус |
 |-------|------|---------|--------------------|--------|

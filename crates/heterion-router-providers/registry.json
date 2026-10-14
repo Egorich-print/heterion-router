@@ -13610,7 +13610,7 @@
     "format": "custom",
     "executor": "exa",
     "auth_type": "apikey",
-    "base_url": "https://api.exa.ai/v1",
+    "base_url": "https://api.exa.ai",
     "models": [
       {
         "id": "exa-search",

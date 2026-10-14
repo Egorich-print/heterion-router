@@ -17,6 +17,7 @@ pub mod combos;
 pub mod cors;
 pub mod credentials;
 pub mod embeddings;
+pub mod exa;
 pub mod gemini;
 pub mod grok_cli;
 pub mod guardrails;
