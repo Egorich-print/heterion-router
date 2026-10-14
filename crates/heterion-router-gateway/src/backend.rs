@@ -162,6 +162,18 @@ pub(crate) fn openai_request_body(request: &ChatCompletionRequest) -> Value {
     if let Some(tools) = &request.tools {
         body["tools"] = tools.clone();
     }
+    // Codestral drifts to prose when tools are merely offered; pin the choice
+    // unless the client made one (ADR-014-style policy, see reasoning.rs).
+    if request
+        .tools
+        .as_ref()
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        && body.get("tool_choice").is_none()
+        && crate::reasoning::needs_explicit_tool_choice(&request.model)
+    {
+        body["tool_choice"] = json!("required");
+    }
     if let Some(tool_choice) = &request.tool_choice {
         body["tool_choice"] = tool_choice.clone();
     }
@@ -588,6 +600,42 @@ mod tests {
         request.reasoning_effort = Some("low".to_string());
         let body = openai_request_body(&request);
         assert_eq!(body["reasoning_effort"], json!("low"));
+    }
+
+    #[test]
+    fn codestral_gets_a_pinned_tool_choice_when_tools_are_present() {
+        let tool = json!({"type": "function", "function": {"name": "read_file", "parameters": {}}});
+        let mut request = request("read /etc/hosts");
+        request.model = "mistral/codestral-latest".into();
+        request.tools = Some(json!([tool]));
+        // Without a client choice, the family policy pins the call.
+        let body = openai_request_body(&request);
+        assert_eq!(body["tool_choice"], json!("required"));
+        assert_eq!(body["tools"][0]["function"]["name"], json!("read_file"));
+
+        // A client-set choice is forwarded untouched.
+        let mut with_choice = request.clone();
+        with_choice.tool_choice = Some(json!({"type": "function", "function": {"name": "other"}}));
+        let body = openai_request_body(&with_choice);
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type": "function", "function": {"name": "other"}})
+        );
+
+        // No tools → nothing to pin; other families stay untouched.
+        let mut no_tools = request.clone();
+        no_tools.tools = None;
+        assert!(openai_request_body(&no_tools).get("tool_choice").is_none());
+        let mut empty_tools = request.clone();
+        empty_tools.tools = Some(json!([]));
+        assert!(
+            openai_request_body(&empty_tools)
+                .get("tool_choice")
+                .is_none()
+        );
+        let mut other = request;
+        other.model = "grok-4.6".into();
+        assert!(openai_request_body(&other).get("tool_choice").is_none());
     }
 
     #[tokio::test]

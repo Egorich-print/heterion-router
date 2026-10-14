@@ -31,9 +31,28 @@ pub fn default_effort(model: &str) -> Option<&'static str> {
     }
 }
 
+/// Models that answer in prose instead of calling the tool they were given,
+/// unless the request pins the choice.
+///
+/// Codestral (Mistral's low-latency code-completion model) officially
+/// supports function calling, but drifts to a text answer by default: probed
+/// live on 2026-10-14, `tool_choice: "required"` produced
+/// `finish_reason: tool_calls` with a valid call, while the same request
+/// without it returned `{"path": "..."}` as plain content. Injecting
+/// `tool_choice: "required"` — only when tools are present and the client
+/// did not choose — keeps agentic turns on Mistral working.
+///
+/// Client-set `tool_choice` always wins; this only fills the gap.
+pub fn needs_explicit_tool_choice(model: &str) -> bool {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    let bare = bare.to_ascii_lowercase();
+    bare.starts_with("codestral")
+}
+
 #[cfg(test)]
 mod tests {
     use super::default_effort;
+    use super::needs_explicit_tool_choice;
 
     #[test]
     fn evidenced_families_get_their_predefined_level() {
@@ -64,8 +83,19 @@ mod tests {
     fn unevidenced_families_stay_on_the_provider_default() {
         assert_eq!(default_effort("gpt-5.6-sol"), None);
         assert_eq!(default_effort("claude-haiku-4"), None);
-        assert_eq!(default_effort("mistral-large"), None);
+        assert_eq!(default_effort("mistral-large-latest"), None);
         assert_eq!(default_effort("exa-search"), None);
         assert_eq!(default_effort(""), None);
+    }
+
+    #[test]
+    fn only_codestral_needs_an_explicit_tool_choice() {
+        assert!(needs_explicit_tool_choice("codestral-latest"));
+        assert!(needs_explicit_tool_choice("mistral/codestral-latest"));
+        assert!(needs_explicit_tool_choice("CODESTRAL-25-08"));
+        assert!(!needs_explicit_tool_choice("glm-5.3-flash"));
+        assert!(!needs_explicit_tool_choice("grok-4.6"));
+        assert!(!needs_explicit_tool_choice("openai/gpt-oss-20b"));
+        assert!(!needs_explicit_tool_choice(""));
     }
 }
