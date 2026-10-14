@@ -29,3 +29,14 @@ SPA (Svelte 5 + Vite) собирается в `desktop/ui/dist` и раздаё�
 - Бандл обязан быть собран до старта шлюза; при отсутствии — API работает, `/`
   объясняет, что делать.
 - Tauri-оболочка переиспользует тот же бандл (см. ADR-007), а не второй UI.
+
+## Фактическая граница 2026-09-29
+
+- Основное имя переменной — `HETERION_ROUTER_UI_DIR`;
+  `OMNIROUTE_UI_DIR` остаётся fallback на один цикл
+  (`crates/heterion-router-gateway/src/ui.rs`).
+- `/` и `/{*path}` — публичная статика без `Authenticated`; это позволяет
+  same-origin UI, но делает SPA и `/healthz` доступными на любом bind-адресе.
+  Контейнер `HETERION_ROUTER_UI_DIR` не ограничен дополнительным root-путём.
+  Ограничение и LAN/TLS-рекомендации описаны в `STATUS.md` и
+  `docs/research/PROJECT-AUDIT-2026-09.md`.

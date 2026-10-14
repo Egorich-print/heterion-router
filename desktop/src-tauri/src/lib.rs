@@ -81,8 +81,7 @@ pub fn run() {
                         }
                     }
                 });
-                init_script =
-                    format!("window.__HETERION_ROUTER_GATEWAY_URL__={gateway_url:?};");
+                init_script = format!("window.__HETERION_ROUTER_GATEWAY_URL__={gateway_url:?};");
             }
 
             WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))

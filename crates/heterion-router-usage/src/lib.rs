@@ -7,7 +7,9 @@
 //! `src/shared/constants/pricing/`.
 
 pub mod pricing;
+pub mod provider_usage;
 pub mod records;
 
 pub use pricing::{ModelPrice, PriceTable};
-pub use records::{UsageRecord, record_usage};
+pub use provider_usage::CachedUsage;
+pub use records::{CallLogRecord, UsageRecord, record_call_log, record_usage};

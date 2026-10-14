@@ -26,3 +26,14 @@ Sidecar живёт и умирает вместе с приложением; е�
 - Один UI, одна кодовая база, два способа доставки.
 - Второй инстанс приложения упирается в занятый порт — известное ограничение
   (кандидат на single-instance guard).
+
+## Addendum 2026-09-29
+
+- Sidecar binary: `heterion-router-gateway` (не `omniroute-gateway`).
+- Injected global: `window.__HETERION_ROUTER_GATEWAY_URL__`;
+  `__OMNIROUTE_GATEWAY_URL__` читается только как legacy fallback.
+- Single-instance guard реализован первым Tauri plugin; прежнее ограничение
+  снято.
+- Sidecar по-прежнему не имеет readiness handshake/respawn; bundle
+  (`cargo tauri build`) проверен локально, но adhoc-signed и не notarized.
+  Детали и port-mismatch с Vite/API fallback: `docs/research/PROJECT-AUDIT-2026-09.md`.

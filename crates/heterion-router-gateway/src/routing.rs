@@ -1,10 +1,12 @@
 //! Routing backend: model-based selection with failover.
 //!
-//! Phase 4 slice. A [`RoutingBackend`] holds named backends, asks the
-//! [`Router`] which to try for a model, skips tripped breakers, and falls
-//! back on failure for non-streaming requests. Streaming uses the first
-//! allowed backend (no mid-stream failover yet); per-attempt usage
-//! attribution is a follow-up, so usage currently records `routing`.
+//! A [`RoutingBackend`] holds named backends, asks the [`Router`] which to
+//! try for a model, skips tripped breakers, and falls back on failure for
+//! non-streaming requests. Streaming uses the first allowed backend (no
+//! mid-stream failover yet). Because the router dispatches to backends that
+//! do the real serving, it also records which one served each request, keyed
+//! by the gateway's request token, so usage rows name a provider instead of
+//! `routing`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -19,9 +21,23 @@ use heterion_router_routing::{BreakerSet, Router};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::backend::{ChatBackend, ChunkStream};
-use crate::combos::{load_combos, plan_steps, ComboConfig};
-use std::collections::HashMap as StdHashMap;
+use crate::backend::{ATTRIBUTION_TOKEN, Attribution, ChatBackend, ChunkStream, request_token};
+use crate::combos::{ComboConfig, load_combos, plan_steps};
+use crate::upstream_status_or_recovered;
+
+/// How many finished requests keep an attribution for. Bounded so a request
+/// that is never booked (a `no_log` key) cannot grow the ring without limit.
+const ATTRIBUTION_SLOTS: usize = 256;
+
+/// Everything one request needs before the first attempt.
+struct Plan {
+    /// Retry/failover settings from the combo row, defaults otherwise.
+    config: ComboConfig,
+    /// Ordered `(backend, model)` attempts; empty means "nothing can serve it".
+    steps: Vec<(String, String)>,
+    /// Combo the request is served through, when it is served through one.
+    combo_name: Option<String>,
+}
 
 /// Backend router with failover.
 #[derive(Clone)]
@@ -31,7 +47,11 @@ pub struct RoutingBackend {
     breakers: Arc<Mutex<BreakerSet>>,
     db: Option<Arc<Db>>,
     registry: Option<Arc<ProviderRegistry>>,
-    combo_configs: Arc<StdHashMap<String, ComboConfig>>,
+    /// Who served which request: `request token -> Attribution`.
+    ///
+    /// Keyed rather than a single "last served" slot, because concurrent
+    /// requests would otherwise read each other's provider.
+    attributions: Arc<Mutex<Vec<(String, Attribution)>>>,
 }
 
 /// Whether a failure means the backend itself is unhealthy.
@@ -43,7 +63,7 @@ pub struct RoutingBackend {
 /// a working provider.
 fn is_backend_outage(error: &GatewayError) -> bool {
     match error {
-        GatewayError::Upstream(message) => match upstream_status(message) {
+        GatewayError::Upstream(message) => match upstream_status_or_recovered(message) {
             Some(status) => status >= 500,
             // No status means the call never landed (transport, DNS, TLS,
             // exhausted credentials): the backend is unreachable.
@@ -52,16 +72,6 @@ fn is_backend_outage(error: &GatewayError) -> bool {
         // Nothing-to-serve is a routing outcome, not a backend fault.
         GatewayError::UnknownModel(_) | GatewayError::InvalidRequest(_) => false,
     }
-}
-
-/// Parse the code out of the HTTP client's `upstream status {code}: {body}`.
-fn upstream_status(message: &str) -> Option<u16> {
-    let rest = message.strip_prefix("upstream status ")?;
-    rest.chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .ok()
 }
 
 /// Error for a plan that exists but is entirely in breaker cooldown.
@@ -76,6 +86,15 @@ fn no_candidate(model: &str) -> GatewayError {
     GatewayError::UnknownModel(format!(
         "{model} (no backend can serve it; check the combo entries or provider credentials)"
     ))
+}
+
+/// One attempt against a named backend: the request leaves without the
+/// internal attribution token, which no upstream may ever see.
+fn attempt(request: &ChatCompletionRequest, model: &str) -> ChatCompletionRequest {
+    let mut attempt = request.clone();
+    attempt.model = model.to_string();
+    attempt.extra.remove(ATTRIBUTION_TOKEN);
+    attempt
 }
 
 impl RoutingBackend {
@@ -97,22 +116,14 @@ impl RoutingBackend {
             breakers: Arc::new(Mutex::new(BreakerSet::new(threshold, cooldown_secs))),
             db: None,
             registry: None,
-            combo_configs: Arc::new(StdHashMap::new()),
+            attributions: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Attach a database + registry for combo-name expansion.
     pub fn with_combo_source(mut self, db: Arc<Db>, registry: Arc<ProviderRegistry>) -> Self {
-        let guard = db.connection();
-        let combos = load_combos(&guard);
-        let mut configs = StdHashMap::new();
-        for (name, combo) in &combos {
-            configs.insert(name.clone(), combo.config.clone());
-        }
-        drop(guard);
         self.db = Some(db);
         self.registry = Some(registry);
-        self.combo_configs = Arc::new(configs);
         self
     }
 
@@ -122,23 +133,89 @@ impl RoutingBackend {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Get retry config for a model, falling back to defaults.
-    fn combo_config(&self, model: &str) -> ComboConfig {
-        if let Some(db) = self.db.as_ref() {
-            let guard = db.connection();
-            let combos = load_combos(&guard);
-            if let Some(combo) = combos.get(model) {
-                return combo.config.clone();
-            }
+    fn lock_attributions(&self) -> std::sync::MutexGuard<'_, Vec<(String, Attribution)>> {
+        self.attributions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Remember that `backend` handled the request stamped `token`.
+    ///
+    /// The provider id is the key this router dispatches under, which is the
+    /// canonical provider id; the connection id comes from the executor that
+    /// actually ran, and only from
+    /// [`Self::dispatch_head_connection_id`] when the executor cannot name
+    /// one. Failures are attributed too: "which provider is rate-limiting us"
+    /// is the question this data exists to answer.
+    fn attribute(
+        &self,
+        token: Option<&str>,
+        provider: &str,
+        backend: &dyn ChatBackend,
+        combo_name: Option<&str>,
+    ) {
+        let Some(token) = token else {
+            return;
+        };
+        let connection_id = backend
+            .attribution(token)
+            .connection_id
+            .or_else(|| self.dispatch_head_connection_id(provider));
+        let attribution = Attribution {
+            provider: Some(provider.to_string()),
+            connection_id,
+            combo_name: combo_name.map(str::to_string),
+        };
+        let mut entries = self.lock_attributions();
+        if entries.len() >= ATTRIBUTION_SLOTS {
+            entries.remove(0);
         }
-        ComboConfig::default()
+        entries.retain(|(key, _)| key != token);
+        entries.push((token.to_string(), attribution));
+    }
+
+    /// The `provider_connections` row to name when the executor that served
+    /// the request could not name one itself.
+    ///
+    /// It is the head of [`heterion_router_db::repos::active_connection_ids`]
+    /// — `priority DESC, id ASC` — which is the exact order
+    /// [`crate::credentials::load_credentials`] builds the dispatch pool in and
+    /// the exact order [`crate::backend::next_token`] rotates over, so the id
+    /// recorded is always a row that was in the pool and that dispatch tries
+    /// before any other: the request's first credential attempt. For a
+    /// single-row provider that is the row that really served, exactly; for a
+    /// rotating multi-row pool it is the row a per-request rotation cannot be
+    /// asked to name, and the head is the only honest deterministic answer.
+    ///
+    /// Why not leave it `None`, the way this used to for any provider with two
+    /// or more accounts: `None` is what made the multi-account case useless,
+    /// and a multi-account provider is precisely the case an operator is
+    /// asking about — "which of my four Grok accounts just spent the quota?"
+    /// In the dashboard a `NULL` `connection_id` leaves every per-account
+    /// rollup empty and is indistinguishable from the gateway having lost
+    /// track of the provider entirely, while naming the dispatch head keeps
+    /// the column joinable, keeps the number consistent with what the gateway
+    /// sent, and is right whenever the pool was not mid-rotation. A recorded
+    /// row that is one rotation step off is a fact about the pool; a missing
+    /// row is a fact about nothing.
+    ///
+    /// A provider with no active row at all — a keyless one such as
+    /// `heterion-local`, or one whose credentials were all disabled — returns
+    /// `None`, because there is no row to name.
+    fn dispatch_head_connection_id(&self, provider: &str) -> Option<String> {
+        let db = self.db.as_ref()?;
+        let guard = db.connection();
+        heterion_router_db::repos::active_connection_ids(&guard, provider)
+            .ok()?
+            .into_iter()
+            .next()
     }
 
     /// Whether the error is transient and worth retrying.
     fn is_transient(error: &GatewayError) -> bool {
         match error {
             GatewayError::Upstream(msg) => {
-                if let Some(status) = upstream_status(msg) {
+                if let Some(status) = upstream_status_or_recovered(msg) {
                     status == 429 || status >= 500
                 } else {
                     true
@@ -148,12 +225,20 @@ impl RoutingBackend {
         }
     }
 
-    /// Ordered `(backend, model)` attempts for a requested model name.
+    /// Retry config, candidate plan and combo name for a requested model.
     ///
-    /// Resolution order: combo name → `provider/model` id → prefix rule.
-    /// An empty plan means "nothing can serve this", which the caller turns
-    /// into an error (never a fabricated answer).
-    fn plan(&self, model: &str) -> Vec<(String, String)> {
+    /// Resolution order: `provider/model` id → combo name → prefix rule. The
+    /// combo store is consulted at most once per request, and only when the
+    /// request is not already a `provider/model` id. A store that cannot be
+    /// read is reported as such: clients must not be sent hunting for a model
+    /// typo that does not exist.
+    fn resolve(&self, model: &str) -> Result<Plan, GatewayError> {
+        let prefix_plan = || Plan {
+            config: ComboConfig::default(),
+            steps: self.prefix_plan(model),
+            combo_name: None,
+        };
+
         // `provider/model` ids map straight to a provider backend, which is
         // what `/v1/models` advertises. The prefix may be an alias (`ds/…`),
         // so it is canonicalized before the backend lookup.
@@ -166,23 +251,46 @@ impl RoutingBackend {
                 .and_then(|registry| registry.canonical_id(prefix))
                 .unwrap_or(prefix);
             if self.backends.contains_key(provider) {
-                return vec![(provider.to_string(), rest.to_string())];
+                return Ok(Plan {
+                    config: ComboConfig::default(),
+                    steps: vec![(provider.to_string(), rest.to_string())],
+                    combo_name: None,
+                });
             }
         }
 
-        if let (Some(db), Some(registry)) = (self.db.as_ref(), self.registry.as_ref()) {
-            let guard = db.connection();
-            let combos = load_combos(&guard);
-            if let Some(combo) = combos.get(model) {
-                let available: HashSet<String> = self.backends.keys().cloned().collect();
-                let steps = plan_steps(combo, registry, &available);
-                if !steps.is_empty() {
-                    return steps;
-                }
-                // No servable entry: fall through to prefix routing so an
-                // under-provisioned combo degrades like an unknown model.
-            }
+        let (Some(db), Some(registry)) = (self.db.as_ref(), self.registry.as_ref()) else {
+            return Ok(prefix_plan());
+        };
+        let guard = db.connection();
+        let combos = load_combos(&guard).map_err(|error| {
+            tracing::warn!("combo store read failed: {error}");
+            GatewayError::Upstream("combo store unavailable".to_string())
+        })?;
+        let Some(combo) = combos.get(model) else {
+            return Ok(prefix_plan());
+        };
+        let available: HashSet<String> = self.backends.keys().cloned().collect();
+        let steps = plan_steps(combo, registry, &available);
+        let config = combo.config.clone();
+        // No servable entry: fall through to prefix routing so an
+        // under-provisioned combo degrades like an unknown model.
+        if steps.is_empty() {
+            return Ok(Plan {
+                config,
+                steps: self.prefix_plan(model),
+                combo_name: None,
+            });
         }
+        Ok(Plan {
+            config,
+            steps,
+            combo_name: Some(model.to_string()),
+        })
+    }
+
+    /// Candidates from the explicit route rules (no combos involved).
+    fn prefix_plan(&self, model: &str) -> Vec<(String, String)> {
         self.router
             .route(model)
             .into_iter()
@@ -197,15 +305,34 @@ impl ChatBackend for RoutingBackend {
         "routing"
     }
 
+    fn attribution(&self, token: &str) -> Attribution {
+        self.lock_attributions()
+            .iter()
+            .find(|(key, _)| key == token)
+            .map(|(_, attribution)| attribution.clone())
+            // Nothing was dispatched for this token — the request never
+            // reached a provider (unknown model, every combo step failed), so
+            // there is no provider to name.
+            .unwrap_or_else(|| Attribution {
+                provider: None,
+                connection_id: None,
+                combo_name: None,
+            })
+    }
+
     async fn complete(
         &self,
         request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         let model = request.model.clone();
-        let config = self.combo_config(&model);
+        let token = request_token(&request);
+        let Plan {
+            config,
+            steps: plan,
+            combo_name,
+        } = self.resolve(&model)?;
         let mut last_error: Option<GatewayError> = None;
         let mut tripped = false;
-        let plan = self.plan(&model);
 
         for (name, target_model) in &plan {
             let mut retry_count = 0;
@@ -217,27 +344,39 @@ impl ChatBackend for RoutingBackend {
                 let Some(backend) = self.backends.get(name) else {
                     break;
                 };
-                let mut attempt = request.clone();
-                attempt.model = target_model.clone();
-                match backend.complete(attempt).await {
+                match backend.complete(attempt(&request, target_model)).await {
                     Ok(response) => {
                         self.lock_breakers().record_success(name);
+                        self.attribute(
+                            token.as_deref(),
+                            name,
+                            backend.as_ref(),
+                            combo_name.as_deref(),
+                        );
                         return Ok(response);
                     }
                     Err(error) => {
                         if is_backend_outage(&error) {
                             self.lock_breakers().record_failure(name, Instant::now());
                         }
+                        self.attribute(
+                            token.as_deref(),
+                            name,
+                            backend.as_ref(),
+                            combo_name.as_deref(),
+                        );
+                        let transient = Self::is_transient(&error);
                         last_error = Some(error);
-                        if retry_count < config.max_retries && Self::is_transient(last_error.as_ref().unwrap()) {
+                        if retry_count < config.max_retries && transient {
                             retry_count += 1;
                             if config.failover_before_retry {
                                 break;
                             }
                             if config.retry_delay_ms > 0 {
-                                tokio::time::sleep(
-                                    std::time::Duration::from_millis(config.retry_delay_ms),
-                                ).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    config.retry_delay_ms,
+                                ))
+                                .await;
                             }
                             continue;
                         }
@@ -259,13 +398,25 @@ impl ChatBackend for RoutingBackend {
     fn stream(&self, request: ChatCompletionRequest) -> ChunkStream {
         let this = self.clone();
         let model = request.model.clone();
-        let config = this.combo_config(&model);
+        let token = request_token(&request);
         let (tx, rx) = mpsc::channel(64);
 
         tokio::spawn(async move {
+            let Plan {
+                config,
+                steps: plan,
+                combo_name,
+            } = match this.resolve(&model) {
+                Ok(resolved) => resolved,
+                // Say the combo store is unavailable instead of streaming a
+                // fabricated "unknown model".
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+            };
             let mut last_error: Option<GatewayError> = None;
             let mut tripped = false;
-            let plan = this.plan(&model);
 
             for (name, target_model) in &plan {
                 let mut retry_count = 0;
@@ -277,13 +428,17 @@ impl ChatBackend for RoutingBackend {
                     let Some(backend) = this.backends.get(name).cloned() else {
                         break;
                     };
-                    let mut attempt = request.clone();
-                    attempt.model = target_model.clone();
-                    let mut stream = backend.stream(attempt);
+                    let mut stream = backend.stream(attempt(&request, target_model));
 
                     match stream.next().await {
                         Some(Ok(first)) => {
                             this.lock_breakers().record_success(name);
+                            this.attribute(
+                                token.as_deref(),
+                                name,
+                                backend.as_ref(),
+                                combo_name.as_deref(),
+                            );
                             if tx.send(Ok(first)).await.is_err() {
                                 return;
                             }
@@ -298,16 +453,24 @@ impl ChatBackend for RoutingBackend {
                             if is_backend_outage(&error) {
                                 this.lock_breakers().record_failure(name, Instant::now());
                             }
+                            this.attribute(
+                                token.as_deref(),
+                                name,
+                                backend.as_ref(),
+                                combo_name.as_deref(),
+                            );
+                            let transient = Self::is_transient(&error);
                             last_error = Some(error);
-                            if retry_count < config.max_retries && Self::is_transient(last_error.as_ref().unwrap()) {
+                            if retry_count < config.max_retries && transient {
                                 retry_count += 1;
                                 if config.failover_before_retry {
                                     break;
                                 }
                                 if config.retry_delay_ms > 0 {
-                                    tokio::time::sleep(
-                                        std::time::Duration::from_millis(config.retry_delay_ms),
-                                    ).await;
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        config.retry_delay_ms,
+                                    ))
+                                    .await;
                                 }
                                 continue;
                             }
@@ -315,6 +478,12 @@ impl ChatBackend for RoutingBackend {
                         }
                         None => {
                             this.lock_breakers().record_success(name);
+                            this.attribute(
+                                token.as_deref(),
+                                name,
+                                backend.as_ref(),
+                                combo_name.as_deref(),
+                            );
                             return;
                         }
                     }
@@ -341,7 +510,9 @@ mod tests {
     use crate::backend::EchoBackend;
     use futures::StreamExt;
     use heterion_router_core::ChatMessage;
+    use heterion_router_providers::ProviderRegistry;
     use heterion_router_routing::RouteRule;
+    use serde_json::json;
 
     #[derive(Debug, Clone)]
     struct FailBackend;
@@ -454,10 +625,19 @@ mod tests {
 
     #[test]
     fn upstream_status_is_parsed_from_the_client_message() {
-        assert_eq!(upstream_status("upstream status 404: nope"), Some(404));
-        assert_eq!(upstream_status("upstream status 503: busy"), Some(503));
-        assert_eq!(upstream_status("upstream status : weird"), None);
-        assert_eq!(upstream_status("transport error"), None);
+        assert_eq!(
+            upstream_status_or_recovered("upstream status 404: nope"),
+            Some(404)
+        );
+        assert_eq!(
+            upstream_status_or_recovered("upstream status 503: busy"),
+            Some(503)
+        );
+        assert_eq!(
+            upstream_status_or_recovered("upstream status : weird"),
+            None
+        );
+        assert_eq!(upstream_status_or_recovered("transport error"), None);
     }
 
     #[tokio::test]
@@ -624,6 +804,377 @@ mod tests {
         assert_eq!(response.choices[0].message.text(), "echo: hi");
     }
 
+    /// A backend that names its own provider and connection, the way the
+    /// registry-driven executors do.
+    #[derive(Clone)]
+    struct AttributedBackend {
+        provider: &'static str,
+        connection: &'static str,
+    }
+
+    #[async_trait]
+    impl ChatBackend for AttributedBackend {
+        fn name(&self) -> &'static str {
+            "provider"
+        }
+
+        fn attribution(&self, _token: &str) -> Attribution {
+            Attribution {
+                provider: Some(self.provider.to_string()),
+                connection_id: Some(self.connection.to_string()),
+                combo_name: None,
+            }
+        }
+
+        async fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                id: "chatcmpl-attributed".to_string(),
+                object: "chat.completion",
+                created: 0,
+                model: request.model,
+                choices: vec![heterion_router_core::ChatChoice {
+                    index: 0,
+                    message: ChatMessage::plain("assistant".to_string(), "ok".to_string()),
+                    finish_reason: "stop".to_string(),
+                }],
+                usage: heterion_router_core::Usage::default(),
+                raw: None,
+            })
+        }
+
+        fn stream(&self, _request: ChatCompletionRequest) -> ChunkStream {
+            Box::pin(futures::stream::once(async {
+                Ok(heterion_router_core::StreamChunk::done("stop"))
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn attribution_is_keyed_per_request_not_per_backend() {
+        // Two providers, two requests in flight: a shared "last served" slot
+        // would hand one request the other's provider.
+        let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
+        for (provider, connection) in [("openrouter", "conn-a"), ("pollinations", "conn-b")] {
+            backends.insert(
+                provider.to_string(),
+                Arc::new(AttributedBackend {
+                    provider,
+                    connection,
+                }),
+            );
+        }
+        let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+
+        let mut first = request("openrouter/model");
+        first
+            .extra
+            .insert(ATTRIBUTION_TOKEN.to_string(), json!("t1"));
+        let mut second = request("pollinations/model");
+        second
+            .extra
+            .insert(ATTRIBUTION_TOKEN.to_string(), json!("t2"));
+
+        let (a, b) = tokio::join!(routing.complete(first), routing.complete(second));
+        a.unwrap();
+        b.unwrap();
+
+        let one = routing.attribution("t1");
+        assert_eq!(one.provider.as_deref(), Some("openrouter"));
+        assert_eq!(one.connection_id.as_deref(), Some("conn-a"));
+        let two = routing.attribution("t2");
+        assert_eq!(two.provider.as_deref(), Some("pollinations"));
+        assert_eq!(two.connection_id.as_deref(), Some("conn-b"));
+        // An unknown token names no provider at all — never a stale one, and
+        // never the router, which is not a provider and would otherwise land
+        // in `usage_history.provider` as if it were.
+        assert_eq!(routing.attribution("t3").provider, None);
+    }
+
+    /// An active `provider_connections` row for `provider`. No secrets: the
+    /// routing fallback only ever reads ids.
+    fn connection(db: &heterion_router_db::Db, id: &str, provider: &str, priority: i64) {
+        use heterion_router_db::repos;
+        let guard = db.connection();
+        repos::upsert_connection(
+            &guard,
+            &repos::ConnectionRow {
+                id: id.to_string(),
+                provider: provider.to_string(),
+                auth_type: Some("apikey".to_string()),
+                name: None,
+                email: None,
+                priority,
+                is_active: true,
+                access_token: None,
+                refresh_token: None,
+                expires_at: None,
+                api_key: Some(format!("secret-for-{id}")),
+                provider_specific_data: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// An in-memory database plus a routing backend whose per-provider
+    /// executors name nothing, which is how the real pool-less executors
+    /// behave — the DB fallback is the only source of a connection id.
+    fn routing_with_db(db: &Arc<heterion_router_db::Db>, providers: &[&str]) -> RoutingBackend {
+        let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
+        for provider in providers {
+            backends.insert((*provider).to_string(), Arc::new(AnonymousBackend));
+        }
+        RoutingBackend::new(backends, Router::new(vec![], vec![]))
+            .with_combo_source(Arc::clone(db), Arc::new(ProviderRegistry::load()))
+    }
+
+    fn memory_db() -> Arc<heterion_router_db::Db> {
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        db
+    }
+
+    fn stamped(model: &str, token: &str) -> ChatCompletionRequest {
+        let mut request = request(model);
+        request
+            .extra
+            .insert(ATTRIBUTION_TOKEN.to_string(), json!(token));
+        request
+    }
+
+    /// An executor that uses the default attribution: it names its provider
+    /// and no connection, so the routing fallback decides.
+    #[derive(Debug, Clone)]
+    struct AnonymousBackend;
+
+    #[async_trait]
+    impl ChatBackend for AnonymousBackend {
+        fn name(&self) -> &'static str {
+            "provider"
+        }
+
+        async fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                id: "chatcmpl-anonymous".to_string(),
+                object: "chat.completion",
+                created: 0,
+                model: request.model,
+                choices: vec![heterion_router_core::ChatChoice {
+                    index: 0,
+                    message: ChatMessage::plain("assistant".to_string(), "ok".to_string()),
+                    finish_reason: "stop".to_string(),
+                }],
+                usage: heterion_router_core::Usage::default(),
+                raw: None,
+            })
+        }
+
+        fn stream(&self, _request: ChatCompletionRequest) -> ChunkStream {
+            Box::pin(futures::stream::once(async {
+                Ok(heterion_router_core::StreamChunk::done("stop"))
+            }))
+        }
+    }
+
+    /// One active row: the id is that row, exactly.
+    #[tokio::test]
+    async fn sole_active_connection_is_the_attributed_row() {
+        let db = memory_db();
+        connection(&db, "conn-solo", "openrouter", 5);
+        let routing = routing_with_db(&db, &["openrouter"]);
+
+        routing
+            .complete(stamped("openrouter/model", "t1"))
+            .await
+            .unwrap();
+
+        let attributed = routing.attribution("t1");
+        assert_eq!(attributed.provider.as_deref(), Some("openrouter"));
+        assert_eq!(attributed.connection_id.as_deref(), Some("conn-solo"));
+    }
+
+    /// Several active rows: the recorded id is the head of dispatch order
+    /// (`priority DESC, id ASC`) — the row the credential pool puts at index
+    /// zero — so the dashboard names the account this request would be
+    /// charged to, not a blank and not an arbitrary row.
+    #[tokio::test]
+    async fn multi_connection_provider_names_the_dispatch_head() {
+        let db = memory_db();
+        connection(&db, "conn-low", "grok-cli", 1);
+        connection(&db, "conn-top", "grok-cli", 90);
+        connection(&db, "conn-mid", "grok-cli", 50);
+        let routing = routing_with_db(&db, &["grok-cli"]);
+
+        routing
+            .complete(stamped("grok-cli/grok-4.6", "t1"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            routing.attribution("t1").connection_id.as_deref(),
+            Some("conn-top"),
+            "highest priority wins, and the id is a row the request could use"
+        );
+    }
+
+    /// A priority tie is broken by id, so the head is stable across calls.
+    #[tokio::test]
+    async fn tied_priorities_break_the_tie_by_id() {
+        let db = memory_db();
+        connection(&db, "conn-b", "grok-cli", 7);
+        connection(&db, "conn-a", "grok-cli", 7);
+        let routing = routing_with_db(&db, &["grok-cli"]);
+
+        for token in ["t1", "t2", "t3"] {
+            routing
+                .complete(stamped("grok-cli/grok-4.6", token))
+                .await
+                .unwrap();
+            assert_eq!(
+                routing.attribution(token).connection_id.as_deref(),
+                Some("conn-a"),
+                "id ASC is the second key, so the head does not drift"
+            );
+        }
+    }
+
+    /// An inactive row is not in the pool, so it can never be named; no
+    /// active row means no row at all rather than a dangling id.
+    #[tokio::test]
+    async fn a_provider_without_active_connections_names_no_row() {
+        use heterion_router_db::repos;
+
+        let db = memory_db();
+        connection(&db, "conn-off", "pollinations", 100);
+        {
+            let guard = db.connection();
+            let mut row = repos::get_connection(&guard, "conn-off").unwrap().unwrap();
+            row.is_active = false;
+            repos::upsert_connection(&guard, &row).unwrap();
+        }
+        let routing = routing_with_db(&db, &["pollinations"]);
+
+        routing
+            .complete(stamped("pollinations/model", "t1"))
+            .await
+            .unwrap();
+
+        let attributed = routing.attribution("t1");
+        assert_eq!(attributed.provider.as_deref(), Some("pollinations"));
+        assert_eq!(attributed.connection_id, None);
+    }
+
+    /// An alias-keyed id (`grok-cli::acct-9f2a`) belongs to its own provider
+    /// and must never be handed to a provider whose name merely starts with
+    /// the same characters, in either direction.
+    #[tokio::test]
+    async fn alias_keyed_connections_stay_scoped_to_their_provider() {
+        let db = memory_db();
+        connection(&db, "grok-cli::acct-9f2a", "grok-cli", 3);
+        connection(&db, "grok-cli-acct-9f2a", "grok", 3);
+        let routing = routing_with_db(&db, &["grok-cli", "grok"]);
+
+        routing
+            .complete(stamped("grok-cli/grok-4.6", "t1"))
+            .await
+            .unwrap();
+        routing
+            .complete(stamped("grok/grok-4.6", "t2"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            routing.attribution("t1").connection_id.as_deref(),
+            Some("grok-cli::acct-9f2a"),
+            "the alias id comes back verbatim for its own provider"
+        );
+        assert_eq!(
+            routing.attribution("t2").connection_id.as_deref(),
+            Some("grok-cli-acct-9f2a"),
+            "and the other provider never sees the `::` row"
+        );
+    }
+
+    /// The row an executor reports is the one that really served; the
+    /// database is only consulted when the executor declines to say.
+    #[tokio::test]
+    async fn a_reported_connection_beats_the_database_head() {
+        let db = memory_db();
+        connection(&db, "conn-top", "openrouter", 90);
+        connection(&db, "conn-served", "openrouter", 1);
+        let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
+        backends.insert(
+            "openrouter".to_string(),
+            Arc::new(AttributedBackend {
+                provider: "openrouter",
+                connection: "conn-served",
+            }),
+        );
+        let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]))
+            .with_combo_source(Arc::clone(&db), Arc::new(ProviderRegistry::load()));
+
+        routing
+            .complete(stamped("openrouter/model", "t1"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            routing.attribution("t1").connection_id.as_deref(),
+            Some("conn-served"),
+            "the lower-priority row that really served wins over the head"
+        );
+    }
+
+    /// Regression guard for the fallback path itself: two providers, two
+    /// rows each, two requests in flight. A shared slot would hand one
+    /// request the other's provider *and* the other's account.
+    #[tokio::test]
+    async fn concurrent_requests_keep_their_own_connection() {
+        let db = memory_db();
+        connection(&db, "conn-a1", "openrouter", 90);
+        connection(&db, "conn-a2", "openrouter", 1);
+        connection(&db, "conn-b1", "pollinations", 90);
+        connection(&db, "conn-b2", "pollinations", 1);
+        let routing = routing_with_db(&db, &["openrouter", "pollinations"]);
+
+        let (a, b) = tokio::join!(
+            routing.complete(stamped("openrouter/model", "t1")),
+            routing.complete(stamped("pollinations/model", "t2"))
+        );
+        a.unwrap();
+        b.unwrap();
+
+        let one = routing.attribution("t1");
+        assert_eq!(one.provider.as_deref(), Some("openrouter"));
+        assert_eq!(one.connection_id.as_deref(), Some("conn-a1"));
+        let two = routing.attribution("t2");
+        assert_eq!(two.provider.as_deref(), Some("pollinations"));
+        assert_eq!(two.connection_id.as_deref(), Some("conn-b1"));
+    }
+
+    /// A keyless provider has no `provider_connections` row and no credential
+    /// at all, so it serves normally and records no row.
+    #[tokio::test]
+    async fn keyless_provider_serves_and_names_no_connection() {
+        let db = memory_db();
+        let routing = routing_with_db(&db, &["heterion-local"]);
+
+        let response = routing
+            .complete(stamped("heterion-local/grok-4.6", "t1"))
+            .await
+            .unwrap();
+        assert_eq!(response.choices[0].message.text(), "ok");
+
+        let attributed = routing.attribution("t1");
+        assert_eq!(attributed.provider.as_deref(), Some("heterion-local"));
+        assert_eq!(attributed.connection_id, None);
+    }
+
     #[tokio::test]
     async fn combo_name_expands_and_rewrites_model() {
         use heterion_router_db::{Db, repos};
@@ -635,18 +1186,19 @@ mod tests {
             let guard = db.connection();
             repos::upsert_combo(
                 &guard,
-                &repos::ComboRow {
-                    id: "c1".to_string(),
-                    name: "test-combo".to_string(),
-                    data: serde_json::json!({
-                        "strategy": "priority",
-                        "models": [
-                            {"kind": "model", "model": "grok-cli/grok-4.6", "providerId": "grok-cli"},
-                        ],
-                    })
-                    .to_string(),
-                    sort_order: 0,
-                },
+                 &repos::ComboRow {
+                     id: "c1".to_string(),
+                     name: "test-combo".to_string(),
+                     data: serde_json::json!({
+                         "strategy": "priority",
+                         "models": [
+                             {"kind": "model", "model": "grok-cli/grok-4.6", "providerId": "grok-cli"},
+                         ],
+                     })
+                     .to_string(),
+                     sort_order: 0,
+                     active: true,
+                 },
             )
             .unwrap();
         }

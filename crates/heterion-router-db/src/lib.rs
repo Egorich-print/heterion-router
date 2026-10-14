@@ -10,6 +10,8 @@
 //! `INSERT OR IGNORE` ledger rows, so attaching to a database owned by the
 //! Node server is safe. All reads name explicit columns.
 
+pub mod budget_repos;
+pub mod cache_repos;
 pub mod db;
 pub mod error;
 pub mod migrate;

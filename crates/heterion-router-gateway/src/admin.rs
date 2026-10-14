@@ -11,6 +11,10 @@
 //! rotation for providers is not exposed here; it stays a JS-dashboard/CLI
 //! operation until the Rust side owns decryption.
 
+use std::borrow::Cow;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path as StdPath, PathBuf};
+
 use axum::{
     Json,
     extract::{Path, Query, State},
@@ -22,8 +26,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
+use crate::JsonBody;
 use crate::apikeys;
-use crate::auth::Authenticated;
+use crate::auth::ManageAuthenticated;
 use crate::combos::{dispatch_backend, parse_combo_rich};
 use crate::restart;
 
@@ -48,7 +53,7 @@ impl ListQuery {
 }
 
 /// `GET /api/overview` — gateway identity, live backends and row counts.
-pub async fn overview(State(state): State<AppState>, _auth: Authenticated) -> Json<Value> {
+pub async fn overview(State(state): State<AppState>, _auth: ManageAuthenticated) -> Json<Value> {
     let mut combos = 0;
     let mut connections_active = 0;
     let mut connections_total = 0;
@@ -56,7 +61,7 @@ pub async fn overview(State(state): State<AppState>, _auth: Authenticated) -> Js
 
     if let Some(db) = state.db.as_ref() {
         let guard = db.connection();
-        combos = repos::list_combos(&guard)
+        combos = repos::list_active_combos(&guard)
             .map(|rows| rows.len())
             .unwrap_or(0);
         if let Ok(rows) = repos::list_connections(&guard) {
@@ -87,7 +92,7 @@ pub async fn overview(State(state): State<AppState>, _auth: Authenticated) -> Js
 ///
 /// `servable` per entry comes from the router's own predicate, so the UI shows
 /// exactly what the gateway would do.
-pub async fn combos(State(state): State<AppState>, _auth: Authenticated) -> Json<Value> {
+pub async fn combos(State(state): State<AppState>, _auth: ManageAuthenticated) -> Json<Value> {
     let Some(db) = state.db.as_ref() else {
         return Json(json!({ "combos": [] }));
     };
@@ -100,7 +105,7 @@ pub async fn combos(State(state): State<AppState>, _auth: Authenticated) -> Json
     let guard = db.connection();
     let mut out: Vec<Value> = Vec::new();
 
-    if let Ok(rows) = repos::list_combos(&guard) {
+    if let Ok(rows) = repos::list_active_combos(&guard) {
         for row in rows {
             let data: Value = serde_json::from_str(&row.data).unwrap_or(Value::Null);
             let (strategy, rich) = parse_combo_rich(&data).unwrap_or_default();
@@ -124,6 +129,7 @@ pub async fn combos(State(state): State<AppState>, _auth: Authenticated) -> Json
                 "strategy": strategy,
                 "sort_order": row.sort_order,
                 "is_hidden": is_hidden(&row.data),
+                "active": row.active,
                 "servable_entries": entries.iter().filter(|entry| entry["servable"] == json!(true)).count(),
                 "total_entries": entries.len(),
                 "entries": entries,
@@ -135,7 +141,7 @@ pub async fn combos(State(state): State<AppState>, _auth: Authenticated) -> Json
 }
 
 /// `GET /api/connections` — providers and their connections, secrets masked.
-pub async fn connections(State(state): State<AppState>, _auth: Authenticated) -> Json<Value> {
+pub async fn connections(State(state): State<AppState>, _auth: ManageAuthenticated) -> Json<Value> {
     let Some(db) = state.db.as_ref() else {
         return Json(json!({ "connections": [] }));
     };
@@ -191,9 +197,12 @@ pub async fn connections(State(state): State<AppState>, _auth: Authenticated) ->
 
 /// `GET /api/keys` — every API key, secrets masked to their prefix.
 ///
-/// Encrypted (`enc:v1:`) rows are listed honestly as unusable by this
-/// gateway, which matches plaintext secrets verbatim.
-pub async fn keys(State(state): State<AppState>, _auth: Authenticated) -> Json<Value> {
+/// Nothing here is credential material: the response carries the display
+/// prefix and metadata only, never `api_keys.key` and never `key_hash`. A row
+/// whose `key` column is `enc:v1:`-encrypted is reported as such — the
+/// plaintext branch of the credential predicate skips those rows, so they
+/// authenticate through their own `key_hash` and nothing else.
+pub async fn keys(State(state): State<AppState>, _auth: ManageAuthenticated) -> Json<Value> {
     let Some(db) = state.db.as_ref() else {
         return Json(json!({ "keys": [] }));
     };
@@ -233,12 +242,16 @@ pub struct CreateKeyBody {
 /// `POST /api/keys` — issue an operator key.
 ///
 /// Mirrors the JS dashboard's key shape (`sk-` + 32 hex, prefix, sha256
-/// hash, manage scope) so the key works on both sides. The full secret is
-/// returned exactly once; list endpoints never expose it.
+/// hash, manage scope) so the key works on both sides. The row keeps only the
+/// hash: `repos::insert_full_api_key` writes the `hash-only:<id>` marker into
+/// the `key` column, so nothing readable in the database — not the secret, not
+/// the digest, not the display prefix — can be presented back as a bearer
+/// token. The full secret is returned exactly once, here, and never logged or
+/// echoed into an error.
 pub async fn create_key(
     State(state): State<AppState>,
-    _auth: Authenticated,
-    Json(body): Json<CreateKeyBody>,
+    _auth: ManageAuthenticated,
+    JsonBody(body): crate::JsonBody<CreateKeyBody>,
 ) -> impl IntoResponse {
     let name = body.name.unwrap_or_default().trim().to_string();
     if name.is_empty() {
@@ -274,6 +287,8 @@ pub async fn create_key(
         let row = repos::NewApiKey {
             id: generated.id.clone(),
             name: name.clone(),
+            // Carried for the caller that returns it once; the row keeps the
+            // hash only, so the secret is not recoverable from the database.
             key: generated.secret.clone(),
             key_prefix: generated.prefix.clone(),
             key_hash: generated.hash.clone(),
@@ -315,7 +330,7 @@ pub async fn create_key(
 /// request. Idempotent.
 pub async fn revoke_key(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: ManageAuthenticated,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     set_key_revoked(state, &id, true).await
@@ -324,7 +339,7 @@ pub async fn revoke_key(
 /// `POST /api/keys/:id/restore` — un-revoke a key. Idempotent.
 pub async fn restore_key(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: ManageAuthenticated,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     set_key_revoked(state, &id, false).await
@@ -374,7 +389,7 @@ async fn set_key_revoked(state: AppState, id: &str, revoked: bool) -> (StatusCod
 /// answers 409 so a dev-process operator never kills their own shell by
 /// accident. The restart re-execs the same binary ~2s after the 202, so
 /// in-flight requests are dropped — call it from a quiet moment.
-pub async fn restart_service(_auth: Authenticated) -> impl IntoResponse {
+pub async fn restart_service(_auth: ManageAuthenticated) -> impl IntoResponse {
     let label = restart::service_label();
     let Some(uid) = restart::current_uid() else {
         return (
@@ -403,7 +418,7 @@ pub async fn restart_service(_auth: Authenticated) -> impl IntoResponse {
 /// `GET /api/usage?days=7&limit=10` — totals plus top providers and models.
 pub async fn usage(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: ManageAuthenticated,
     Query(query): Query<ListQuery>,
 ) -> Json<Value> {
     let Some(db) = state.db.as_ref() else {
@@ -438,6 +453,14 @@ pub async fn usage(
         "tokens_input": summary.tokens_input,
         "tokens_output": summary.tokens_output,
         "tokens_cache_read": summary.tokens_cache_read,
+        // Percentiles, not just sums: an operator reading a dashboard needs
+        // the tail, and the tail is also the only data source a
+        // `least-latency` routing strategy will ever have.
+        "latency": {
+            "p50_ms": summary.latency.p50_ms,
+            "p95_ms": summary.latency.p95_ms,
+            "p99_ms": summary.latency.p99_ms,
+        },
         "by_provider": buckets(&summary.by_provider),
         "by_model": buckets(&summary.by_model),
     }))
@@ -446,7 +469,7 @@ pub async fn usage(
 /// `GET /api/logs?limit=50` — recent calls, newest first.
 pub async fn logs(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: ManageAuthenticated,
     Query(query): Query<ListQuery>,
 ) -> Json<Value> {
     let Some(db) = state.db.as_ref() else {
@@ -479,27 +502,89 @@ pub async fn logs(
     Json(json!({ "logs": logs }))
 }
 
+fn application_log_path(data_dir: &StdPath) -> PathBuf {
+    let direct = data_dir.join("gateway.log");
+    if direct.is_file() {
+        return direct;
+    }
+    std::fs::read_dir(data_dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("gateway.log."))
+        })
+        .max_by_key(|path| {
+            path.file_name()
+                .map(|name| name.to_owned())
+                .unwrap_or_default()
+        })
+        .unwrap_or(direct)
+}
+
+/// Bytes read from the end of an application log (512 KiB). `GET /api/logs/app`
+/// returns at most 1000 lines, so reading the whole daily log only ever
+/// allocated megabytes to throw them away. The window is generous enough to
+/// cover the limit many times over at any realistic line length.
+pub const APP_LOG_TAIL_BYTES: usize = 512 * 1024;
+
+/// Last `limit` lines of a log file, oldest first, reading only the tail.
+///
+/// Missing/unreadable files yield no lines, as before. When the read window
+/// starts mid-file the first (partial) line is dropped, and when the cut
+/// lands inside a multi-byte character the leading bytes are trimmed rather
+/// than decoded, so a truncated read can never panic or emit a replacement
+/// character.
+fn tail_lines(path: &StdPath, limit: usize) -> Vec<String> {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return Vec::new();
+    };
+    let start = len.saturating_sub(APP_LOG_TAIL_BYTES as u64);
+    let mut window = Vec::with_capacity((len - start) as usize);
+    if file.seek(SeekFrom::Start(start)).is_err()
+        || file.take(len - start).read_to_end(&mut window).is_err()
+    {
+        return Vec::new();
+    }
+    let text: Cow<'_, str> = match std::str::from_utf8(&window) {
+        Ok(text) => Cow::Borrowed(text),
+        // A multi-byte character straddles the cut: skip its leading bytes,
+        // and only fall back to lossy for a genuinely corrupt log.
+        Err(_) => (1..=3)
+            .find_map(|skip| std::str::from_utf8(&window[skip..]).ok())
+            .map_or_else(|| String::from_utf8_lossy(&window), Cow::Borrowed),
+    };
+    let mut lines: Vec<&str> = text.lines().collect();
+    let start_index = lines.len().saturating_sub(limit);
+    lines
+        .split_off(start_index)
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
 /// `GET /api/logs/app?limit=50` — recent application/tracing log lines.
 pub async fn logs_app(
     State(state): State<AppState>,
+    _auth: ManageAuthenticated,
     Query(query): Query<LogAppQuery>,
 ) -> Json<Value> {
     let Some(data_dir) = state.data_dir.as_ref() else {
         return Json(json!({ "lines": [] }));
     };
-    let log_path = data_dir.join("gateway.log");
+    let log_path = application_log_path(data_dir);
     let limit = query.limit().min(1000) as usize;
 
-    let lines = match std::fs::read_to_string(&log_path) {
-        Ok(content) => {
-            let all: Vec<String> = content.lines().map(String::from).collect();
-            let start = all.len().saturating_sub(limit);
-            all[start..].to_vec()
-        }
-        Err(_) => vec![],
-    };
-
-    Json(json!({ "lines": lines }))
+    Json(json!({ "lines": tail_lines(&log_path, limit) }))
 }
 
 /// Query for the application log endpoint.
@@ -532,6 +617,7 @@ pub struct UpdateComboBody {
     pub name: Option<String>,
     pub sort_order: Option<i64>,
     pub is_hidden: Option<bool>,
+    pub is_active: Option<bool>,
     pub strategy: Option<String>,
     pub models: Option<Vec<ComboModelBody>>,
 }
@@ -576,9 +662,9 @@ fn is_unique_violation(error: &heterion_router_db::DbError) -> bool {
 /// unknown strategy, or sends an empty/unusable model list.
 pub async fn update_combo(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: ManageAuthenticated,
     Path(id): Path<String>,
-    Json(body): Json<UpdateComboBody>,
+    JsonBody(body): crate::JsonBody<UpdateComboBody>,
 ) -> impl IntoResponse {
     if let Some(name) = body.name.as_deref()
         && name.trim().is_empty()
@@ -632,6 +718,7 @@ pub async fn update_combo(
         name: body.name.map(|name| name.trim().to_string()),
         sort_order: body.sort_order,
         is_hidden: body.is_hidden,
+        is_active: body.is_active,
         strategy: body.strategy,
         models,
     };
@@ -662,6 +749,7 @@ pub async fn update_combo(
                 "name": row.name,
                 "sort_order": row.sort_order,
                 "is_hidden": is_hidden(&row.data),
+                "active": row.active,
             })),
         ),
         Ok(None) => (
@@ -686,9 +774,9 @@ pub async fn update_combo(
 /// once at startup, so the live gateway only picks the change up on restart.
 pub async fn update_connection(
     State(state): State<AppState>,
-    _auth: Authenticated,
+    _auth: ManageAuthenticated,
     Path(id): Path<String>,
-    Json(body): Json<UpdateConnectionBody>,
+    JsonBody(body): crate::JsonBody<UpdateConnectionBody>,
 ) -> impl IntoResponse {
     if body.name.is_none() && body.is_active.is_none() && body.priority.is_none() {
         return (
@@ -734,5 +822,416 @@ pub async fn update_connection(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": error.to_string() })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+    use std::path::{Path as StdPath, PathBuf};
+    use std::sync::Arc;
+
+    use axum::extract::{Query, State};
+    use serde_json::Value;
+
+    use super::*;
+    use crate::auth::ManageAuthenticated;
+    use crate::backend::EchoBackend;
+
+    /// Counts live bytes allocated by the *current thread* while armed, so a
+    /// test can prove a handler did not pull a whole file into memory. Only
+    /// armed tests pay for the bookkeeping; the counters are const-init
+    /// `Cell`s (no destructor), so the allocator never allocates or unwinds.
+    struct AllocationProbe;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static LIVE: Cell<isize> = const { Cell::new(0) };
+        static PEAK: Cell<isize> = const { Cell::new(0) };
+    }
+
+    fn adjust(delta: isize) {
+        if !ARMED.get() {
+            return;
+        }
+        let live = LIVE.get() + delta;
+        LIVE.set(live);
+        PEAK.set(PEAK.get().max(live));
+    }
+
+    // SAFETY: every method forwards to `System`, the global allocator, with
+    // the layout it was given, so alignment/size are the std contract's. The
+    // only added work is a const-init `Cell` update on the current thread, so
+    // no other thread observes it and the allocator never re-enters itself
+    // (the counters have no destructor and allocate nothing).
+    // SAFETY: see the note directly above this impl.
+    unsafe impl GlobalAlloc for AllocationProbe {
+        // SAFETY: forwarding to `System.alloc` with the same `layout`.
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: as above.
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                adjust(layout.size() as isize);
+            }
+            ptr
+        }
+
+        // SAFETY: as above.
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            // SAFETY: as above.
+            let ptr = unsafe { System.alloc_zeroed(layout) };
+            if !ptr.is_null() {
+                adjust(layout.size() as isize);
+            }
+            ptr
+        }
+
+        // SAFETY: as above — the pointer came from this allocator.
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: as above.
+            unsafe { System.dealloc(ptr, layout) };
+            adjust(-(layout.size() as isize));
+        }
+
+        // SAFETY: as above — the pointer came from this allocator.
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            // SAFETY: as above.
+            let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+            if !new_ptr.is_null() {
+                adjust(new_size as isize - layout.size() as isize);
+            }
+            new_ptr
+        }
+    }
+
+    #[global_allocator]
+    static PROBE: AllocationProbe = AllocationProbe;
+
+    /// Peak live bytes allocated on this thread while `f` runs.
+    fn peak_bytes<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        LIVE.set(0);
+        PEAK.set(0);
+        ARMED.set(true);
+        let out = f();
+        ARMED.set(false);
+        (out, PEAK.get().max(0) as usize)
+    }
+
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "heterion-router-admin-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_log(dir: &StdPath, content: &[u8]) {
+        std::fs::write(dir.join("gateway.log"), content).unwrap();
+    }
+
+    /// Call `GET /api/logs/app` the way axum does and return its JSON body.
+    async fn get_app_log(dir: &StdPath, limit: Option<u32>) -> Value {
+        let state = AppState::new(Arc::new(EchoBackend)).with_data_dir(dir.to_path_buf());
+        let query = LogAppQuery { limit };
+        logs_app(State(state), ManageAuthenticated, Query(query))
+            .await
+            .0
+    }
+
+    fn lines_of(value: &Value) -> Vec<String> {
+        value["lines"]
+            .as_array()
+            .expect("lines array")
+            .iter()
+            .map(|line| line.as_str().expect("string line").to_string())
+            .collect()
+    }
+
+    /// The contract as it stood before the tail-read fix: last `limit` lines
+    /// of the whole file, oldest first.
+    fn expected_tail(content: &[u8], limit: usize) -> Vec<String> {
+        let text = String::from_utf8_lossy(content);
+        let all: Vec<&str> = text.lines().collect();
+        all[all.len().saturating_sub(limit)..]
+            .iter()
+            .map(|line| line.to_string())
+            .collect()
+    }
+
+    // --- The `api_keys.key` digest-is-a-credential exploit (W-13 / C-9 / E4),
+    // driven through the real issuance path.
+
+    /// Run the `Authenticated` extractor over a bearer token, exactly as axum
+    /// does for `/v1/*`. `Ok(())` authenticated; `Err` is the rejection status.
+    async fn authenticate(
+        state: &AppState,
+        token: &str,
+    ) -> std::result::Result<(), axum::http::StatusCode> {
+        use axum::body::Body;
+        use axum::extract::FromRequestParts;
+        use axum::http::Request;
+
+        let request = Request::builder()
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (mut parts, _) = request.into_parts();
+        <crate::auth::Authenticated as FromRequestParts<AppState>>::from_request_parts(
+            &mut parts, state,
+        )
+        .await
+        .map(|_authenticated| ())
+        .map_err(|rejection| rejection.status())
+    }
+
+    /// Issue a key through `POST /api/keys` against a throwaway database file
+    /// (never a live `~/.heterion-router`), then read the row back raw.
+    async fn issue_key_on_disk(dir: &StdPath) -> (AppState, Value, String, String) {
+        use http_body_util::BodyExt;
+
+        let db =
+            std::sync::Arc::new(heterion_router_db::Db::open(&dir.join("storage.sqlite")).unwrap());
+        db.migrate().unwrap();
+        let state = AppState::with_db(Arc::new(EchoBackend), db.clone());
+
+        let response = create_key(
+            State(state.clone()),
+            ManageAuthenticated,
+            JsonBody(CreateKeyBody {
+                name: Some("ops".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).expect("json body");
+        let secret = body["key"].as_str().expect("secret once").to_string();
+        assert!(secret.starts_with("sk-"));
+
+        let (stored_key, stored_hash) = {
+            let guard = db.connection();
+            guard
+                .query_row(
+                    "SELECT key, key_hash FROM api_keys WHERE id = ?1",
+                    rusqlite::params![body["id"].as_str().expect("id")],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap()
+        };
+        (state, body, stored_key, stored_hash)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_issued_key_stores_nothing_that_authenticates() {
+        let dir = scratch_dir("key-exploit");
+        let (state, body, stored_key, stored_hash) = issue_key_on_disk(&dir).await;
+        let secret = body["key"].as_str().unwrap().to_string();
+
+        assert_eq!(stored_hash, repos::api_key_hash(&secret));
+        assert!(
+            authenticate(&state, &secret).await.is_ok(),
+            "the secret returned once must authenticate"
+        );
+        for (label, presented) in [("key column", &stored_key), ("digest", &stored_hash)] {
+            assert_eq!(
+                authenticate(&state, presented).await,
+                Err(axum::http::StatusCode::UNAUTHORIZED),
+                "the value read from the {label} authenticated as a bearer token"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_key_list_endpoint_never_returns_the_secret_or_digest() {
+        let dir = scratch_dir("key-list");
+        let (state, body, stored_key, stored_hash) = issue_key_on_disk(&dir).await;
+        let secret = body["key"].as_str().unwrap().to_string();
+
+        let listed = keys(State(state), ManageAuthenticated).await.0;
+        let rendered = listed.to_string();
+        assert!(
+            !rendered.contains(&secret),
+            "GET /api/keys leaked the secret"
+        );
+        assert!(
+            !rendered.contains(&stored_key),
+            "GET /api/keys leaked api_keys.key"
+        );
+        assert!(
+            !rendered.contains(&stored_hash),
+            "GET /api/keys leaked the digest"
+        );
+        assert_eq!(listed["keys"][0]["id"], body["id"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A legacy row from the frozen JS server: plaintext in `key`, matched
+    /// verbatim. It must keep authenticating after the fix.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_legacy_plaintext_row_still_authenticates() {
+        let dir = scratch_dir("key-legacy");
+        let db =
+            std::sync::Arc::new(heterion_router_db::Db::open(&dir.join("storage.sqlite")).unwrap());
+        db.migrate().unwrap();
+        {
+            let guard = db.connection();
+            guard
+                .execute(
+                    "INSERT INTO api_keys (id, name, key, allowed_models, scopes, created_at)
+                     VALUES ('js-1', 'js-1', 'sk-legacy-plaintext-synthetic', '[]',
+                             '[\"manage\"]', datetime('now'))",
+                    [],
+                )
+                .unwrap();
+        }
+        let state = AppState::with_db(Arc::new(EchoBackend), db);
+        assert_eq!(
+            authenticate(&state, "sk-legacy-plaintext-synthetic").await,
+            Ok(()),
+            "legacy plaintext rows must keep working"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dated_application_log_is_discovered() {
+        let dir =
+            std::env::temp_dir().join(format!("heterion-router-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("gateway.log.2026-09-24"), "line\n").unwrap();
+        assert!(application_log_path(&dir).ends_with("gateway.log.2026-09-24"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dated_application_log_is_discovered_in_scratch() {
+        let dir = scratch_dir("dated");
+        write_log(&dir, b"line\n");
+        std::fs::write(dir.join("gateway.log.2026-09-24"), b"older\n").unwrap();
+        assert!(application_log_path(&dir).ends_with("gateway.log"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn app_log_endpoint_stays_bounded_on_a_huge_file() {
+        let dir = scratch_dir("huge");
+        let line = "2026-09-24T00:00:00Z INFO request served model=synthetic-model\n";
+        let body = line.repeat(500_000); // ~27 MiB, far over any tail cap.
+        write_log(&dir, body.as_bytes());
+
+        let (value, peak) = peak_bytes(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(get_app_log(&dir, Some(1000)))
+        });
+
+        let lines = lines_of(&value);
+        assert_eq!(lines.len(), 1000);
+        assert_eq!(lines.last().map(String::as_str), Some(line.trim_end()));
+        assert!(
+            peak < 4 * 1024 * 1024,
+            "reading the log tail allocated {peak} bytes; the endpoint must not buffer the file"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn small_app_log_is_returned_whole() {
+        let dir = scratch_dir("small");
+        let content = "first line\nsecond line\nthird line\n";
+        write_log(&dir, content.as_bytes());
+        let lines = lines_of(&get_app_log(&dir, None).await);
+        assert_eq!(lines, expected_tail(content.as_bytes(), 50));
+        assert_eq!(lines, vec!["first line", "second line", "third line"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn many_lines_return_the_last_requested_lines() {
+        let dir = scratch_dir("many");
+        let mut content = String::new();
+        for index in 0..40_000 {
+            content.push_str(&format!(
+                "2026-09-24T00:00:00Z INFO line {index:06} synthetic\n"
+            ));
+        }
+        write_log(&dir, content.as_bytes());
+        assert!(
+            content.len() > 1024 * 1024,
+            "fixture must exceed the tail cap"
+        );
+
+        let lines = lines_of(&get_app_log(&dir, Some(1000)).await);
+        assert_eq!(lines.len(), 1000);
+        assert_eq!(lines, expected_tail(content.as_bytes(), 1000));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some("2026-09-24T00:00:00Z INFO line 039999 synthetic")
+        );
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some("2026-09-24T00:00:00Z INFO line 039000 synthetic")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_app_log_returns_no_lines() {
+        let dir = scratch_dir("empty");
+        write_log(&dir, b"");
+        let value = get_app_log(&dir, Some(1000)).await;
+        assert_eq!(value, json!({ "lines": [] }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn missing_app_log_returns_no_lines() {
+        let dir = scratch_dir("missing");
+        let value = get_app_log(&dir, Some(1000)).await;
+        assert_eq!(value, json!({ "lines": [] }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multibyte_lines_survive_a_cut_inside_a_character() {
+        let dir = scratch_dir("utf8");
+        let mut content = String::new();
+        for index in 0..20_000 {
+            content.push_str(&format!("line {index:06} привет 😀 café\n"));
+        }
+        assert!(
+            content.len() > APP_LOG_TAIL_BYTES,
+            "fixture must exceed the tail window"
+        );
+        let mut bytes = content.into_bytes();
+        // Park a 4-byte character so that the byte window the tail reader
+        // seeks to starts inside it.
+        let marker = "😀".as_bytes().to_vec();
+        let cut = bytes.len().saturating_sub(APP_LOG_TAIL_BYTES) + 3;
+        bytes.splice(cut..cut, marker);
+        assert!(
+            std::str::from_utf8(&bytes[bytes.len() - APP_LOG_TAIL_BYTES..]).is_err(),
+            "fixture must split a multi-byte character"
+        );
+        write_log(&dir, &bytes);
+
+        let lines = lines_of(&get_app_log(&dir, Some(1000)).await);
+        assert_eq!(lines.len(), 1000);
+        assert_eq!(lines, expected_tail(&bytes, 1000));
+        assert!(lines.iter().all(|line| line.contains("😀")));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

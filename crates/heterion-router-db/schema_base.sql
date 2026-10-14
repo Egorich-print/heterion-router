@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS combos (
   data TEXT NOT NULL,
   sort_order INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
-  updated_at TEXT NOT NULL
+  updated_at TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS api_keys (

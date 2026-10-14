@@ -170,7 +170,10 @@ fn parse_combo_config(data: &Value) -> ComboConfig {
             .get("failoverBeforeRetry")
             .and_then(Value::as_bool)
             .unwrap_or(true),
-        max_set_retries: cfg.get("maxSetRetries").and_then(Value::as_u64).unwrap_or(0) as u32,
+        max_set_retries: cfg
+            .get("maxSetRetries")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32,
         set_retry_delay_ms: cfg
             .get("setRetryDelayMs")
             .and_then(Value::as_u64)
@@ -178,19 +181,19 @@ fn parse_combo_config(data: &Value) -> ComboConfig {
     }
 }
 
-/// Load every parseable combo, keyed by name.
-pub fn load_combos(conn: &Connection) -> HashMap<String, ComboDef> {
+/// Load every parseable combo that is still active, keyed by name.
+///
+/// A store that cannot be read is an error, not an empty map: reporting "no
+/// combos" turns a database outage into "unknown model" on the client side.
+/// Unparseable rows are still skipped — one bad combo must not hide the rest.
+/// Archived rows (`active = 0`, ADR-015) never route; they stay in the
+/// database for later restoration.
+pub fn load_combos(conn: &Connection) -> heterion_router_db::Result<HashMap<String, ComboDef>> {
     let mut map = HashMap::new();
-    let mut statement = match conn.prepare("SELECT name, data FROM combos") {
-        Ok(statement) => statement,
-        Err(_) => return map,
-    };
-    let rows = match statement.query_map([], |row| {
+    let mut statement = conn.prepare("SELECT name, data FROM combos WHERE active = 1")?;
+    let rows = statement.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    }) {
-        Ok(rows) => rows,
-        Err(_) => return map,
-    };
+    })?;
     for row in rows.flatten() {
         let (name, data) = row;
         if let Ok(json) = serde_json::from_str::<Value>(&data)
@@ -199,7 +202,7 @@ pub fn load_combos(conn: &Connection) -> HashMap<String, ComboDef> {
             map.insert(name, combo);
         }
     }
-    map
+    Ok(map)
 }
 
 /// Resolve a combo to ordered `(backend, model)` steps.
@@ -373,5 +376,54 @@ mod tests {
         let combo = parse_combo("c", &combo_json()).unwrap();
         let available: HashSet<String> = ["echo"].into_iter().map(str::to_string).collect();
         assert!(plan_steps(&combo, &registry, &available).is_empty());
+    }
+
+    #[test]
+    fn a_combo_store_that_cannot_be_read_is_an_error_not_an_empty_map() {
+        // No schema at all: `prepare` fails. Reporting that as "no combos"
+        // turns a database outage into "unknown model" on the client side.
+        let broken = Connection::open_in_memory().unwrap();
+        assert!(load_combos(&broken).is_err());
+
+        // Migrated but emptied: the query is fine, the rows are gone.
+        let db = heterion_router_db::Db::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        db.connection().execute_batch("DROP TABLE combos").unwrap();
+        assert!(load_combos(&db.connection()).is_err());
+
+        // And a healthy store still loads.
+        let healthy = heterion_router_db::Db::open_in_memory().unwrap();
+        healthy.migrate().unwrap();
+        let guard = healthy.connection();
+        heterion_router_db::repos::upsert_combo(
+            &guard,
+            &heterion_router_db::repos::ComboRow {
+                id: "c1".to_string(),
+                name: "combo".to_string(),
+                data: json!({"models": [{"kind": "model", "model": "grok-cli/grok-4.6",
+                                          "providerId": "grok-cli"}]})
+                .to_string(),
+                sort_order: 0,
+                active: true,
+            },
+        )
+        .unwrap();
+        assert!(load_combos(&guard).unwrap().contains_key("combo"));
+
+        // Archived combos (ADR-015) never route.
+        heterion_router_db::repos::update_combo_meta(
+            &guard,
+            "c1",
+            &heterion_router_db::repos::ComboMetaPatch {
+                is_active: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .expect("row exists");
+        assert!(
+            !load_combos(&guard).unwrap().contains_key("combo"),
+            "archived combo must not route"
+        );
     }
 }

@@ -30,4 +30,5 @@ async fn mock_upstream_models_round_trip() {
     let body: serde_json::Value = reqwest::get(url).await.unwrap().json().await.unwrap();
 
     assert_eq!(body["data"][0]["id"], "grok-4.6");
+    server.verify().await;
 }

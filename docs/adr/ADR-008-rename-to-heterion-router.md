@@ -54,3 +54,13 @@
 - Переименование крейтов — отдельным механическим коммитом; env-совместимость
   и `heterion-local` — отдельными содержательными.
 - Старые ADR-001..007 и `docs/history/` не переписываются (фиксация фактов).
+
+## Фактическое уточнение 2026-09-29
+
+- `docs/history/` — frozen upstream JS OmniRoute material (A2A/Conductor/
+  orchestration reports), а не история Rust-порта; добавлен
+  `docs/history/README.md` с этим разделением.
+- Фактический CI workflow — `.github/workflows/ci.yml`, не
+  `.github/workflows/rust.yml`.
+- `docs/ROADMAP-2026-09.md`, ADR-009 и ADR-010 — working-tree документы;
+  они должны быть зафиксированы вместе с кодом перед release.

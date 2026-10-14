@@ -11,7 +11,23 @@ desktop/src-tauri/binaries/
 
 # Node (desktop/ui only — no JS toolchain at the root by design)
 desktop/ui/node_modules/
+**/node_modules/
 desktop/ui/dist/
+**/dist/
+**/build/
+**/artifacts/
+
+# Local databases and WAL sidecars (runtime state, never tracked)
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*.db
+*.db-*
+*.sql
+
+# macOS AppleDouble sidecars (Finder writes both "._name" and ".!NNNN!name")
+._*
+.!*
 
 # Env / secrets
 .env

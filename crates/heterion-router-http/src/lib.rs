@@ -8,5 +8,5 @@
 pub mod client;
 pub mod sse;
 
-pub use client::HttpClient;
+pub use client::{HttpClient, HttpTimeouts};
 pub use sse::{SseDecoder, SseEvent};

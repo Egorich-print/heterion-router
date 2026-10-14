@@ -9,7 +9,8 @@ pub mod error;
 pub mod format;
 
 pub use chat::{
-    ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, StreamChunk, Usage,
+    ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, StreamChunk, TextJoin,
+    TextParts, Usage, UsageDetail, content_text, content_text_with,
 };
 pub use error::GatewayError;
 pub use format::{WireFormat, needs_translation};

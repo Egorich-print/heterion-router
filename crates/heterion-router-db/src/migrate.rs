@@ -29,11 +29,64 @@ pub struct Migration {
 
 /// Ordered migration history. Append only — never reorder or edit applied
 /// entries, the ledger has no downgrade path.
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: "001",
-    name: "initial_schema",
-    sql: BASE_SCHEMA_SQL,
-}];
+///
+/// `002` archives empty-model combos (`"models": []`) by flipping the
+/// `active` column to 0 — the data stays, only the archive flag moves. It
+/// relies on the `active` column existing before it runs, which
+/// [`ensure_combos_columns`] guarantees (fresh databases get the column from
+/// the base schema; databases predating ADR-015 get it added on boot).
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: "001",
+        name: "initial_schema",
+        sql: BASE_SCHEMA_SQL,
+    },
+    Migration {
+        version: "002",
+        name: "archive_empty_combos",
+        sql: "UPDATE combos \
+              SET active = 0, updated_at = datetime('now') \
+              WHERE active = 1 \
+                AND json_valid(data) \
+                AND COALESCE(json_array_length(data, '$.models'), 0) = 0;",
+    },
+];
+
+/// Columns the combo archive feature (ADR-015) needs on `combos` that
+/// postdate the 001 base schema. A fresh Rust database gets `active` from
+/// the base schema itself; a database created before ADR-015 (the ledger
+/// already records 001) never re-runs it, so the column is converged here.
+const COMBOS_COMPAT_COLUMNS: &[(&str, &str)] = &[("active", "INTEGER NOT NULL DEFAULT 1")];
+
+/// Add any [`COMBOS_COMPAT_COLUMNS`] the database lacks.
+///
+/// Skips silently when the `combos` table does not exist yet (a fresh
+/// database creates it, with the column, via migration 001). Runs before the
+/// pending migrations so `002`'s backfill can reference the column on
+/// databases that predate ADR-015.
+fn ensure_combos_columns(conn: &Connection) -> Result<()> {
+    let table: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'combos'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)?;
+    if table.is_none() {
+        return Ok(());
+    }
+    let mut statement = conn.prepare("PRAGMA table_info(combos)")?;
+    let present: HashSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (column, ddl) in COMBOS_COMPAT_COLUMNS {
+        if !present.contains(*column) {
+            conn.execute_batch(&format!("ALTER TABLE combos ADD COLUMN {column} {ddl}"))?;
+        }
+    }
+    Ok(())
+}
 
 fn ensure_ledger(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -118,6 +171,8 @@ pub fn migrate(conn: &mut Connection) -> Result<Vec<String>> {
     ensure_ledger(conn)?;
     let applied = applied_versions(conn)?;
 
+    ensure_combos_columns(conn)?;
+
     let mut newly_applied = Vec::new();
     for migration in MIGRATIONS {
         if applied.contains(migration.version) {
@@ -148,12 +203,12 @@ mod tests {
     use crate::db::Db;
 
     #[test]
-    fn fresh_db_applies_001_and_is_idempotent() {
+    fn fresh_db_applies_001_002_and_is_idempotent() {
         let db = Db::open_in_memory().unwrap();
         let mut guard = db.connection();
 
         let first = migrate(&mut guard).unwrap();
-        assert_eq!(first, vec!["001".to_string()]);
+        assert_eq!(first, vec!["001".to_string(), "002".to_string()]);
 
         let second = migrate(&mut guard).unwrap();
         assert!(second.is_empty());
@@ -169,21 +224,124 @@ mod tests {
         assert_eq!(tables, 18);
     }
 
-    #[test]
-    fn preseeded_ledger_skips_base_schema() {
+    /// The exact schema a database created before ADR-015 has: ledger says
+    /// 001 is applied and `combos` has no `active` column.
+    fn open_pre_adr015_db() -> Db {
         let db = Db::open_in_memory().unwrap();
+        {
+            let guard = db.connection();
+            guard
+                .execute_batch(
+                    "CREATE TABLE combos (
+                     id TEXT PRIMARY KEY,
+                     name TEXT NOT NULL UNIQUE,
+                     data TEXT NOT NULL,
+                     sort_order INTEGER NOT NULL DEFAULT 0,
+                     created_at TEXT NOT NULL,
+                     updated_at TEXT NOT NULL
+                 );
+                 CREATE TABLE _heterion_router_migrations (
+                     version TEXT PRIMARY KEY,
+                     name TEXT NOT NULL,
+                     applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO _heterion_router_migrations (version, name)
+                     VALUES ('001', 'initial_schema');",
+                )
+                .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn pre_adr015_db_gains_active_column_without_losing_rows() {
+        let db = open_pre_adr015_db();
+        {
+            let guard = db.connection();
+            guard
+                .execute(
+                    "INSERT INTO combos (id, name, data, sort_order, created_at, updated_at)
+                     VALUES ('keep', 'vivanta-code', '{\"name\":\"vivanta-code\",\"models\":[{\"id\":\"m1\"}]}', 0, datetime('now'), datetime('now'))",
+                    [],
+                )
+                .unwrap();
+        }
+
         let mut guard = db.connection();
-        ensure_ledger(&guard).unwrap();
-        guard
-            .execute(
-                "INSERT INTO _heterion_router_migrations (version, name) VALUES ('001', 'initial_schema')",
+        let applied = migrate(&mut guard).unwrap();
+        assert_eq!(applied, vec!["002".to_string()]);
+
+        let columns: HashSet<String> = {
+            let mut statement = guard.prepare("PRAGMA table_info(combos)").unwrap();
+            statement
+                .query_map([], |row| row.get::<_, String>(1))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        assert!(columns.contains("active"), "active column missing");
+
+        // Existing rows survive the ALTER, defaulted to active.
+        let (name, active): (String, i64) = guard
+            .query_row(
+                "SELECT name, active FROM combos WHERE id = 'keep'",
                 [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
+        assert_eq!(name, "vivanta-code");
+        assert_eq!(active, 1);
+    }
 
-        // A database the Node server already migrated must not be touched.
+    #[test]
+    fn pre_adr015_empty_combos_are_archived_not_deleted() {
+        let db = open_pre_adr015_db();
+        {
+            let guard = db.connection();
+            guard
+                .execute_batch(
+                    "INSERT INTO combos (id, name, data, sort_order, created_at, updated_at) VALUES
+                     ('dead', 'vivanta-auto', '{\"name\":\"vivanta-auto\",\"models\":[]}', 0, datetime('now'), datetime('now')),
+                     ('live', 'vivanta-code', '{\"name\":\"vivanta-code\",\"models\":[{\"id\":\"m1\"}]}', 1, datetime('now'), datetime('now')),
+                     ('broken', 'broken-json', 'not json at all', 2, datetime('now'), datetime('now'));",
+                )
+                .unwrap();
+        }
+
+        let mut guard = db.connection();
+        migrate(&mut guard).unwrap();
+
+        let rows: Vec<(String, i64)> = {
+            let mut statement = guard
+                .prepare("SELECT id, active FROM combos ORDER BY id")
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<_, _>>()
+                .unwrap()
+        };
+        // Empty-model combo archived (active = 0); everything else untouched.
+        assert_eq!(
+            rows,
+            vec![
+                ("broken".to_string(), 1),
+                ("dead".to_string(), 0),
+                ("live".to_string(), 1),
+            ]
+        );
+        // No deletion: all three rows still exist (checked by the count above).
+    }
+
+    #[test]
+    fn preseeded_ledger_skips_base_schema() {
+        let db = open_pre_adr015_db();
+
+        // A database the Node server already migrated must not have its base
+        // schema re-run — only the new 002 backfill applies on top.
+        let mut guard = db.connection();
         let applied = migrate(&mut guard).unwrap();
-        assert!(applied.is_empty());
+        assert_eq!(applied, vec!["002".to_string()]);
     }
 
     fn api_keys_columns(conn: &rusqlite::Connection) -> HashSet<String> {

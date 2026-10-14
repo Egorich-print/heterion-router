@@ -9,7 +9,10 @@ cd "$ROOT"
 fail=0
 
 echo "== exec bits =="
-if git ls-files -s scripts/ | grep -v '^100755 '; then
+# Both script roots, not just the top-level one: `desktop/scripts/` escapes a
+# `scripts/`-only gate, and a non-executable stage-sidecar.sh only fails much
+# later, inside a cold `cargo tauri build`.
+if git ls-files -s scripts/ desktop/scripts/ | grep -v '^100755 '; then
   echo "FAIL: scripts above are not executable (git update-index --chmod=+x)"
   fail=1
 else

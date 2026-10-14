@@ -11,7 +11,11 @@
 //! plain `reasoning_content` mapping. Unknown event kinds are ignored,
 //! never fabricated.
 
-use serde_json::{Value, json};
+use crate::chunk::{
+    announce_role, attach_usage, cached_prompt_details, chunk, insert_text, stream_chunk,
+    usage_root,
+};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 
 /// In-flight function call tracked across `.added`/`.delta`/`.done` events.
@@ -328,28 +332,15 @@ fn delta_chunk(
     content: Option<&str>,
     reasoning: Option<&str>,
 ) -> Value {
-    let mut delta = serde_json::Map::new();
-    if !state.role_sent {
-        delta.insert("role".to_string(), Value::from("assistant"));
-        state.role_sent = true;
-    }
-    if let Some(text) = content {
-        delta.insert("content".to_string(), Value::from(text));
-    }
-    if let Some(text) = reasoning {
-        delta.insert("reasoning_content".to_string(), Value::from(text));
-    }
-    json!({
-        "id": state.chat_id,
-        "object": "chat.completion.chunk",
-        "created": state.created,
-        "model": state.model,
-        "choices": [{
-            "index": 0,
-            "delta": Value::Object(delta),
-            "finish_reason": null,
-        }],
-    })
+    let mut delta = Map::new();
+    announce_role(&mut delta, &mut state.role_sent);
+    insert_text(&mut delta, content, reasoning);
+    stream_chunk(
+        &state.chat_id,
+        state.created,
+        &state.model,
+        Value::Object(delta),
+    )
 }
 
 /// Terminal reason: `tool_calls` once any call opened, else `stop`.
@@ -363,69 +354,38 @@ fn compute_finish_reason(state: &ResponsesState) -> &'static str {
 
 /// Build a tool-calls delta chunk, announcing the role on the first chunk.
 fn tool_chunk(state: &mut ResponsesState, tool_calls: Value) -> Value {
-    let mut delta = serde_json::Map::new();
-    if !state.role_sent {
-        delta.insert("role".to_string(), Value::from("assistant"));
-        state.role_sent = true;
-    }
+    let mut delta = Map::new();
+    announce_role(&mut delta, &mut state.role_sent);
     delta.insert("tool_calls".to_string(), tool_calls);
-    json!({
-        "id": state.chat_id,
-        "object": "chat.completion.chunk",
-        "created": state.created,
-        "model": state.model,
-        "choices": [{
-            "index": 0,
-            "delta": Value::Object(delta),
-            "finish_reason": null,
-        }],
-    })
+    stream_chunk(
+        &state.chat_id,
+        state.created,
+        &state.model,
+        Value::Object(delta),
+    )
 }
 
 fn finish_chunk(state: &ResponsesState, reason: &str, usage: Option<TranslatedUsage>) -> Value {
-    let mut chunk = json!({
-        "id": state.chat_id,
-        "object": "chat.completion.chunk",
-        "created": state.created,
-        "model": state.model,
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": reason,
-        }],
-    });
-    if let Some(usage) = usage {
-        chunk
-            .as_object_mut()
-            .expect("chunk is an object")
-            .insert("usage".to_string(), usage_json(&usage));
-    }
-    chunk
+    attach_usage(
+        chunk(
+            &state.chat_id,
+            state.created,
+            &state.model,
+            json!({}),
+            json!(reason),
+        ),
+        usage.as_ref().map(usage_json),
+    )
 }
 
 fn usage_json(usage: &TranslatedUsage) -> Value {
-    let mut root = serde_json::Map::new();
-    root.insert("prompt_tokens".to_string(), json!(usage.prompt_tokens));
-    root.insert(
-        "completion_tokens".to_string(),
-        json!(usage.completion_tokens),
+    let mut root = usage_root(
+        usage.prompt_tokens,
+        usage.completion_tokens,
+        usage.prompt_tokens + usage.completion_tokens,
     );
-    root.insert(
-        "total_tokens".to_string(),
-        json!(usage.prompt_tokens + usage.completion_tokens),
-    );
-    if usage.cached_tokens > 0 || usage.cache_creation_tokens > 0 {
-        let mut details = serde_json::Map::new();
-        if usage.cached_tokens > 0 {
-            details.insert("cached_tokens".to_string(), json!(usage.cached_tokens));
-        }
-        if usage.cache_creation_tokens > 0 {
-            details.insert(
-                "cache_creation_tokens".to_string(),
-                json!(usage.cache_creation_tokens),
-            );
-        }
-        root.insert("prompt_tokens_details".to_string(), Value::Object(details));
+    if let Some(details) = cached_prompt_details(usage.cached_tokens, usage.cache_creation_tokens) {
+        root.insert("prompt_tokens_details".to_string(), details);
     }
     if usage.reasoning_tokens > 0 {
         root.insert(

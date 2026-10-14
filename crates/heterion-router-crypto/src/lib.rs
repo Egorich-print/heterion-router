@@ -78,16 +78,23 @@ impl FieldCrypto {
     ///
     /// Panics only if the OS random source is unavailable, which would make
     /// the whole process untrustworthy anyway.
-    #[allow(deprecated)]
     pub fn encrypt(&self, plaintext: &str) -> String {
         if Self::looks_encrypted(plaintext) {
             return plaintext.to_string();
         }
         let mut iv = [0u8; 16];
         getrandom::fill(&mut iv).expect("os random source");
-        let cipher =
-            AesGcm::<Aes256, U16>::new(Key::<AesGcm<Aes256, U16>>::from_slice(&self.primary));
+        // Both `from_slice` calls are deprecated in favour of `TryFrom`, which
+        // the interop format cannot use: the stored key is a fixed
+        // `[u8; 32]` and the nonce a fixed `[u8; 16]`, and re-encoding them
+        // would change bytes the frozen JS side depends on. The allow is
+        // scoped to these two statements so a future deprecated call in this
+        // function cannot hide behind it.
+        #[allow(deprecated)]
+        let key = Key::<AesGcm<Aes256, U16>>::from_slice(&self.primary);
+        #[allow(deprecated)]
         let nonce = Nonce::<U16>::from_slice(&iv);
+        let cipher = AesGcm::<Aes256, U16>::new(key);
         let payload = cipher
             .encrypt(nonce, plaintext.as_bytes())
             .expect("gcm encryption");
@@ -250,9 +257,15 @@ mod loader_tests {
 
         // The process env takes precedence; ensure it is not set for this check.
         let previous = std::env::var("STORAGE_ENCRYPTION_KEY").ok();
+        // SAFETY: edition-2024 makes env mutation unsafe because it
+        // races another thread reading the environment; this test owns
+        // its variable name.
         unsafe { std::env::remove_var("STORAGE_ENCRYPTION_KEY") };
         assert_eq!(load_secret(Some(&dir)).as_deref(), Some("abc123"));
         if let Some(previous) = previous {
+            // SAFETY: edition-2024 makes env mutation unsafe because it
+            // races another thread reading the environment; this test owns
+            // its variable name.
             unsafe { std::env::set_var("STORAGE_ENCRYPTION_KEY", previous) };
         }
 
@@ -262,9 +275,15 @@ mod loader_tests {
     #[test]
     fn missing_secret_returns_none() {
         let previous = std::env::var("STORAGE_ENCRYPTION_KEY").ok();
+        // SAFETY: edition-2024 makes env mutation unsafe because it
+        // races another thread reading the environment; this test owns
+        // its variable name.
         unsafe { std::env::remove_var("STORAGE_ENCRYPTION_KEY") };
         assert!(load_secret(None).is_none());
         if let Some(previous) = previous {
+            // SAFETY: edition-2024 makes env mutation unsafe because it
+            // races another thread reading the environment; this test owns
+            // its variable name.
             unsafe { std::env::set_var("STORAGE_ENCRYPTION_KEY", previous) };
         }
     }

@@ -1,5 +1,6 @@
 ---
 source: crates/heterion-router-providers/src/registry.rs
+assertion_line: 348
 expression: ids
 ---
 [
@@ -281,4 +282,5 @@ expression: ids
     "zenmux-free",
     "zerolimitai",
     "zylo-api",
+    "exa-search",
 ]

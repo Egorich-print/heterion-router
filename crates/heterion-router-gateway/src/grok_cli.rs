@@ -10,28 +10,81 @@
 //! ```
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use heterion_router_core::{
-    ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, GatewayError,
-    StreamChunk, Usage,
+    ChatCompletionRequest, ChatCompletionResponse, GatewayError, StreamChunk,
 };
-use heterion_router_http::{HttpClient, SseDecoder};
-use heterion_router_translate::{
-    requests::openai_to_responses,
-    responses::{Converted, ResponsesState, convert_event},
-};
-use serde_json::{Value, json};
+use heterion_router_http::HttpClient;
+use heterion_router_translate::requests::openai_to_responses;
+use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::backend::{ChatBackend, ChunkStream, openai_chunk_to_stream_chunk, openai_request_body};
-use crate::ids;
+use crate::backend::{ChatBackend, ChunkStream, openai_request_body};
+use crate::responses::{
+    MissingTerminal, pump_sse_stream, response_to_completion, responses_event_handler,
+};
 
 /// Pinned Grok client version (mirrors `GROK_BUILD_DEFAULT_CLIENT_VERSION`).
 /// The proxy rejects missing/outdated versions with 426, so this must track
 /// the JS constant.
 const GROK_CLIENT_VERSION: &str = "0.2.106";
 const GROK_CLIENT_IDENTIFIER: &str = "grok-shell";
+
+fn now_unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn rfc3339_from_epoch(epoch: i64) -> String {
+    let days = epoch.div_euclid(86_400);
+    let seconds = epoch.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.000Z",
+        seconds / 3600,
+        (seconds % 3600) / 60,
+        seconds % 60
+    )
+}
+
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+fn refresh_expiry(payload: &Value) -> Option<String> {
+    if let Some(expiry) = payload.get("expires_at") {
+        if let Some(expiry) = expiry.as_str() {
+            return Some(expiry.to_string());
+        }
+        if let Some(epoch) = expiry.as_i64() {
+            return Some(rfc3339_from_epoch(epoch));
+        }
+    }
+    let seconds = payload.get("expires_in").and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str()?.parse::<u64>().ok())
+    })?;
+    Some(rfc3339_from_epoch(now_unix_seconds() + seconds as i64))
+}
 
 fn grok_user_agent() -> String {
     format!(
@@ -68,20 +121,42 @@ fn session_headers<'a>(
     ]
 }
 
+pub type RefreshCallback = std::sync::Arc<
+    dyn Fn(&str, &str, Option<&str>, Option<&str>) -> Result<(), String> + Send + Sync,
+>;
+
+type RefreshLock = Arc<tokio::sync::Mutex<()>>;
+type RefreshLockMap = Arc<tokio::sync::Mutex<HashMap<usize, RefreshLock>>>;
+
 /// Grok Build executor over HTTP.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct GrokCliBackend {
     http: HttpClient,
     base_url: String,
-    credentials: Vec<Credential>,
+    oauth_token_url: String,
+    credentials: std::sync::Arc<std::sync::Mutex<Vec<Credential>>>,
+    on_refresh: Option<RefreshCallback>,
+    refresh_locks: RefreshLockMap,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::fmt::Debug for GrokCliBackend {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GrokCliBackend")
+            .field("base_url", &self.base_url)
+            .field("credential_count", &self.credential_count())
+            .finish()
+    }
 }
 
 /// One credential for rotation: access token + optional refresh token.
 #[derive(Debug, Clone)]
 pub struct Credential {
+    pub connection_id: Option<String>,
     pub token: String,
     pub refresh_token: Option<String>,
+    pub expires_at: Option<String>,
 }
 
 impl GrokCliBackend {
@@ -91,7 +166,15 @@ impl GrokCliBackend {
         base_url: String,
         token: String,
     ) -> Result<Self, heterion_router_http::client::HttpError> {
-        Self::with_credentials(base_url, vec![Credential { token, refresh_token: None }])
+        Self::with_credentials(
+            base_url,
+            vec![Credential {
+                connection_id: None,
+                token,
+                refresh_token: None,
+                expires_at: None,
+            }],
+        )
     }
 
     /// Build with a rotation pool of credentials.
@@ -108,51 +191,144 @@ impl GrokCliBackend {
         Ok(Self {
             http: HttpClient::new(600)?,
             base_url: base_url.trim_end_matches('/').to_string(),
-            credentials,
+            oauth_token_url: std::env::var("GROK_OAUTH_TOKEN_URL")
+                .unwrap_or_else(|_| "https://auth.x.ai/oauth2/token".to_string()),
+            credentials: std::sync::Arc::new(std::sync::Mutex::new(credentials)),
+            on_refresh: None,
+            refresh_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
+    pub fn with_oauth_endpoint(mut self, token_url: String) -> Self {
+        self.oauth_token_url = token_url;
+        self
+    }
+
+    pub fn with_refresh_callback(mut self, callback: RefreshCallback) -> Self {
+        self.on_refresh = Some(callback);
+        self
+    }
+
     /// Pool size.
     pub fn credential_count(&self) -> usize {
-        self.credentials.len()
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
     }
 
     /// Round-robin credential selection.
-    fn next_credential(&self) -> &Credential {
+    fn next_credential(&self) -> (usize, Credential) {
+        let credentials = self
+            .credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let index =
-            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % self.credentials.len();
-        &self.credentials[index]
+            self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % credentials.len();
+        (index, credentials[index].clone())
     }
 
-    /// Call the upstream, refreshing on 401 if possible.
+    fn update_credential(&self, index: usize, credential: Credential) {
+        let mut credentials = self
+            .credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(slot) = credentials.get_mut(index) {
+            *slot = credential;
+        }
+    }
+
+    fn credential_at(&self, index: usize) -> Option<Credential> {
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(index)
+            .cloned()
+    }
+
+    async fn refresh_after_unauthorized(
+        &self,
+        index: usize,
+        credential: &Credential,
+    ) -> Result<Credential, GatewayError> {
+        let lock = {
+            let mut locks = self.refresh_locks.lock().await;
+            locks
+                .entry(index)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+        let current = self.credential_at(index).ok_or_else(|| {
+            GatewayError::Upstream("grok-cli credential disappeared during refresh".to_string())
+        })?;
+        if current.token != credential.token
+            || current.refresh_token != credential.refresh_token
+            || current.expires_at != credential.expires_at
+        {
+            return Ok(current);
+        }
+        let refresh_token = current.refresh_token.as_deref().ok_or_else(|| {
+            GatewayError::Upstream(
+                "upstream status 401: token expired and no refresh token".to_string(),
+            )
+        })?;
+        let refreshed = self.refresh_token(refresh_token).await?;
+        let refreshed = self.persist_refreshed(&current, &refreshed)?;
+        self.update_credential(index, refreshed.clone());
+        Ok(refreshed)
+    }
+
+    fn persist_refreshed(
+        &self,
+        original: &Credential,
+        refreshed: &Credential,
+    ) -> Result<Credential, GatewayError> {
+        let mut updated = refreshed.clone();
+        updated.connection_id = original.connection_id.clone();
+        if let (Some(connection_id), Some(callback)) =
+            (updated.connection_id.as_deref(), &self.on_refresh)
+        {
+            callback(
+                connection_id,
+                &updated.token,
+                updated.refresh_token.as_deref(),
+                updated.expires_at.as_deref(),
+            )
+            .map_err(GatewayError::Upstream)?;
+        }
+        Ok(updated)
+    }
+
+    /// Call the upstream, refreshing the selected credential on 401.
     async fn call_with_refresh(
         &self,
         url: &str,
-        token: &str,
+        index: usize,
+        credential: &Credential,
         headers: &[(&str, &str)],
         body: &Value,
     ) -> Result<Value, GatewayError> {
-        let response = self
+        let response = match self
             .http
-            .post_json_with_headers(url, Some(token), headers, body)
+            .post_json_with_headers(url, Some(&credential.token), headers, body)
             .await
-            .map_err(|error| GatewayError::Upstream(error.to_string()))?;
-        let status = response.status().as_u16();
+        {
+            Ok(response) => response,
+            Err(heterion_router_http::client::HttpError::Status { status: 401, .. }) => {
+                let refreshed = self.refresh_after_unauthorized(index, credential).await?;
+                self.http
+                    .post_json_with_headers(url, Some(&refreshed.token), headers, body)
+                    .await
+                    .map_err(|error| GatewayError::Upstream(error.to_string()))?
+            }
+            Err(error) => return Err(GatewayError::Upstream(error.to_string())),
+        };
         let payload: Value = response
             .json()
             .await
             .map_err(|error| GatewayError::Upstream(error.to_string()))?;
-        if status == 401 {
-            if let Some(refresh) = &self.next_credential().refresh_token {
-                if let Ok(refreshed) = self.refresh_token(refresh).await {
-                    return Ok(refreshed);
-                }
-            }
-            return Err(GatewayError::Upstream(
-                "upstream status 401: token expired and no refresh token".to_string(),
-            ));
-        }
         if let Some(message) = payload
             .get("error")
             .and_then(|error| error.get("message"))
@@ -163,22 +339,83 @@ impl GrokCliBackend {
         Ok(payload)
     }
 
-    async fn refresh_token(&self, refresh_token: &str) -> Result<Value, GatewayError> {
-        self.http
-            .post_json(
-                &format!("{}/token/refresh", self.base_url),
-                None,
-                &serde_json::json!({ "refresh_token": refresh_token }),
-            )
+    async fn refresh_token(&self, refresh_token: &str) -> Result<Credential, GatewayError> {
+        let client_id = std::env::var("GROK_OAUTH_CLIENT_ID")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let mut fields = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+        ];
+        if let Some(client_id) = client_id.as_deref() {
+            fields.insert(1, ("client_id", client_id));
+        }
+        let payload: Value = self
+            .http
+            .post_form(&self.oauth_token_url, &fields)
             .await
-            .map_err(|_| GatewayError::Upstream("refresh failed".to_string()))?
+            .map_err(|error| GatewayError::Upstream(error.to_string()))?
             .json()
             .await
-            .map_err(|error| GatewayError::Upstream(error.to_string()))
+            .map_err(|error| GatewayError::Upstream(error.to_string()))?;
+        let token = payload
+            .get("access_token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                GatewayError::Upstream("refresh response has no access_token".to_string())
+            })?
+            .to_string();
+        let refresh_token = payload
+            .get("refresh_token")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(refresh_token)
+            .to_string();
+        Ok(Credential {
+            connection_id: None,
+            token,
+            refresh_token: Some(refresh_token),
+            expires_at: refresh_expiry(&payload),
+        })
     }
 
     fn responses_url(&self) -> String {
         format!("{}/responses", self.base_url)
+    }
+
+    async fn stream_response(
+        &self,
+        index: usize,
+        credential: &Credential,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<reqwest::Response, GatewayError> {
+        match self
+            .http
+            .post_json_with_headers(
+                &self.responses_url(),
+                Some(&credential.token),
+                headers,
+                body,
+            )
+            .await
+        {
+            Ok(response) => Ok(response),
+            Err(heterion_router_http::client::HttpError::Status { status: 401, .. }) => {
+                let refreshed = self.refresh_after_unauthorized(index, credential).await?;
+                self.http
+                    .post_json_with_headers(
+                        &self.responses_url(),
+                        Some(&refreshed.token),
+                        headers,
+                        body,
+                    )
+                    .await
+                    .map_err(|error| GatewayError::Upstream(error.to_string()))
+            }
+            Err(error) => Err(GatewayError::Upstream(error.to_string())),
+        }
     }
 
     async fn drive_stream(
@@ -191,71 +428,25 @@ impl GrokCliBackend {
         }
 
         let mut upstream = openai_to_responses(&request.model, &openai_request_body(&request));
+        if let Some(input) = &request.responses_input {
+            upstream["input"] = input.clone();
+        }
         upstream["stream"] = Value::from(true);
         let user_agent = grok_user_agent();
         let headers = session_headers(&request.model, true, &user_agent);
+        let headers_vec: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, *v)).collect();
+        let (index, credential) = self.next_credential();
         let response = self
-            .http
-            .post_json_with_headers(
-                &self.responses_url(),
-                Some(&self.next_credential().token),
-                &headers.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>(),
-                &upstream,
-            )
-            .await
-            .map_err(|error| GatewayError::Upstream(error.to_string()))?;
+            .stream_response(index, &credential, &headers_vec, &upstream)
+            .await?;
 
-        let mut bytes = response.bytes_stream();
-        let mut decoder = SseDecoder::new();
-        let mut translator = ResponsesState::new(
-            "chatcmpl-rust".to_string(),
-            ids::unix_seconds(),
-            request.model.clone(),
-        );
-        let mut finish_seen = false;
-
-        while let Some(chunk) = bytes.next().await {
-            let chunk = chunk.map_err(|error| GatewayError::Upstream(error.to_string()))?;
-            let text = String::from_utf8_lossy(&chunk);
-            for event in decoder.push(&text) {
-                if event.data.trim() == "[DONE]" {
-                    if !finish_seen {
-                        let _ = tx.send(Ok(StreamChunk::done("stop"))).await;
-                    }
-                    return Ok(());
-                }
-                let data: Value = match serde_json::from_str(&event.data) {
-                    Ok(data) => data,
-                    Err(_) => continue,
-                };
-                let event_type = event
-                    .event
-                    .as_deref()
-                    .or_else(|| data.get("type").and_then(Value::as_str))
-                    .unwrap_or("");
-                match convert_event(&mut translator, event_type, &data) {
-                    Converted::Emit(chunk_json) => {
-                        if let Some(stream_chunk) = openai_chunk_to_stream_chunk(&chunk_json) {
-                            if stream_chunk.finish_reason.is_some() {
-                                finish_seen = true;
-                            }
-                            if tx.send(Ok(stream_chunk)).await.is_err() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                    Converted::Ignore => {}
-                    Converted::Fail(message) => {
-                        return Err(GatewayError::Upstream(message));
-                    }
-                }
-            }
-        }
-
-        if !finish_seen {
-            let _ = tx.send(Ok(StreamChunk::done("stop"))).await;
-        }
-        Ok(())
+        pump_sse_stream(
+            response,
+            &tx,
+            responses_event_handler(&request.model),
+            MissingTerminal::SynthesizeStop,
+        )
+        .await
     }
 }
 
@@ -273,17 +464,22 @@ impl ChatBackend for GrokCliBackend {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
         let mut upstream = openai_to_responses(&request.model, &openai_request_body(&request));
+        if let Some(input) = &request.responses_input {
+            upstream["input"] = input.clone();
+        }
         upstream["stream"] = Value::from(false);
         let user_agent = grok_user_agent();
         let headers = session_headers(&request.model, false, &user_agent);
         let headers_vec: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, *v)).collect();
 
         let mut last_error: Option<GatewayError> = None;
-        for _ in 0..self.credentials.len() {
+        for _ in 0..self.credential_count() {
+            let (index, credential) = self.next_credential();
             match self
                 .call_with_refresh(
                     &self.responses_url(),
-                    &self.next_credential().token,
+                    index,
+                    &credential,
                     &headers_vec,
                     &upstream,
                 )
@@ -313,105 +509,6 @@ impl ChatBackend for GrokCliBackend {
     }
 }
 
-/// Convert a completed Responses API object to a chat completion.
-fn response_to_completion(model: &str, payload: &Value) -> ChatCompletionResponse {
-    let id = payload
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or("resp-unknown")
-        .to_string();
-
-    let mut text = String::new();
-    let mut tool_calls: Vec<Value> = Vec::new();
-    if let Some(output) = payload.get("output").and_then(Value::as_array) {
-        for item in output {
-            match item.get("type").and_then(Value::as_str) {
-                Some("message") => {
-                    if let Some(content) = item.get("content").and_then(Value::as_array) {
-                        for part in content {
-                            if part.get("type").and_then(Value::as_str) == Some("output_text")
-                                && let Some(part_text) = part.get("text").and_then(Value::as_str)
-                            {
-                                text.push_str(part_text);
-                            }
-                        }
-                    }
-                }
-                // A Responses `function_call` item maps to an OpenAI tool call.
-                Some("function_call") => {
-                    let call_id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .or_else(|| item.get("id").and_then(Value::as_str))
-                        .unwrap_or("");
-                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
-                    if name.is_empty() {
-                        continue;
-                    }
-                    tool_calls.push(json!({
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": item
-                                .get("arguments")
-                                .and_then(Value::as_str)
-                                .unwrap_or("{}"),
-                        },
-                    }));
-                }
-                _ => {}
-            }
-        }
-    }
-
-    let usage = payload.get("usage");
-    let prompt = usage
-        .and_then(|usage| usage.get("input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
-    let completion = usage
-        .and_then(|usage| usage.get("output_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u32;
-    let total = usage
-        .and_then(|usage| usage.get("total_tokens"))
-        .and_then(Value::as_u64)
-        .map(|total| total as u32)
-        .unwrap_or_else(|| prompt + completion);
-
-    let has_calls = !tool_calls.is_empty();
-    let message = ChatMessage {
-        role: "assistant".to_string(),
-        content: if text.is_empty() {
-            None
-        } else {
-            Some(Value::from(text))
-        },
-        reasoning_content: None,
-        tool_calls: has_calls.then_some(Value::Array(tool_calls)),
-        tool_call_id: None,
-        name: None,
-    };
-
-    ChatCompletionResponse {
-        id: format!("chatcmpl-{id}"),
-        object: "chat.completion",
-        created: ids::unix_seconds(),
-        model: model.to_string(),
-        choices: vec![ChatChoice {
-            index: 0,
-            message,
-            finish_reason: if has_calls { "tool_calls" } else { "stop" }.to_string(),
-        }],
-        usage: Usage {
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            total_tokens: total,
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,6 +519,19 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
         matchers::{body_string_contains, header, method, path},
     };
+
+    #[test]
+    fn formats_refresh_expiry() {
+        assert_eq!(
+            rfc3339_from_epoch(1_700_000_000),
+            "2023-11-14T22:13:20.000Z"
+        );
+        assert_eq!(
+            refresh_expiry(&json!({"expires_at": "2999-01-01T00:00:00Z"})),
+            Some("2999-01-01T00:00:00Z".to_string())
+        );
+        assert!(refresh_expiry(&json!({"expires_in": "3600"})).is_some());
+    }
 
     fn request() -> ChatCompletionRequest {
         ChatCompletionRequest {
@@ -481,6 +591,7 @@ mod tests {
             chunks.last().unwrap().finish_reason.as_deref(),
             Some("stop")
         );
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -509,6 +620,7 @@ mod tests {
         assert_eq!(response.usage.prompt_tokens, 4);
         assert_eq!(response.usage.total_tokens, 6);
         assert_eq!(response.choices[0].finish_reason, "stop");
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -635,9 +747,11 @@ mod tool_tests {
 mod rotation_tests {
     use super::*;
     use heterion_router_core::{ChatCompletionRequest, ChatMessage};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
     use wiremock::{
         Mock, MockServer, ResponseTemplate,
-        matchers::{header, method, path},
+        matchers::{body_string_contains, header, method, path},
     };
 
     #[tokio::test]
@@ -667,12 +781,24 @@ mod rotation_tests {
             .mount(&server)
             .await;
 
-        let backend =
-            GrokCliBackend::with_credentials(server.uri(), vec![
-                Credential { token: "bad".to_string(), refresh_token: None },
-                Credential { token: "good".to_string(), refresh_token: None },
-            ])
-            .unwrap();
+        let backend = GrokCliBackend::with_credentials(
+            server.uri(),
+            vec![
+                Credential {
+                    connection_id: None,
+                    token: "bad".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                },
+                Credential {
+                    connection_id: None,
+                    token: "good".to_string(),
+                    refresh_token: None,
+                    expires_at: None,
+                },
+            ],
+        )
+        .unwrap();
         assert_eq!(backend.credential_count(), 2);
 
         let request = ChatCompletionRequest {
@@ -688,6 +814,213 @@ mod rotation_tests {
         };
         let response = backend.complete(request).await.unwrap();
         assert_eq!(response.choices[0].message.text(), "rotated");
+        server.verify().await;
+
+        // Rotation order, not just traffic: the rejected token is tried first
+        // and the second credential is the one that answers.
+        let seen = server.received_requests().await.unwrap();
+        let bearers: Vec<_> = seen
+            .iter()
+            .map(|request| {
+                request.headers["authorization"]
+                    .to_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(bearers, vec!["Bearer bad", "Bearer good"]);
+    }
+
+    #[tokio::test]
+    async fn refreshes_the_rejected_credential_and_retries_original_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer bad"))
+            .respond_with(ResponseTemplate::new(401))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=refresh-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "fresh",
+                "refresh_token": "refresh-2",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer fresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_refreshed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let persisted = Arc::new(Mutex::new(Vec::new()));
+        let persisted_callback = Arc::clone(&persisted);
+        let backend = GrokCliBackend::with_credentials(
+            server.uri(),
+            vec![Credential {
+                connection_id: Some("connection-1".to_string()),
+                token: "bad".to_string(),
+                refresh_token: Some("refresh-1".to_string()),
+                expires_at: Some("2000-01-01T00:00:00.000Z".to_string()),
+            }],
+        )
+        .unwrap()
+        .with_oauth_endpoint(format!("{}/oauth2/token", server.uri()))
+        .with_refresh_callback(Arc::new(move |id, token, refresh, expires| {
+            persisted_callback.lock().unwrap().push((
+                id.to_string(),
+                token.to_string(),
+                refresh.map(str::to_string),
+                expires.map(str::to_string),
+            ));
+            Ok(())
+        }));
+        let request = ChatCompletionRequest {
+            model: "grok-4.6".to_string(),
+            messages: vec![ChatMessage::plain("user".to_string(), "hi".to_string())],
+            stream: false,
+            ..Default::default()
+        };
+        let response = backend.complete(request).await.unwrap();
+        assert_eq!(response.choices[0].message.text(), "ok");
+        {
+            let persisted = persisted.lock().unwrap();
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted[0].0, "connection-1");
+            assert_eq!(persisted[0].1, "fresh");
+            assert_eq!(persisted[0].2.as_deref(), Some("refresh-2"));
+            assert!(
+                persisted[0]
+                    .3
+                    .as_deref()
+                    .is_some_and(|expiry| expiry.ends_with("Z"))
+            );
+        }
+        server.verify().await;
+
+        // The retry must reuse the *original* request body, not an empty or
+        // reshaped one, and must go out under the refreshed bearer.
+        let seen = server.received_requests().await.unwrap();
+        let responses: Vec<_> = seen
+            .iter()
+            .filter(|request| request.url.path() == "/responses")
+            .collect();
+        assert_eq!(responses.len(), 2, "one rejected attempt, one retry");
+        assert_eq!(
+            responses[0].body, responses[1].body,
+            "the retry must replay the original request body"
+        );
+        assert_eq!(responses[1].headers["authorization"], "Bearer fresh");
+    }
+
+    #[tokio::test]
+    async fn concurrent_refresh_is_single_flight() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer bad"))
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .set_delay(std::time::Duration::from_millis(50))
+                    .set_body_json(json!({"error": {"message": "invalid token"}})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/oauth2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "fresh",
+                "refresh_token": "refresh-2"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .and(header("authorization", "Bearer fresh"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_ok",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]
+            })))
+            .mount(&server)
+            .await;
+
+        let refreshes = Arc::new(Mutex::new(0));
+        let refreshes_callback = Arc::clone(&refreshes);
+        let backend = Arc::new(
+            GrokCliBackend::with_credentials(
+                server.uri(),
+                vec![Credential {
+                    connection_id: Some("connection-1".to_string()),
+                    token: "bad".to_string(),
+                    refresh_token: Some("refresh-1".to_string()),
+                    expires_at: None,
+                }],
+            )
+            .unwrap()
+            .with_oauth_endpoint(format!("{}/oauth2/token", server.uri()))
+            .with_refresh_callback(Arc::new(move |_, _, _, _| {
+                *refreshes_callback.lock().unwrap() += 1;
+                Ok(())
+            })),
+        );
+        let request = ChatCompletionRequest {
+            model: "grok-4.6".to_string(),
+            messages: vec![ChatMessage::plain("user".to_string(), "hi".to_string())],
+            stream: false,
+            ..Default::default()
+        };
+        let (first, second) =
+            tokio::join!(backend.complete(request.clone()), backend.complete(request));
+        assert!(first.is_ok());
+        assert!(second.is_ok());
+        assert_eq!(*refreshes.lock().unwrap(), 1);
+        server.verify().await;
+
+        // Both callers hit the upstream, but the refresh went out exactly once:
+        // two concurrent 401s collapse into a single OAuth round-trip that both
+        // waiters then retry under. Observed shape:
+        //   Bearer bad, Bearer bad, /oauth2/token, Bearer fresh, Bearer fresh.
+        let seen = server.received_requests().await.unwrap();
+        let mut calls = seen
+            .iter()
+            .map(|request| {
+                let auth = request
+                    .headers
+                    .get("authorization")
+                    .map(|value| value.to_str().unwrap().to_string())
+                    .unwrap_or_default();
+                (request.url.path().to_string(), auth)
+            })
+            .collect::<Vec<_>>();
+        let refreshes_sent = calls
+            .iter()
+            .filter(|(path, _)| path == "/oauth2/token")
+            .count();
+        assert_eq!(refreshes_sent, 1, "the refresh must be single-flight");
+        calls.sort();
+        assert_eq!(
+            calls,
+            vec![
+                ("/oauth2/token".to_string(), String::new()),
+                ("/responses".to_string(), "Bearer bad".to_string()),
+                ("/responses".to_string(), "Bearer bad".to_string()),
+                ("/responses".to_string(), "Bearer fresh".to_string()),
+                ("/responses".to_string(), "Bearer fresh".to_string()),
+            ],
+            "each caller is rejected once and retries once under the shared token"
+        );
     }
 
     #[test]

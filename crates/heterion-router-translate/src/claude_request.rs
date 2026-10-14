@@ -10,6 +10,7 @@
 //! the two prescribed spots, and Kimi-specific paths. Tool-carrying requests
 //! are out of scope for this slice (see the `tools` note below).
 
+use heterion_router_core::{TextJoin, TextParts, content_text_with};
 use serde_json::{Map, Value, json};
 
 const DEFAULT_MAX_TOKENS: u32 = 64000;
@@ -42,24 +43,9 @@ fn adjust_max_tokens(body: &Value, has_tools: bool) -> u32 {
     max_tokens.max(1)
 }
 
-/// `normalizeContentToString`: string as-is, text parts joined with `\n`.
-fn normalize_content_to_string(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
-            .map(|part| match part.get("text") {
-                Some(Value::String(text)) => text.clone(),
-                Some(Value::Number(number)) => number.to_string(),
-                Some(Value::Bool(flag)) => flag.to_string(),
-                _ => String::new(),
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
+/// `normalizeContentToString` flattening rules: `type: "text"` parts joined
+/// with a newline, a non-string `text` rendered in its JSON form.
+const NORMALIZED: TextJoin = TextJoin::new(TextParts::TypedText, "\n", false);
 
 /// Message content → Claude text blocks. Empty strings and empty text parts
 /// are dropped, matching the JS truthiness checks.
@@ -144,7 +130,7 @@ pub fn openai_to_claude(model: &str, body: &Value, stream: bool) -> Value {
         for message in list {
             let role = message.get("role").and_then(Value::as_str).unwrap_or("");
             if role == "system" || role == "developer" {
-                system_parts.push(normalize_content_to_string(message.get("content")));
+                system_parts.push(content_text_with(message.get("content"), NORMALIZED));
                 continue;
             }
 

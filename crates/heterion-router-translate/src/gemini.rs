@@ -11,7 +11,11 @@
 //! stripping, promptFeedback blocks, and the malformed/abort finish-reason
 //! overrides.
 
-use serde_json::{Value, json};
+use crate::chunk::{
+    announce_role, attach_usage, cached_prompt_details, chatcmpl_id, chunk, chunk_model,
+    insert_text, stream_chunk, usage_root,
+};
+use serde_json::{Map, Value, json};
 
 /// Mutable per-stream conversion state.
 #[derive(Debug, Clone, Default)]
@@ -243,30 +247,15 @@ fn normalize_finish_reason(reason: &str) -> String {
     normalized
 }
 
-fn chunk_id(state: &GeminiState) -> String {
-    format!(
-        "chatcmpl-{}",
-        state.message_id.as_deref().unwrap_or("unknown")
-    )
-}
-
-fn chunk_model(state: &GeminiState) -> String {
-    state.model.clone().unwrap_or_else(|| "unknown".to_string())
-}
-
 fn role_chunk(state: &mut GeminiState, now: i64) -> Value {
-    state.role_sent = true;
-    json!({
-        "id": chunk_id(state),
-        "object": "chat.completion.chunk",
-        "created": now,
-        "model": chunk_model(state),
-        "choices": [{
-            "index": 0,
-            "delta": {"role": "assistant"},
-            "finish_reason": null,
-        }],
-    })
+    let mut delta = Map::new();
+    announce_role(&mut delta, &mut state.role_sent);
+    stream_chunk(
+        &chatcmpl_id(state.message_id.as_deref()),
+        now,
+        &chunk_model(state.model.as_deref()),
+        Value::Object(delta),
+    )
 }
 
 fn delta_chunk(
@@ -275,72 +264,39 @@ fn delta_chunk(
     content: Option<&str>,
     reasoning: Option<&str>,
 ) -> Value {
-    let mut delta = serde_json::Map::new();
-    if let Some(text) = content {
-        delta.insert("content".to_string(), Value::from(text));
-    }
-    if let Some(text) = reasoning {
-        delta.insert("reasoning_content".to_string(), Value::from(text));
-    }
-    json!({
-        "id": chunk_id(state),
-        "object": "chat.completion.chunk",
-        "created": now,
-        "model": chunk_model(state),
-        "choices": [{
-            "index": 0,
-            "delta": Value::Object(delta),
-            "finish_reason": null,
-        }],
-    })
+    let mut delta = Map::new();
+    insert_text(&mut delta, content, reasoning);
+    stream_chunk(
+        &chatcmpl_id(state.message_id.as_deref()),
+        now,
+        &chunk_model(state.model.as_deref()),
+        Value::Object(delta),
+    )
 }
 
 /// Build a tool-calls delta chunk, announcing the role on the first chunk.
 fn tool_chunk(state: &mut GeminiState, now: i64, tool_calls: Value) -> Value {
-    let mut delta = serde_json::Map::new();
-    if !state.role_sent {
-        delta.insert("role".to_string(), Value::from("assistant"));
-        state.role_sent = true;
-    }
+    let mut delta = Map::new();
+    announce_role(&mut delta, &mut state.role_sent);
     delta.insert("tool_calls".to_string(), tool_calls);
-    json!({
-        "id": chunk_id(state),
-        "object": "chat.completion.chunk",
-        "created": now,
-        "model": chunk_model(state),
-        "choices": [{
-            "index": 0,
-            "delta": Value::Object(delta),
-            "finish_reason": null,
-        }],
-    })
+    stream_chunk(
+        &chatcmpl_id(state.message_id.as_deref()),
+        now,
+        &chunk_model(state.model.as_deref()),
+        Value::Object(delta),
+    )
 }
 
 fn finish_chunk(state: &GeminiState, now: i64, reason: &str) -> Value {
-    let mut chunk = json!({
-        "id": chunk_id(state),
-        "object": "chat.completion.chunk",
-        "created": now,
-        "model": chunk_model(state),
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": reason,
-        }],
-    });
-    if let Some(usage) = state.usage {
-        let mut root = serde_json::Map::new();
-        root.insert("prompt_tokens".to_string(), json!(usage.prompt_tokens));
-        root.insert(
-            "completion_tokens".to_string(),
-            json!(usage.completion_tokens),
+    let usage = state.usage.map(|usage| {
+        let mut root = usage_root(
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
         );
-        root.insert("total_tokens".to_string(), json!(usage.total_tokens));
-        if usage.cached_tokens > 0 {
-            root.insert(
-                "prompt_tokens_details".to_string(),
-                json!({ "cached_tokens": usage.cached_tokens }),
-            );
+        // Gemini reports cache hits but has no cache-creation field.
+        if let Some(details) = cached_prompt_details(usage.cached_tokens, 0) {
+            root.insert("prompt_tokens_details".to_string(), details);
         }
         if let Some(reasoning) = usage.reasoning_tokens {
             root.insert(
@@ -348,12 +304,18 @@ fn finish_chunk(state: &GeminiState, now: i64, reason: &str) -> Value {
                 json!({ "reasoning_tokens": reasoning }),
             );
         }
-        chunk
-            .as_object_mut()
-            .expect("chunk is an object")
-            .insert("usage".to_string(), Value::Object(root));
-    }
-    chunk
+        Value::Object(root)
+    });
+    attach_usage(
+        chunk(
+            &chatcmpl_id(state.message_id.as_deref()),
+            now,
+            &chunk_model(state.model.as_deref()),
+            json!({}),
+            json!(reason),
+        ),
+        usage,
+    )
 }
 
 #[cfg(test)]

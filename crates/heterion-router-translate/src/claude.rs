@@ -10,7 +10,11 @@
 //! `pendingThinkClose` markers, and signature handling. Unknown event kinds
 //! are ignored, never fabricated.
 
-use serde_json::{Value, json};
+use crate::chunk::{
+    ROLE_ASSISTANT, attach_usage, cached_prompt_details, chatcmpl_id, chunk, chunk_model,
+    insert_text, stream_chunk, usage_root,
+};
+use serde_json::{Map, Value, json};
 
 /// Mutable per-stream conversion state.
 #[derive(Debug, Clone, Default)]
@@ -213,29 +217,15 @@ fn merge_usage(state: &mut ClaudeState, usage: &Value) {
     });
 }
 
-fn chunk_id(state: &ClaudeState) -> String {
-    format!(
-        "chatcmpl-{}",
-        state.message_id.as_deref().unwrap_or("unknown")
-    )
-}
-
-fn chunk_model(state: &ClaudeState) -> String {
-    state.model.clone().unwrap_or_else(|| "unknown".to_string())
-}
-
 fn role_chunk(state: &ClaudeState, now: i64) -> Value {
-    json!({
-        "id": chunk_id(state),
-        "object": "chat.completion.chunk",
-        "created": now,
-        "model": chunk_model(state),
-        "choices": [{
-            "index": 0,
-            "delta": {"role": "assistant"},
-            "finish_reason": null,
-        }],
-    })
+    let mut delta = Map::new();
+    delta.insert("role".to_string(), Value::from(ROLE_ASSISTANT));
+    stream_chunk(
+        &chatcmpl_id(state.message_id.as_deref()),
+        now,
+        &chunk_model(state.model.as_deref()),
+        Value::Object(delta),
+    )
 }
 
 fn delta_chunk(
@@ -244,24 +234,14 @@ fn delta_chunk(
     content: Option<&str>,
     reasoning: Option<&str>,
 ) -> Value {
-    let mut delta = serde_json::Map::new();
-    if let Some(text) = content {
-        delta.insert("content".to_string(), Value::from(text));
-    }
-    if let Some(text) = reasoning {
-        delta.insert("reasoning_content".to_string(), Value::from(text));
-    }
-    json!({
-        "id": chunk_id(state),
-        "object": "chat.completion.chunk",
-        "created": now,
-        "model": chunk_model(state),
-        "choices": [{
-            "index": 0,
-            "delta": Value::Object(delta),
-            "finish_reason": null,
-        }],
-    })
+    let mut delta = Map::new();
+    insert_text(&mut delta, content, reasoning);
+    stream_chunk(
+        &chatcmpl_id(state.message_id.as_deref()),
+        now,
+        &chunk_model(state.model.as_deref()),
+        Value::Object(delta),
+    )
 }
 
 fn finish_chunk(state: &ClaudeState, now: i64) -> Value {
@@ -269,25 +249,8 @@ fn finish_chunk(state: &ClaudeState, now: i64) -> Value {
         // No tool tracking yet, so a bare stop always means "stop".
         "stop".to_string()
     });
-    let mut chunk = json!({
-        "id": chunk_id(state),
-        "object": "chat.completion.chunk",
-        "created": now,
-        "model": chunk_model(state),
-        "choices": [{
-            "index": 0,
-            "delta": {},
-            "finish_reason": reason,
-        }],
-    });
-    if let Some(usage) = state.usage {
-        let mut root = serde_json::Map::new();
-        root.insert("prompt_tokens".to_string(), json!(usage.input));
-        root.insert("completion_tokens".to_string(), json!(usage.output));
-        root.insert(
-            "total_tokens".to_string(),
-            json!(usage.input + usage.output),
-        );
+    let usage = state.usage.map(|usage| {
+        let mut root = usage_root(usage.input, usage.output, usage.input + usage.output);
         if let Some(reasoning) = usage.reasoning {
             root.insert("reasoning_tokens".to_string(), json!(reasoning));
             root.insert(
@@ -295,25 +258,21 @@ fn finish_chunk(state: &ClaudeState, now: i64) -> Value {
                 json!({ "reasoning_tokens": reasoning }),
             );
         }
-        if usage.cache_read > 0 || usage.cache_creation > 0 {
-            let mut details = serde_json::Map::new();
-            if usage.cache_read > 0 {
-                details.insert("cached_tokens".to_string(), json!(usage.cache_read));
-            }
-            if usage.cache_creation > 0 {
-                details.insert(
-                    "cache_creation_tokens".to_string(),
-                    json!(usage.cache_creation),
-                );
-            }
-            root.insert("prompt_tokens_details".to_string(), Value::Object(details));
+        if let Some(details) = cached_prompt_details(usage.cache_read, usage.cache_creation) {
+            root.insert("prompt_tokens_details".to_string(), details);
         }
-        chunk
-            .as_object_mut()
-            .expect("chunk is an object")
-            .insert("usage".to_string(), Value::Object(root));
-    }
-    chunk
+        Value::Object(root)
+    });
+    attach_usage(
+        chunk(
+            &chatcmpl_id(state.message_id.as_deref()),
+            now,
+            &chunk_model(state.model.as_deref()),
+            json!({}),
+            json!(reason),
+        ),
+        usage,
+    )
 }
 
 #[cfg(test)]

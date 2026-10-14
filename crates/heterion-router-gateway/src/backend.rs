@@ -10,18 +10,121 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use heterion_router_core::{
     ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, GatewayError,
-    StreamChunk, Usage,
+    StreamChunk, Usage, UsageDetail,
 };
+use heterion_router_usage::CachedUsage;
 use serde_json::{Value, json};
 
 /// A boxed, owned stream of deltas.
 pub type ChunkStream = BoxStream<'static, Result<StreamChunk, GatewayError>>;
+
+/// The discounted counts one stream chunk carried, as the accounting row's
+/// type.
+///
+/// `None` when the chunk published none, so an accounting caller can tell
+/// "nothing to book" from "reported zero" — the same thing
+/// [`ChatCompletionResponse::raw`] does on the non-streaming path.
+pub fn chunk_cached_usage(chunk: &StreamChunk) -> Option<CachedUsage> {
+    chunk.usage_detail.map(|detail| CachedUsage {
+        cache_read: detail.cache_read,
+        cache_creation: detail.cache_creation,
+        reasoning: detail.reasoning,
+    })
+}
+
+/// Internal request key that ties usage rows to the request they belong to.
+///
+/// The gateway stamps it into [`ChatCompletionRequest::extra`]; a backend
+/// that dispatches to other backends must remove it again before the request
+/// reaches an upstream provider.
+pub const ATTRIBUTION_TOKEN: &str = "_heterion_router_attribution";
+
+/// Who served a request.
+///
+/// Usage rows and call logs are per-provider analytics, so the backend that
+/// actually answered has to identify itself — not the router that picked it.
+/// A backend serving one request at a time just describes itself; a router
+/// reports the candidate it dispatched to.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Attribution {
+    /// Canonical provider id (`"openrouter"`, `"grok-cli"`, ...), or `None`
+    /// when nothing was ever dispatched — an unknown model, a combo whose
+    /// every step failed. Recording the router's own name there would put a
+    /// non-provider in `usage_history.provider` and poison every
+    /// `WHERE provider = ?` aggregate.
+    pub provider: Option<String>,
+    /// Row id in `provider_connections`, when one can be named.
+    ///
+    /// A backend that dispatches through a named credential pool reports the
+    /// row it really used. When it cannot, the router names the head of that
+    /// provider's active rows in `priority DESC, id ASC` — the row dispatch
+    /// tries first — rather than leaving the field `None`; see
+    /// `routing::RoutingBackend::dispatch_head_connection_id` for why a
+    /// deterministic dispatch-order row beats a blank. `None` therefore means
+    /// "no row exists to name" (a keyless provider), not "unknown".
+    pub connection_id: Option<String>,
+    /// Combo the request was served through, when it was served through one.
+    pub combo_name: Option<String>,
+}
+
+/// Stamp `request` with a fresh attribution token and hand it back.
+pub fn stamp_attribution(request: &mut ChatCompletionRequest) -> String {
+    let token = crate::ids::call_id();
+    request
+        .extra
+        .insert(ATTRIBUTION_TOKEN.to_string(), json!(token.clone()));
+    token
+}
+
+/// The attribution token [`stamp_attribution`] put in `request.extra`.
+pub fn request_token(request: &ChatCompletionRequest) -> Option<String> {
+    request
+        .extra
+        .get(ATTRIBUTION_TOKEN)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Round-robin selection from a backend's credential pool.
+///
+/// One helper for every HTTP executor: each backend owns its own `tokens`
+/// slice and `next` cursor, so the rotation rule lives here instead of being
+/// copied per backend. `Relaxed` ordering is enough — the counter only needs
+/// to be unique per call, not ordered against the pool read.
+///
+/// An empty pool is `None` rather than a panic: a provider with
+/// `auth_type: optional` legitimately serves anonymous traffic. The cursor is
+/// left untouched in that case, so a keyless pool never consumes a slot from
+/// the rotation a later-inserted key would see.
+pub(crate) fn next_token<'a>(
+    tokens: &'a [String],
+    next: &std::sync::atomic::AtomicUsize,
+) -> Option<&'a str> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % tokens.len();
+    tokens.get(index).map(String::as_str)
+}
 
 /// Anything that can serve a chat completion.
 #[async_trait]
 pub trait ChatBackend: Send + Sync + 'static {
     /// Human-readable backend name, used in logs and health output.
     fn name(&self) -> &'static str;
+
+    /// Attribution for the request stamped with `token`.
+    ///
+    /// Defaults to "me": a backend that serves a request directly knows both
+    /// its provider id and (when it has a single named connection) its
+    /// connection id.
+    fn attribution(&self, _token: &str) -> Attribution {
+        Attribution {
+            provider: Some(self.name().to_string()),
+            connection_id: None,
+            combo_name: None,
+        }
+    }
 
     /// Serve a complete (non-streaming) response.
     async fn complete(
@@ -71,6 +174,39 @@ pub(crate) fn openai_request_body(request: &ChatCompletionRequest) -> Value {
     if let Some(top_k) = request.top_k {
         body["top_k"] = json!(top_k);
     }
+    if let Some(max_completion_tokens) = request.max_completion_tokens {
+        body["max_completion_tokens"] = json!(max_completion_tokens);
+    }
+    // ADR-014: the router predefines a reasoning level per model family;
+    // an explicit client `reasoning_effort` always wins over the default.
+    let effort = request
+        .reasoning_effort
+        .clone()
+        .or_else(|| crate::reasoning::default_effort(&request.model).map(str::to_string));
+    if let Some(effort) = effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    if let Some(stream_options) = &request.stream_options {
+        body["stream_options"] = stream_options.clone();
+    }
+    if let Some(parallel_tool_calls) = request.parallel_tool_calls {
+        body["parallel_tool_calls"] = json!(parallel_tool_calls);
+    }
+    if let Some(metadata) = &request.metadata {
+        body["metadata"] = metadata.clone();
+    }
+    if let Some(service_tier) = &request.service_tier {
+        body["service_tier"] = json!(service_tier);
+    }
+    if let Some(seed) = request.seed {
+        body["seed"] = json!(seed);
+    }
+    if let Some(verbosity) = &request.verbosity {
+        body["verbosity"] = json!(verbosity);
+    }
+    for (key, value) in &request.extra {
+        body[key] = value.clone();
+    }
     body
 }
 
@@ -100,14 +236,55 @@ pub(crate) fn openai_chunk_to_stream_chunk(value: &Value) -> Option<StreamChunk>
         .and_then(Value::as_str)
         .map(str::to_string);
     let tool_calls = delta.get("tool_calls").cloned();
-    if content.is_none() && reasoning.is_none() && tool_calls.is_none() && finish.is_none() {
+    let usage = value
+        .get("usage")
+        .filter(|value| value.is_object())
+        .map(|value| {
+            let prompt_tokens = value
+                .get("prompt_tokens")
+                .or_else(|| value.get("input_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let completion_tokens = value
+                .get("completion_tokens")
+                .or_else(|| value.get("output_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32;
+            let total_tokens = value
+                .get("total_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::from(prompt_tokens) + u64::from(completion_tokens))
+                as u32;
+            Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+            }
+        });
+    if content.is_none()
+        && reasoning.is_none()
+        && tool_calls.is_none()
+        && finish.is_none()
+        && usage.is_none()
+    {
         return None;
     }
+    // The discounted counts ride the same usage frame, read by the
+    // accounting layer's parser so every upstream spelling is known in
+    // exactly one place. Absent means the frame had nothing to discount.
+    let cached = CachedUsage::from_payload(value);
+    let usage_detail = (cached != CachedUsage::default()).then_some(UsageDetail {
+        cache_read: cached.cache_read,
+        cache_creation: cached.cache_creation,
+        reasoning: cached.reasoning,
+    });
     Some(StreamChunk {
         content,
         reasoning,
         tool_calls,
         finish_reason: finish,
+        usage,
+        usage_detail,
     })
 }
 
@@ -168,6 +345,7 @@ impl ChatBackend for EchoBackend {
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
             },
+            raw: None,
         })
     }
 
@@ -201,6 +379,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn next_token_rotates_and_wraps() {
+        let tokens = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let picked: Vec<&str> = (0..5)
+            .map(|_| next_token(&tokens, &cursor).expect("key"))
+            .collect();
+        assert_eq!(picked, vec!["a", "b", "c", "a", "b"]);
+    }
+
+    #[test]
+    fn next_token_on_empty_pool_is_none_and_spares_the_cursor() {
+        let tokens: Vec<String> = Vec::new();
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        assert_eq!(next_token(&tokens, &cursor), None);
+        // A keyless provider must not burn a rotation slot.
+        assert_eq!(cursor.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn next_token_resumes_at_zero_after_a_keyless_call() {
+        let tokens = vec!["only".to_string()];
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(next_token(&empty, &cursor), None);
+        assert_eq!(next_token(&tokens, &cursor), Some("only"));
+    }
+
+    #[test]
     fn chunk_mapping_carries_tool_calls() {
         let chunk = openai_chunk_to_stream_chunk(&json!({
             "choices": [{
@@ -226,6 +432,79 @@ mod tests {
         .expect("reasoning chunk present");
         assert_eq!(chunk.reasoning.as_deref(), Some("thinking"));
         assert!(chunk.content.is_none(), "empty content must be dropped");
+    }
+
+    #[test]
+    fn chunk_mapping_extracts_terminal_usage() {
+        let chunk = openai_chunk_to_stream_chunk(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        }))
+        .expect("terminal chunk present");
+        assert_eq!(
+            chunk.usage,
+            Some(Usage {
+                prompt_tokens: 3,
+                completion_tokens: 2,
+                total_tokens: 5,
+            })
+        );
+    }
+
+    /// The usage frame of a stream is the only place a cache hit is ever
+    /// published, so dropping its detail bills the hit as fresh input.
+    #[test]
+    fn chunk_mapping_keeps_the_discounted_detail_off_the_usage_frame() {
+        let chunk = openai_chunk_to_stream_chunk(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {
+                "prompt_tokens": 1000,
+                "completion_tokens": 500,
+                "prompt_tokens_details": {"cached_tokens": 200},
+                "completion_tokens_details": {"reasoning_tokens": 64},
+            },
+        }))
+        .expect("terminal chunk present");
+        assert_eq!(
+            chunk.usage_detail,
+            Some(UsageDetail {
+                cache_read: 200,
+                cache_creation: 0,
+                reasoning: 64,
+            }),
+            "the usage frame reported 200 cached and 64 reasoning tokens"
+        );
+        assert_eq!(
+            chunk_cached_usage(&chunk),
+            Some(CachedUsage {
+                cache_read: 200,
+                cache_creation: 0,
+                reasoning: 64,
+            }),
+            "the accounting layer reads the same counts"
+        );
+    }
+
+    /// A usage frame with no detail block is what every provider that never
+    /// caches streams: nothing to book, and nothing invented.
+    #[test]
+    fn chunk_mapping_reports_no_detail_for_a_plain_usage_frame() {
+        let chunk = openai_chunk_to_stream_chunk(&json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+        }))
+        .expect("terminal chunk present");
+        assert_eq!(chunk.usage_detail, None);
+        assert_eq!(chunk_cached_usage(&chunk), None);
+        // A content delta never carries one either.
+        assert_eq!(
+            openai_chunk_to_stream_chunk(&json!({
+                "choices": [{"index": 0, "delta": {"content": "hi"}, "finish_reason": null}],
+            }))
+            .expect("content chunk present")
+            .usage_detail,
+            None
+        );
     }
 
     #[test]
@@ -261,6 +540,54 @@ mod tests {
             tool_call_id: None,
             name: None,
         }
+    }
+
+    #[test]
+    fn request_body_forwards_agent_controls() {
+        let mut request = request("hello");
+        request.max_completion_tokens = Some(128);
+        request.reasoning_effort = Some("high".to_string());
+        request.parallel_tool_calls = Some(false);
+        request.stream_options = Some(json!({"include_usage": true}));
+        request.metadata = Some(json!({"trace": "t1"}));
+        let body = openai_request_body(&request);
+        assert_eq!(body["max_completion_tokens"], json!(128));
+        assert_eq!(body["reasoning_effort"], json!("high"));
+        assert_eq!(body["parallel_tool_calls"], json!(false));
+        assert_eq!(body["stream_options"]["include_usage"], json!(true));
+        assert_eq!(body["metadata"]["trace"], json!("t1"));
+    }
+
+    #[test]
+    fn request_body_predefines_reasoning_for_evidenced_families() {
+        // ADR-014: no explicit effort → the family default applies.
+        let mut request = request("hello");
+        request.model = "grok-4.6".into();
+        let body = openai_request_body(&request);
+        assert_eq!(body["reasoning_effort"], json!("medium"));
+
+        request.model = "claude-opus-4".into();
+        let body = openai_request_body(&request);
+        assert_eq!(body["reasoning_effort"], json!("high"));
+
+        // Combo-rewritten ids resolve the bare model part.
+        request.model = "grok-cli/grok-4.6".into();
+        let body = openai_request_body(&request);
+        assert_eq!(body["reasoning_effort"], json!("medium"));
+
+        // Unevidenced families stay on the provider default.
+        request.model = "mistral-large".into();
+        let body = openai_request_body(&request);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn explicit_reasoning_effort_wins_over_the_predefined_default() {
+        let mut request = request("hello");
+        request.model = "grok-4.6".into();
+        request.reasoning_effort = Some("low".to_string());
+        let body = openai_request_body(&request);
+        assert_eq!(body["reasoning_effort"], json!("low"));
     }
 
     #[tokio::test]

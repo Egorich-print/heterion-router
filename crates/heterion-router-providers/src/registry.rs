@@ -89,6 +89,10 @@ impl ProviderRegistry {
     }
 
     /// Whether the registry is empty.
+    ///
+    /// Load-bearing API, not dead code: `clippy::len_without_is_empty` rejects
+    /// [`Self::len`] without it, so removing this fails the build.
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
@@ -297,6 +301,19 @@ mod tests {
         );
         assert_eq!(
             registry.model_wire_format("grok-cli", "grok-4.6"),
+            Some(WireFormat::OpenAiResponses)
+        );
+    }
+
+    #[test]
+    fn xai_reasoning_models_use_responses_format() {
+        let registry = registry();
+        assert_eq!(
+            registry.model_wire_format("xai", "grok-4.7"),
+            Some(WireFormat::OpenAiResponses)
+        );
+        assert_eq!(
+            registry.model_wire_format("xai-oauth", "grok-4.7"),
             Some(WireFormat::OpenAiResponses)
         );
     }

@@ -5,6 +5,7 @@
 //! reasoning deltas and the terminal `response.completed` event. Tool calls,
 //! namespaces and the remaining pairs follow.
 
+pub(crate) mod chunk;
 pub mod claude;
 pub mod claude_request;
 pub mod gemini;

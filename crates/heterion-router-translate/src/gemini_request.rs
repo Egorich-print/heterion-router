@@ -8,6 +8,7 @@
 //! Explicitly deferred: thinking/reasoning config, safety overrides,
 //! multimodal inline data beyond text, and cached content.
 
+use heterion_router_core::content_text;
 use serde_json::{Map, Value, json};
 
 /// Convert an OpenAI chat body into a Gemini `generateContent` body.
@@ -387,19 +388,6 @@ fn push_turn(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
         return;
     }
     contents.push(json!({ "role": role, "parts": parts }));
-}
-
-/// Plain text of a chat content value (string or `text` parts).
-fn content_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| part.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join(""),
-        _ => String::new(),
-    }
 }
 
 /// OpenAI tool arguments are a JSON string; Gemini wants an object.

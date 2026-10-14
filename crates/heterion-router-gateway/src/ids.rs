@@ -22,6 +22,11 @@ pub fn completion_id() -> String {
     format!("chatcmpl-rust-{:x}-{:x}", unix_seconds(), seq)
 }
 
+pub fn call_id() -> String {
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("call-rust-{:x}-{:x}", unix_seconds(), seq)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

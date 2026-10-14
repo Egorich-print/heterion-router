@@ -11,7 +11,9 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "desktop/src-tauri/**"
       - "desktop/ui/**"
+      - "docs/**"
       - "rust-toolchain.toml"
       - "scripts/ci/**"
       - ".github/workflows/ci.yml"
@@ -20,7 +22,9 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "desktop/src-tauri/**"
       - "desktop/ui/**"
+      - "docs/**"
       - "rust-toolchain.toml"
       - "scripts/ci/**"
       - ".github/workflows/ci.yml"
@@ -36,10 +40,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.99.0
       - uses: Swatinem/rust-cache@v2
       - name: Gates (same script as local)
         run: scripts/ci/check.sh
+
+  tauri-fmt:
+    # desktop/src-tauri is excluded from the workspace, so `cargo fmt --all`
+    # in check.sh never sees it. `cargo fmt` only parses sources, so this
+    # job needs no webkit2gtk/GTK system libraries and runs on any runner.
+    name: desktop fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.99.0
+      - name: fmt --check (excluded crate)
+        working-directory: desktop/src-tauri
+        run: cargo fmt -- --check
 
   ui:
     name: dashboard build

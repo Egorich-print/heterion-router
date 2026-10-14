@@ -10,6 +10,7 @@
 //! edge shapes beyond the common `image_url`/`file` parts. Unknown content
 //! parts are preserved verbatim, exactly as the JS adapter does.
 
+use heterion_router_core::{TextJoin, TextParts, content_text_with};
 use serde_json::{Map, Value, json};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,11 +22,16 @@ static CALL_ID_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Responses API rejects `call_id` longer than 64 characters.
 fn clamp_call_id(id: &str) -> String {
     const MAX_LEN: usize = 64;
-    if id.len() > MAX_LEN {
-        id[..MAX_LEN].to_string()
-    } else {
-        id.to_string()
+    if id.len() <= MAX_LEN {
+        return id.to_string();
     }
+    let end = id
+        .char_indices()
+        .take_while(|(index, _)| *index < MAX_LEN)
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0);
+    id[..end].to_string()
 }
 
 fn generate_tool_call_id() -> String {
@@ -38,33 +44,10 @@ fn s(value: Option<&Value>) -> &str {
     value.and_then(Value::as_str).unwrap_or("")
 }
 
-/// Flatten chat content into the string `instructions` takes: text parts
-/// joined, bare strings kept, anything non-textual dropped.
-fn instructions_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) => parts
-            .iter()
-            .filter_map(|part| match part {
-                Value::String(text) => Some(text.clone()),
-                Value::Object(_) => {
-                    let text = part.get("text").and_then(Value::as_str).unwrap_or("");
-                    if part.get("type").and_then(Value::as_str) == Some("text")
-                        || part.get("text").and_then(Value::as_str).is_some()
-                    {
-                        Some(text.to_string())
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            })
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-        _ => String::new(),
-    }
-}
+/// `instructions` flattening rules mirrored from the JS Responses adapter:
+/// text parts joined by a blank line, bare strings kept, anything non-textual
+/// (and empty) dropped.
+const INSTRUCTIONS: TextJoin = TextJoin::new(TextParts::Loose, "\n\n", true);
 
 /// Chat content block → Responses `input_text` part array.
 fn text_parts(content: Option<&Value>) -> Vec<Value> {
@@ -207,9 +190,9 @@ fn tool_output_string(content: Option<&Value>) -> String {
 
 /// Convert an OpenAI chat request body to a Responses API request body.
 ///
-/// `model` is stamped through. `store` is always `false` here; the
-/// credential-gated `store:true` path needs provider context the translator
-/// does not own yet.
+/// `model` is stamped through. `store` is forwarded when the client sets it
+/// and defaults to `false` otherwise; provider-specific state policy remains
+/// outside this translator.
 pub fn openai_to_responses(model: &str, body: &Value) -> Value {
     let mut input: Vec<Value> = Vec::new();
     let mut instructions: Option<String> = None;
@@ -220,7 +203,8 @@ pub fn openai_to_responses(model: &str, body: &Value) -> Value {
             match role {
                 "system" | "developer" => {
                     if instructions.is_none() {
-                        instructions = Some(instructions_text(message.get("content")));
+                        instructions =
+                            Some(content_text_with(message.get("content"), INSTRUCTIONS));
                     } else {
                         input.push(json!({
                             "type": "message",
@@ -400,7 +384,10 @@ pub fn openai_to_responses(model: &str, body: &Value) -> Value {
     result.insert("model".to_string(), Value::from(model));
     result.insert("input".to_string(), Value::Array(input));
     result.insert("stream".to_string(), Value::from(true));
-    result.insert("store".to_string(), Value::from(false));
+    result.insert(
+        "store".to_string(),
+        body.get("store").cloned().unwrap_or(Value::from(false)),
+    );
     result.insert(
         "instructions".to_string(),
         Value::from(instructions.unwrap_or_default()),
@@ -466,6 +453,8 @@ pub fn openai_to_responses(model: &str, body: &Value) -> Value {
         "service_tier",
         "temperature",
         "top_p",
+        "metadata",
+        "parallel_tool_calls",
     ] {
         if let Some(value) = body.get(key) {
             result.insert(key.to_string(), value.clone());
@@ -480,6 +469,12 @@ pub fn openai_to_responses(model: &str, body: &Value) -> Value {
         result.insert("max_output_tokens".to_string(), value.clone());
     }
 
+    if let Some(reasoning) = body.get("reasoning") {
+        result.insert("reasoning".to_string(), reasoning.clone());
+    } else if let Some(effort) = body.get("reasoning_effort") {
+        result.insert("reasoning".to_string(), json!({"effort": effort}));
+    }
+
     if let Some(include) = body.get("include").and_then(Value::as_array)
         && !include.is_empty()
     {
@@ -487,6 +482,9 @@ pub fn openai_to_responses(model: &str, body: &Value) -> Value {
     }
 
     map_response_format(body, &mut result);
+    if let Some(text) = body.get("text") {
+        result.insert("text".to_string(), text.clone());
+    }
 
     Value::Object(result)
 }
@@ -546,4 +544,17 @@ fn map_response_format(body: &Value, result: &mut Map<String, Value>) {
         .unwrap_or_default();
     text.insert("format".to_string(), Value::Object(format));
     result.insert("text".to_string(), Value::Object(text));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_call_id;
+
+    #[test]
+    fn clamps_call_ids_on_character_boundaries() {
+        let id = "é".repeat(40);
+        let clamped = clamp_call_id(&id);
+        assert!(clamped.len() <= 64);
+        assert!(clamped.chars().all(|ch| ch == 'é'));
+    }
 }

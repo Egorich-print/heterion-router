@@ -4,12 +4,25 @@
 //! handle (the JS `better-sqlite3` singleton), WAL journaling, and the same
 //! data-directory precedence.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use rusqlite::Connection;
 
 use crate::error::Result;
+
+#[cfg(unix)]
+fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
 
 /// Thread-safe handle around a single SQLite connection.
 pub struct Db {
@@ -42,12 +55,21 @@ impl Db {
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)?;
+            restrict_permissions(parent, 0o700)?;
         }
         let conn = Connection::open(path)?;
+        restrict_permissions(path, 0o600)?;
         Self::from_connection(conn)
     }
 
     /// Open the default `storage.sqlite` under the resolved data directory.
+    ///
+    /// Deliberate convenience surface for embedders. NOT wired into the
+    /// gateway: `GatewayConfig::data_dir` already owns the
+    /// `HETERION_ROUTER_DATA_DIR`/`DATA_DIR` precedence and logs the resolved
+    /// path, so calling this from `main.rs` would add a second, divergent
+    /// resolver.
+    #[allow(dead_code)]
     pub fn open_default() -> Result<(Self, PathBuf)> {
         let dir = Self::data_dir();
         let db = Self::open(&dir.join("storage.sqlite"))?;
@@ -131,13 +153,22 @@ mod tests {
     #[test]
     fn data_dir_prefers_env() {
         for key in ["HETERION_ROUTER_DATA_DIR", "DATA_DIR"] {
+            // SAFETY: edition-2024 makes env mutation unsafe because it
+            // races another thread reading the environment; this test owns
+            // its variable name.
             unsafe { std::env::remove_var(key) };
         }
+        // SAFETY: edition-2024 makes env mutation unsafe because it
+        // races another thread reading the environment; this test owns
+        // its variable name.
         unsafe { std::env::set_var("DATA_DIR", "/tmp/heterion-router-test-dir") };
         assert_eq!(
             Db::data_dir(),
             PathBuf::from("/tmp/heterion-router-test-dir")
         );
+        // SAFETY: edition-2024 makes env mutation unsafe because it races
+        // another thread reading the environment; this test owns its
+        // variable name.
         unsafe {
             std::env::set_var(
                 "HETERION_ROUTER_DATA_DIR",
@@ -149,8 +180,32 @@ mod tests {
             PathBuf::from("/tmp/heterion-router-primary-dir")
         );
         for key in ["HETERION_ROUTER_DATA_DIR", "DATA_DIR"] {
+            // SAFETY: edition-2024 makes env mutation unsafe because it
+            // races another thread reading the environment; this test owns
+            // its variable name.
             unsafe { std::env::remove_var(key) };
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_database_uses_private_permissions() {
+        let path = std::env::temp_dir().join(format!(
+            "heterion-router-permissions-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        let db = Db::open(&path.join("storage.sqlite")).unwrap();
+        drop(db);
+        let dir_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let file_mode = std::fs::metadata(path.join("storage.sqlite"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        let _ = std::fs::remove_dir_all(path);
     }
 
     #[test]

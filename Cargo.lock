@@ -596,6 +596,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -613,9 +614,11 @@ dependencies = [
 name = "heterion-router-db"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile 2.2.0",
  "thiserror",
 ]
@@ -683,6 +686,7 @@ version = "0.1.0"
 name = "heterion-router-translate"
 version = "0.1.0"
 dependencies = [
+ "heterion-router-core",
  "serde",
  "serde_json",
 ]
