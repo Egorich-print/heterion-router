@@ -123,7 +123,7 @@ where
                 Err(_) => continue,
             };
             for mut chunk_json in on_event(&event, &data)? {
-                crate::backend::fill_tool_call_ids(&mut chunk_json, &mut tool_call_ids);
+                crate::backend::normalize_tool_call_deltas(&mut chunk_json, &mut tool_call_ids);
                 let Some(stream_chunk) = openai_chunk_to_stream_chunk(&chunk_json) else {
                     continue;
                 };

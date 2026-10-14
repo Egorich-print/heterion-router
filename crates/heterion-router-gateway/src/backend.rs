@@ -222,17 +222,30 @@ pub(crate) fn openai_request_body(request: &ChatCompletionRequest) -> Value {
     body
 }
 
-/// Remembered tool-call ids for one upstream stream, keyed by call index.
-pub(crate) type ToolCallIds = std::collections::HashMap<u64, String>;
+/// What a streamed tool call introduced on its opening frame.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolCallMeta {
+    /// The upstream's real call id.
+    pub id: String,
+    /// The upstream's real function name.
+    pub name: String,
+}
 
-/// Give every streamed `tool_calls` delta a string `id`.
+/// Remembered tool-call metadata for one upstream stream, keyed by call index.
+pub(crate) type ToolCallIds = std::collections::HashMap<u64, ToolCallMeta>;
+
+/// Give every streamed `tool_calls` delta the full OpenAI contract:
+/// `id`, `type`, `function.name` and `function.arguments` are all present
+/// and all strings.
 ///
-/// Some OpenAI-compatible upstreams (observed: `text.pollinations.ai`, 2026-10-14)
-/// send the id once on the opening frame and omit it from the argument
-/// fragments that follow. Strict clients (OpenCode's AI SDK) then fail with
-/// `Expected 'id' to be a string`. This replays the remembered id for that
-/// index — and synthesises a stable one when the stream never sent any.
-pub(crate) fn fill_tool_call_ids(chunk: &mut Value, seen: &mut ToolCallIds) {
+/// Some OpenAI-compatible upstreams (observed: `text.pollinations.ai`,
+/// 2026-10-14) send the id and the function name once on the opening frame
+/// and omit both from the argument fragments that follow. Strict clients
+/// (OpenCode's AI SDK) then abort with `Expected 'id' to be a string` or
+/// `Expected 'function.name' to be a string`. This replays what the opening
+/// frame introduced, and synthesises stable stand-ins when an upstream never
+/// introduced them at all.
+pub(crate) fn normalize_tool_call_deltas(chunk: &mut Value, seen: &mut ToolCallIds) {
     let Some(choices) = chunk.get_mut("choices").and_then(Value::as_array_mut) else {
         return;
     };
@@ -252,24 +265,44 @@ pub(crate) fn fill_tool_call_ids(chunk: &mut Value, seen: &mut ToolCallIds) {
                 .get("index")
                 .and_then(Value::as_u64)
                 .unwrap_or(position as u64);
-            match object.get("id") {
-                Some(Value::String(id)) if !id.is_empty() => {
-                    seen.insert(index, id.clone());
-                }
-                _ => {
-                    let id = seen
-                        .entry(index)
-                        .or_insert_with(|| format!("call_{index}"))
-                        .clone();
-                    object.insert("id".to_string(), Value::from(id));
-                }
+            let meta = seen.entry(index).or_default();
+
+            if let Some(Value::String(id)) = object.get("id")
+                && !id.is_empty()
+            {
+                meta.id.clone_from(id);
             }
+            if meta.id.is_empty() {
+                meta.id = format!("call_{index}");
+            }
+            object.insert("id".to_string(), Value::from(meta.id.clone()));
+
+            let function = object
+                .entry("function".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                .as_object_mut();
+            let Some(function) = function else {
+                continue;
+            };
+            if let Some(Value::String(name)) = function.get("name")
+                && !name.is_empty()
+            {
+                meta.name.clone_from(name);
+            }
+            if meta.name.is_empty() {
+                meta.name = format!("tool_{index}");
+            }
+            function.insert("name".to_string(), Value::from(meta.name.clone()));
+            if !function.get("arguments").is_some_and(Value::is_string) {
+                function.insert("arguments".to_string(), Value::from(""));
+            }
+            object.insert("type".to_string(), Value::from("function"));
         }
     }
 }
 
-/// Same guarantee for a finished message's `tool_calls` array: any
-/// missing/null/non-string id becomes `call_<position>`.
+/// Same guarantee for a finished message's `tool_calls` array: every entry
+/// gets a string `id`, `type`, `function.name` and `function.arguments`.
 pub(crate) fn normalize_tool_call_ids(tool_calls: &mut Value) {
     let Some(calls) = tool_calls.as_array_mut() else {
         return;
@@ -278,12 +311,30 @@ pub(crate) fn normalize_tool_call_ids(tool_calls: &mut Value) {
         let Some(object) = call.as_object_mut() else {
             continue;
         };
-        let valid = object
+        if !object
             .get("id")
             .and_then(Value::as_str)
-            .is_some_and(|id| !id.is_empty());
-        if !valid {
+            .is_some_and(|id| !id.is_empty())
+        {
             object.insert("id".to_string(), Value::from(format!("call_{position}")));
+        }
+        object.insert("type".to_string(), Value::from("function"));
+        let Some(function) = object
+            .entry("function".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+            .as_object_mut()
+        else {
+            continue;
+        };
+        if !function
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| !name.is_empty())
+        {
+            function.insert("name".to_string(), Value::from("tool"));
+        }
+        if !function.get("arguments").is_some_and(Value::is_string) {
+            function.insert("arguments".to_string(), Value::from("{}"));
         }
     }
 }
@@ -660,60 +711,65 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_deltas_always_carry_a_string_id() {
-        // Observed upstream: id on the opening frame only (pollinations).
+    fn tool_call_deltas_always_carry_the_full_contract() {
+        // Observed upstream: id/type/name only on the opening frame
+        // (text.pollinations.ai), argument fragments after that.
         let mut seen: ToolCallIds = std::collections::HashMap::new();
 
         let mut opening = json!({"choices": [{"index": 0, "delta": {"tool_calls": [
             {"index": 0, "id": "chatcmpl-tool-abc", "type": "function",
              "function": {"name": "read_file", "arguments": ""}}
         ]}}]});
-        fill_tool_call_ids(&mut opening, &mut seen);
-        assert_eq!(
-            opening["choices"][0]["delta"]["tool_calls"][0]["id"],
-            json!("chatcmpl-tool-abc")
-        );
+        normalize_tool_call_deltas(&mut opening, &mut seen);
+        let call = &opening["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["id"], json!("chatcmpl-tool-abc"));
+        assert_eq!(call["type"], json!("function"));
+        assert_eq!(call["function"]["name"], json!("read_file"));
 
-        // Continuation without an id replays the remembered one.
+        // A continuation without id/type/name replays all three.
         let mut fragment = json!({"choices": [{"index": 0, "delta": {"tool_calls": [
             {"index": 0, "function": {"arguments": "{\"path\":"}}
         ]}}]});
-        fill_tool_call_ids(&mut fragment, &mut seen);
-        assert_eq!(
-            fragment["choices"][0]["delta"]["tool_calls"][0]["id"],
-            json!("chatcmpl-tool-abc")
-        );
+        normalize_tool_call_deltas(&mut fragment, &mut seen);
+        let call = &fragment["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["id"], json!("chatcmpl-tool-abc"));
+        assert_eq!(call["type"], json!("function"));
+        assert_eq!(call["function"]["name"], json!("read_file"));
+        assert_eq!(call["function"]["arguments"], json!("{\"path\":"));
 
-        // A stream that never sent one gets a stable synthetic id.
+        // A stream that never introduced them gets stable stand-ins.
         let mut fresh: ToolCallIds = std::collections::HashMap::new();
         for _ in 0..2 {
             let mut call = json!({"choices": [{"index": 0, "delta": {"tool_calls": [
                 {"index": 1, "function": {"arguments": "{}"}}
             ]}}]});
-            fill_tool_call_ids(&mut call, &mut fresh);
-            assert_eq!(
-                call["choices"][0]["delta"]["tool_calls"][0]["id"],
-                json!("call_1")
-            );
+            normalize_tool_call_deltas(&mut call, &mut fresh);
+            let call = &call["choices"][0]["delta"]["tool_calls"][0];
+            assert_eq!(call["id"], json!("call_1"));
+            assert_eq!(call["type"], json!("function"));
+            assert_eq!(call["function"]["name"], json!("tool_1"));
         }
 
         // Text deltas stay untouched.
         let mut text = json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]});
-        fill_tool_call_ids(&mut text, &mut seen);
+        normalize_tool_call_deltas(&mut text, &mut seen);
         assert!(text["choices"][0]["delta"].get("tool_calls").is_none());
     }
 
     #[test]
-    fn a_finished_tool_calls_array_gets_string_ids() {
+    fn a_finished_tool_calls_array_gets_the_full_contract() {
         let mut calls = json!([
-            {"type": "function", "function": {"name": "a", "arguments": "{}"}},
+            {"function": {"name": "a", "arguments": "{}"}},
             {"id": "keep-me", "type": "function", "function": {"name": "b", "arguments": "{}"}},
-            {"id": null, "type": "function", "function": {"name": "c", "arguments": "{}"}},
+            {"id": null, "function": {}},
         ]);
         normalize_tool_call_ids(&mut calls);
         assert_eq!(calls[0]["id"], json!("call_0"));
+        assert_eq!(calls[0]["type"], json!("function"));
         assert_eq!(calls[1]["id"], json!("keep-me"));
         assert_eq!(calls[2]["id"], json!("call_2"));
+        assert_eq!(calls[2]["function"]["name"], json!("tool"));
+        assert_eq!(calls[2]["function"]["arguments"], json!("{}"));
     }
 
     #[test]
