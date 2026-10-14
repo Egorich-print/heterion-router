@@ -25,6 +25,21 @@ main-262k/main-128k и вторая ступень main-1m.
 | `main-128k` | zai/glm-5.3-flash → groq → mistral/codestral → mistral/small → pollinations |
 | `google`, `openrouter-free` | без изменений |
 
+## Mistral: подтверждённые факты (2026-10-14, OpenRouter API + docs.mistral.ai)
+
+| Модель | Контекст | Цена (in/out) | Живая проба |
+|--------|----------|---------------|-------------|
+| Mistral Large 4 (`mistral-large-latest`) | **1,048,576** | $0.68 / $2.09 (sale) | **403** — тариф аккаунта не включает |
+| Mistral Medium 3.5 (`mistral-medium-3-5`) | **262,144** | $1.50 / $7.50 | 429 rate limit (code 1300) |
+| Mistral Small 4 (`mistral-small-latest`) | **262,144** | $0.15 / $0.60 | 429 (флапает; в комбо как fallback) |
+| Codestral (`codestral-latest`) | **256,000** | $0.30 / $0.90 | **OK** — стабильно |
+| Devstral 2 (`devstral-latest`) | — | — | **RETIRED** 2026-07-31 |
+
+Старая запись инвентаря «32k» была неверна. Аккаунт — бесплатный тариф:
+Codestral обслуживается, чат-модели лимитируются (429), Large запрещён (403).
+Размещение в комбо корректно: small (262K) в main-262k, codestral (256K) в
+main-128k.
+
 ## Exa (ADR-019)
 
 - Исполнитель реализован; base_url реестра исправлен на `https://api.exa.ai`

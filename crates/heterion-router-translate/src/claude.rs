@@ -1,4 +1,4 @@
-//! Streaming `claude → openai` conversion (text path).
+//! Streaming `claude → openai` conversion.
 //!
 //! Mirrors `claudeToOpenAIResponse` in
 //! `open-sse/translator/response/claude-to-openai.ts` for plain text:
@@ -6,9 +6,13 @@
 //! deltas become content/`reasoning_content`, and `message_delta` usage plus
 //! `message_stop` close the stream with a finish chunk.
 //!
-//! Explicitly deferred: tool_use/input_json synthesis, `<think>` tag parsing,
-//! `pendingThinkClose` markers, and signature handling. Unknown event kinds
-//! are ignored, never fabricated.
+//! Tool calls are translated: a `tool_use` content block accumulates its
+//! `input_json_delta` fragments and is emitted as an OpenAI `tool_calls`
+//! delta when the block stops — without this, agentic clients see a
+//! `tool_calls` finish reason with nothing to execute and stall.
+//!
+//! Still deferred: `<think>` tag parsing, `pendingThinkClose` markers, and
+//! signature handling. Unknown event kinds are ignored, never fabricated.
 
 use crate::chunk::{
     ROLE_ASSISTANT, attach_usage, cached_prompt_details, chatcmpl_id, chunk, chunk_model,
@@ -29,6 +33,25 @@ pub struct ClaudeState {
     pub finish_reason: Option<String>,
     /// Accumulated token accounting.
     pub usage: Option<ClaudeUsage>,
+    /// One accumulator per `tool_use` block seen so far, keyed by the
+    /// Claude content-block index.
+    pub tools: Vec<ToolCallAcc>,
+    /// OpenAI `tool_calls[].index` for the next synthesized call.
+    pub next_tool_index: usize,
+}
+
+/// One accumulating `tool_use` block: id/name from `content_block_start`,
+/// arguments assembled from `input_json_delta` fragments.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ToolCallAcc {
+    /// Claude content-block index this accumulator belongs to.
+    pub block_index: i64,
+    /// `tool_use.id`, stamped verbatim into the OpenAI delta.
+    pub id: String,
+    /// `tool_use.name`.
+    pub name: String,
+    /// Assembled JSON string from `input_json_delta` fragments.
+    pub arguments: String,
 }
 
 /// Token accounting in Claude-native fields.
@@ -90,7 +113,41 @@ pub fn convert_event(
             }
             Converted::Emit(role_chunk(state, now))
         }
-        "content_block_start" | "content_block_stop" => Converted::Ignore,
+        "content_block_start" => {
+            let block = data.get("content_block");
+            if block
+                .and_then(|block| block.get("type"))
+                .and_then(Value::as_str)
+                != Some("tool_use")
+            {
+                return Converted::Ignore;
+            }
+            state.tools.push(ToolCallAcc {
+                block_index: data.get("index").and_then(Value::as_i64).unwrap_or(-1),
+                id: block
+                    .and_then(|block| block.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                name: block
+                    .and_then(|block| block.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                arguments: String::new(),
+            });
+            Converted::Ignore
+        }
+        "content_block_stop" => {
+            let index = data.get("index").and_then(Value::as_i64).unwrap_or(-1);
+            let Some(position) = state.tools.iter().position(|acc| acc.block_index == index) else {
+                return Converted::Ignore;
+            };
+            let acc = state.tools.remove(position);
+            let tool_index = state.next_tool_index;
+            state.next_tool_index += 1;
+            Converted::Emit(tool_call_chunk(state, now, tool_index, &acc))
+        }
         "content_block_delta" => {
             let delta = data.get("delta");
             let kind = delta
@@ -117,6 +174,36 @@ pub fn convert_event(
                         return Converted::Ignore;
                     }
                     Converted::Emit(delta_chunk(state, now, None, Some(text)))
+                }
+                "input_json_delta" => {
+                    let fragment = delta
+                        .and_then(|delta| delta.get("partial_json"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if fragment.is_empty() {
+                        return Converted::Ignore;
+                    }
+                    // Append to the most recently started tool block; Claude
+                    // deltas carry the block index too, so honour it when the
+                    // event provides one.
+                    let index = data.get("index").and_then(Value::as_i64);
+                    let target = match index {
+                        Some(index) => state
+                            .tools
+                            .iter_mut()
+                            .rev()
+                            .find(|acc| acc.block_index == index),
+                        None => state.tools.last_mut(),
+                    };
+                    match target {
+                        Some(acc) => {
+                            acc.arguments.push_str(fragment);
+                            Converted::Ignore
+                        }
+                        // A fragment without a started block is dropped, not
+                        // fabricated into a nameless tool call.
+                        None => Converted::Ignore,
+                    }
                 }
                 _ => Converted::Ignore,
             }
@@ -244,11 +331,35 @@ fn delta_chunk(
     )
 }
 
+/// Emit one completed tool call as an OpenAI `tool_calls` delta.
+///
+/// The assembled arguments go out in a single delta when the Claude block
+/// stops — OpenAI clients accept a full-arguments delta and it keeps the
+/// synthesizer stateless beyond the accumulator itself.
+fn tool_call_chunk(state: &ClaudeState, now: i64, tool_index: usize, acc: &ToolCallAcc) -> Value {
+    stream_chunk(
+        &chatcmpl_id(state.message_id.as_deref()),
+        now,
+        &chunk_model(state.model.as_deref()),
+        json!({
+            "tool_calls": [{
+                "index": tool_index,
+                "type": "function",
+                "id": acc.id,
+                "function": {
+                    "name": acc.name,
+                    "arguments": acc.arguments,
+                },
+            }],
+        }),
+    )
+}
+
 fn finish_chunk(state: &ClaudeState, now: i64) -> Value {
-    let reason = state.finish_reason.clone().unwrap_or_else(|| {
-        // No tool tracking yet, so a bare stop always means "stop".
-        "stop".to_string()
-    });
+    let reason = state
+        .finish_reason
+        .clone()
+        .unwrap_or_else(|| "stop".to_string());
     let usage = state.usage.map(|usage| {
         let mut root = usage_root(usage.input, usage.output, usage.input + usage.output);
         if let Some(reasoning) = usage.reasoning {
@@ -327,5 +438,133 @@ mod tests {
             convert_event(&mut state, "message_stop", &json!({}), NOW),
             Converted::Ignore
         );
+    }
+
+    #[test]
+    fn tool_use_blocks_become_tool_call_deltas() {
+        let mut state = started();
+        // A text block streams through untouched.
+        convert_event(
+            &mut state,
+            "content_block_start",
+            &json!({"index": 0, "content_block": {"type": "text", "text": ""}}),
+            NOW,
+        );
+        assert!(matches!(
+            convert_event(
+                &mut state,
+                "content_block_delta",
+                &json!({"index": 0, "delta": {"type": "text_delta", "text": "calling"}}),
+                NOW,
+            ),
+            Converted::Emit(_)
+        ));
+        assert_eq!(
+            convert_event(&mut state, "content_block_stop", &json!({"index": 0}), NOW,),
+            Converted::Ignore
+        );
+
+        // The tool_use block accumulates fragments and emits on stop.
+        assert_eq!(
+            convert_event(
+                &mut state,
+                "content_block_start",
+                &json!({"index": 1, "content_block": {"type": "tool_use", "id": "tu_1", "name": "search"}}),
+                NOW,
+            ),
+            Converted::Ignore
+        );
+        assert_eq!(
+            convert_event(
+                &mut state,
+                "content_block_delta",
+                &json!({"index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"q\":"}}),
+                NOW,
+            ),
+            Converted::Ignore
+        );
+        convert_event(
+            &mut state,
+            "content_block_delta",
+            &json!({"index": 1, "delta": {"type": "input_json_delta", "partial_json": "\"rust\"}"}}),
+            NOW,
+        );
+        let Converted::Emit(chunk) =
+            convert_event(&mut state, "content_block_stop", &json!({"index": 1}), NOW)
+        else {
+            panic!("tool block stop must emit a tool_calls delta");
+        };
+        let calls = chunk["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .expect("tool_calls array");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["index"], json!(0));
+        assert_eq!(calls[0]["type"], json!("function"));
+        assert_eq!(calls[0]["id"], json!("tu_1"));
+        assert_eq!(calls[0]["function"]["name"], json!("search"));
+        assert_eq!(calls[0]["function"]["arguments"], json!("{\"q\":\"rust\"}"));
+
+        // The terminal stop_reason maps to tool_calls.
+        let Converted::Emit(finish) = convert_event(
+            &mut state,
+            "message_delta",
+            &json!({"delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 5}}),
+            NOW,
+        ) else {
+            panic!("message_delta with stop_reason must emit a finish chunk");
+        };
+        assert_eq!(finish["choices"][0]["finish_reason"], json!("tool_calls"));
+    }
+
+    #[test]
+    fn two_tool_calls_get_sequential_openai_indexes() {
+        let mut state = started();
+        let calls = [("tu_a", "alpha"), ("tu_b", "beta")];
+        for (index, (id, name)) in calls.iter().enumerate() {
+            convert_event(
+                &mut state,
+                "content_block_start",
+                &json!({"index": index, "content_block": {"type": "tool_use", "id": id, "name": name}}),
+                NOW,
+            );
+            convert_event(
+                &mut state,
+                "content_block_delta",
+                &json!({"index": index, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+                NOW,
+            );
+            let Converted::Emit(chunk) = convert_event(
+                &mut state,
+                "content_block_stop",
+                &json!({"index": index}),
+                NOW,
+            ) else {
+                panic!("block stop must emit");
+            };
+            assert_eq!(
+                chunk["choices"][0]["delta"]["tool_calls"][0]["index"],
+                json!(index)
+            );
+            assert_eq!(
+                chunk["choices"][0]["delta"]["tool_calls"][0]["id"],
+                json!(id)
+            );
+        }
+    }
+
+    #[test]
+    fn a_json_fragment_without_a_started_block_is_dropped() {
+        let mut state = started();
+        assert_eq!(
+            convert_event(
+                &mut state,
+                "content_block_delta",
+                &json!({"index": 9, "delta": {"type": "input_json_delta", "partial_json": "{}"}}),
+                NOW,
+            ),
+            Converted::Ignore
+        );
+        assert!(state.tools.is_empty());
+        assert_eq!(state.next_tool_index, 0);
     }
 }

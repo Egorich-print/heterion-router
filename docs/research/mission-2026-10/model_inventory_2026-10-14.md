@@ -43,7 +43,11 @@
 | heterion-local | grok-4.6 | openai | 1M (openrouter?) | none | **ПОКАЗАН В КОДЕ** (grok-4.6) | **high** | не указано | **LOCAL** | Запускается локально, используется в тестах как fallback. Может использоваться для грубого fallback после grok-cli. |
 
 ### Mistral
-| mistral | mistral models | openai | 32k | apikey | **NOT TESTED** | TBD | TBD | **$10 balance** | $10 balance на всех аккаунтах. Не протестированы напрямую в коде, но есть в registry (executor `default`). |
+| mistral | mistral-large-latest (Large 4) | openai | **1,048,576** (OpenRouter API) | apikey | **403** — не входит в тариф аккаунта | TBD | $0.68 in / $2.09 out (sale) | **free tier** | Флагман v26.10; на бесплатном тарифе недоступен |
+| mistral | mistral-medium-3-5 (Medium 3.5) | openai | **262,144** (OpenRouter API) | apikey | **429** code 1300 rate limit | TBD | $1.50 / $7.50 | **free tier** | Frontier-class v26.04 |
+| mistral | mistral-small-latest (Small 4) | openai | **262,144** (OpenRouter API) | apikey | **429** (rate limit; периодически отвечает) | TBD | $0.15 / $0.60 | **free tier** | Hybrid instruct/reasoning/coding v26.03; в main-262k как fallback |
+| mistral | codestral-latest (Codestral 25.08) | openai | **256,000** (OpenRouter API) | apikey | **OK** (единственный стабильно отвечающий) | TBD | $0.30 / $0.90 | **free tier** | Code-модель; в main-128k |
+| mistral | devstral-latest (Devstral 2 25.12) | openai | 262,144 | apikey | **RETIRED** 2026-07-31 (docs.mistral.ai lifecycle) | — | — | — | Модель выведена из эксплуатации; id в реестре мёртв |
 
 ### OpenRouter
 | openrouter | grok-4.6 | openai | 32k / 200k (зависит от модели) | apikey | **NOT TESTED** | TBD | TBD | **BALANCE? не установлено** | Registry: `executor=default`, models: `grok-4.6`. Вызывается как fallback, после grok-cli. Использует OpenRouter для переадресации. |
