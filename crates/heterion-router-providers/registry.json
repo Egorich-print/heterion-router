@@ -10626,7 +10626,7 @@
     "format": "openai",
     "executor": "pollinations",
     "auth_type": "optional",
-    "base_url": "https://gen.pollinations.ai/v1/chat/completions",
+    "base_url": "https://text.pollinations.ai/v1/chat/completions",
     "models": [
       {
         "id": "openai",
