@@ -222,6 +222,72 @@ pub(crate) fn openai_request_body(request: &ChatCompletionRequest) -> Value {
     body
 }
 
+/// Remembered tool-call ids for one upstream stream, keyed by call index.
+pub(crate) type ToolCallIds = std::collections::HashMap<u64, String>;
+
+/// Give every streamed `tool_calls` delta a string `id`.
+///
+/// Some OpenAI-compatible upstreams (observed: `text.pollinations.ai`, 2026-10-14)
+/// send the id once on the opening frame and omit it from the argument
+/// fragments that follow. Strict clients (OpenCode's AI SDK) then fail with
+/// `Expected 'id' to be a string`. This replays the remembered id for that
+/// index — and synthesises a stable one when the stream never sent any.
+pub(crate) fn fill_tool_call_ids(chunk: &mut Value, seen: &mut ToolCallIds) {
+    let Some(choices) = chunk.get_mut("choices").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for choice in choices.iter_mut() {
+        let Some(calls) = choice
+            .get_mut("delta")
+            .and_then(|delta| delta.get_mut("tool_calls"))
+            .and_then(Value::as_array_mut)
+        else {
+            continue;
+        };
+        for (position, call) in calls.iter_mut().enumerate() {
+            let Some(object) = call.as_object_mut() else {
+                continue;
+            };
+            let index = object
+                .get("index")
+                .and_then(Value::as_u64)
+                .unwrap_or(position as u64);
+            match object.get("id") {
+                Some(Value::String(id)) if !id.is_empty() => {
+                    seen.insert(index, id.clone());
+                }
+                _ => {
+                    let id = seen
+                        .entry(index)
+                        .or_insert_with(|| format!("call_{index}"))
+                        .clone();
+                    object.insert("id".to_string(), Value::from(id));
+                }
+            }
+        }
+    }
+}
+
+/// Same guarantee for a finished message's `tool_calls` array: any
+/// missing/null/non-string id becomes `call_<position>`.
+pub(crate) fn normalize_tool_call_ids(tool_calls: &mut Value) {
+    let Some(calls) = tool_calls.as_array_mut() else {
+        return;
+    };
+    for (position, call) in calls.iter_mut().enumerate() {
+        let Some(object) = call.as_object_mut() else {
+            continue;
+        };
+        let valid = object
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty());
+        if !valid {
+            object.insert("id".to_string(), Value::from(format!("call_{position}")));
+        }
+    }
+}
+
 /// Reduce an OpenAI `chat.completion.chunk` object to a gateway `StreamChunk`.
 ///
 /// Returns `None` for chunks without content, reasoning or finish signal.
@@ -591,6 +657,63 @@ mod tests {
         request.model = "mistral-large".into();
         let body = openai_request_body(&request);
         assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn tool_call_deltas_always_carry_a_string_id() {
+        // Observed upstream: id on the opening frame only (pollinations).
+        let mut seen: ToolCallIds = std::collections::HashMap::new();
+
+        let mut opening = json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "id": "chatcmpl-tool-abc", "type": "function",
+             "function": {"name": "read_file", "arguments": ""}}
+        ]}}]});
+        fill_tool_call_ids(&mut opening, &mut seen);
+        assert_eq!(
+            opening["choices"][0]["delta"]["tool_calls"][0]["id"],
+            json!("chatcmpl-tool-abc")
+        );
+
+        // Continuation without an id replays the remembered one.
+        let mut fragment = json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+            {"index": 0, "function": {"arguments": "{\"path\":"}}
+        ]}}]});
+        fill_tool_call_ids(&mut fragment, &mut seen);
+        assert_eq!(
+            fragment["choices"][0]["delta"]["tool_calls"][0]["id"],
+            json!("chatcmpl-tool-abc")
+        );
+
+        // A stream that never sent one gets a stable synthetic id.
+        let mut fresh: ToolCallIds = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let mut call = json!({"choices": [{"index": 0, "delta": {"tool_calls": [
+                {"index": 1, "function": {"arguments": "{}"}}
+            ]}}]});
+            fill_tool_call_ids(&mut call, &mut fresh);
+            assert_eq!(
+                call["choices"][0]["delta"]["tool_calls"][0]["id"],
+                json!("call_1")
+            );
+        }
+
+        // Text deltas stay untouched.
+        let mut text = json!({"choices": [{"index": 0, "delta": {"content": "hi"}}]});
+        fill_tool_call_ids(&mut text, &mut seen);
+        assert!(text["choices"][0]["delta"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn a_finished_tool_calls_array_gets_string_ids() {
+        let mut calls = json!([
+            {"type": "function", "function": {"name": "a", "arguments": "{}"}},
+            {"id": "keep-me", "type": "function", "function": {"name": "b", "arguments": "{}"}},
+            {"id": null, "type": "function", "function": {"name": "c", "arguments": "{}"}},
+        ]);
+        normalize_tool_call_ids(&mut calls);
+        assert_eq!(calls[0]["id"], json!("call_0"));
+        assert_eq!(calls[1]["id"], json!("keep-me"));
+        assert_eq!(calls[2]["id"], json!("call_2"));
     }
 
     #[test]

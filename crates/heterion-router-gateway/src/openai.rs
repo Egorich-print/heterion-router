@@ -224,9 +224,13 @@ fn openai_payload_to_completion(model: &str, payload: &Value) -> ChatCompletionR
         // empty and the arm is dead. Proved by substituting a sentinel — no
         // observable behaviour changed.
         ;
-    let tool_calls = message
+    let mut tool_calls = message
         .and_then(|message| message.get("tool_calls"))
         .cloned();
+    // Strict clients reject a non-string id, and some upstreams omit it.
+    if let Some(calls) = tool_calls.as_mut() {
+        crate::backend::normalize_tool_call_ids(calls);
+    }
     let finish = choice
         .and_then(|choice| choice.get("finish_reason"))
         .and_then(Value::as_str)

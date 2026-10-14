@@ -101,6 +101,9 @@ where
     let mut bytes = response.bytes_stream();
     let mut decoder = SseDecoder::new();
     let mut finish_seen = false;
+    // Tool-call ids survive as their own stream arrives only on the opening
+    // frame; keep them so every delta the client sees carries a string id.
+    let mut tool_call_ids: crate::backend::ToolCallIds = std::collections::HashMap::new();
 
     loop {
         let chunk = tokio::select! {
@@ -119,7 +122,8 @@ where
                 Ok(data) => data,
                 Err(_) => continue,
             };
-            for chunk_json in on_event(&event, &data)? {
+            for mut chunk_json in on_event(&event, &data)? {
+                crate::backend::fill_tool_call_ids(&mut chunk_json, &mut tool_call_ids);
                 let Some(stream_chunk) = openai_chunk_to_stream_chunk(&chunk_json) else {
                     continue;
                 };
