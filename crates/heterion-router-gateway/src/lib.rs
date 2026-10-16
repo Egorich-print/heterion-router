@@ -908,6 +908,7 @@ fn stream_response(
                 let error = with_recovered_status(error);
                 // The 200 is already spent, so the recovered status can only
                 // ride in the error frame — but it must be booked too.
+                tracing::warn!("stream upstream error model={model}: {error}");
                 books.failed_with(i64::from(error_status(&error).as_u16()));
                 error_event(&error)
             }

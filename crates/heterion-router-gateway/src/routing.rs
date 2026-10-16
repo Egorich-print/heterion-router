@@ -89,12 +89,53 @@ fn no_candidate(model: &str) -> GatewayError {
 }
 
 /// One attempt against a named backend: the request leaves without the
-/// internal attribution token, which no upstream may ever see.
+/// internal attribution token, which no upstream may ever see, and without
+/// fields that only the OpenAI platform API defines. `store` (server-side
+/// conversation retention) is the known offender: OpenCode sends it on every
+/// completion and Mistral's strict validation rejects the whole request with
+/// `extra_forbidden` 422, while every other provider merely ignores it.
 fn attempt(request: &ChatCompletionRequest, model: &str) -> ChatCompletionRequest {
+    const OPENAI_ONLY_FIELDS: [&str; 1] = ["store"];
     let mut attempt = request.clone();
     attempt.model = model.to_string();
     attempt.extra.remove(ATTRIBUTION_TOKEN);
+    for field in OPENAI_ONLY_FIELDS {
+        attempt.extra.remove(field);
+    }
     attempt
+}
+
+#[cfg(test)]
+mod attempt_tests {
+    use super::attempt;
+    use heterion_router_core::{ChatCompletionRequest, ChatMessage};
+
+    #[test]
+    fn attempt_strips_store_and_attribution_but_keeps_known_fields() {
+        let mut request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages: vec![ChatMessage::plain("user", "hi")],
+            stream: true,
+            ..Default::default()
+        };
+        request.extra.insert(
+            "_heterion_router_attribution".into(),
+            serde_json::json!("t"),
+        );
+        request
+            .extra
+            .insert("store".into(), serde_json::json!(false));
+        request
+            .extra
+            .insert("logprobs".into(), serde_json::json!(true));
+
+        let out = attempt(&request, "mistral/codestral-latest");
+        assert_eq!(out.model, "mistral/codestral-latest");
+        assert!(!out.extra.contains_key("_heterion_router_attribution"));
+        assert!(!out.extra.contains_key("store"));
+        // Anything else the client sent still rides along.
+        assert_eq!(out.extra.get("logprobs"), Some(&serde_json::json!(true)));
+    }
 }
 
 impl RoutingBackend {
