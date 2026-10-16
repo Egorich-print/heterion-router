@@ -801,6 +801,25 @@ impl StreamAccounting {
             return;
         }
         self.recorded = true;
+        let latency_ms = millis_since(self.started);
+        if self.success {
+            tracing::info!(
+                "completion ok (stream) model={} pt={} ct={} ttft={}ms total={}ms",
+                self.requested_model,
+                self.usage.prompt_tokens,
+                self.usage.completion_tokens,
+                self.ttft_ms.unwrap_or(0),
+                latency_ms,
+            );
+        } else {
+            tracing::warn!(
+                "completion failed (stream) model={} status={} ttft={}ms total={}ms",
+                self.requested_model,
+                self.status,
+                self.ttft_ms.unwrap_or(0),
+                latency_ms,
+            );
+        }
         record_completion_usage(
             &self.state,
             &self.auth,
@@ -816,7 +835,7 @@ impl StreamAccounting {
                 details: self.details,
                 success: self.success,
                 call_status: self.status,
-                latency_ms: millis_since(self.started),
+                latency_ms,
                 ttft_ms: self.ttft_ms.unwrap_or(0),
                 error_code: (!self.success).then_some("stream_error"),
                 request_type: self.request_type,
