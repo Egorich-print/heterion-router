@@ -102,6 +102,10 @@ fn attempt(request: &ChatCompletionRequest, model: &str) -> ChatCompletionReques
     for field in OPENAI_ONLY_FIELDS {
         attempt.extra.remove(field);
     }
+    // Strict validators (Mistral) reject the whole request over this field.
+    if crate::reasoning::rejects_reasoning_effort(model) {
+        attempt.reasoning_effort = None;
+    }
     attempt
 }
 
@@ -135,6 +139,23 @@ mod attempt_tests {
         assert!(!out.extra.contains_key("store"));
         // Anything else the client sent still rides along.
         assert_eq!(out.extra.get("logprobs"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn attempt_drops_reasoning_effort_for_models_that_reject_it() {
+        let mut request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages: vec![ChatMessage::plain("user", "hi")],
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        };
+        // The client's field survives dispatch to a family that accepts it.
+        let glm = attempt(&request, "zai/glm-5.3-flash");
+        assert_eq!(glm.reasoning_effort.as_deref(), Some("high"));
+        // Mistral 400s on the field, so the attempt must not carry it.
+        request.reasoning_effort = Some("medium".into());
+        let codestral = attempt(&request, "mistral/codestral-latest");
+        assert_eq!(codestral.reasoning_effort, None);
     }
 }
 

@@ -33,7 +33,6 @@ pub fn default_effort(model: &str) -> Option<&'static str> {
 
 /// Models that answer in prose instead of calling the tool they were given,
 /// unless the request pins the choice.
-///
 /// Codestral (Mistral's low-latency code-completion model) officially
 /// supports function calling, but drifts to a text answer by default: probed
 /// live on 2026-10-14, `tool_choice: "required"` produced
@@ -47,6 +46,21 @@ pub fn needs_explicit_tool_choice(model: &str) -> bool {
     let bare = model.rsplit('/').next().unwrap_or(model);
     let bare = bare.to_ascii_lowercase();
     bare.starts_with("codestral")
+}
+
+/// Models whose upstream API rejects `reasoning_effort` outright.
+///
+/// Mistral validates the body strictly: codestral-2508 answers
+/// `400 invalid_request_invalid_args` "reasoning_effort is not enabled for
+/// this model" (code 3051) when OpenCode's reasoning modes send the field,
+/// killing the whole request. The router presets no effort for these
+/// families (`default_effort` is `None`), so the field can only arrive from
+/// the client — and for this family the only safe move is to drop it.
+/// Probed live 2026-10-16.
+pub fn rejects_reasoning_effort(model: &str) -> bool {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    let bare = bare.to_ascii_lowercase();
+    bare.starts_with("codestral") || bare.starts_with("mistral") || bare.starts_with("ministral")
 }
 
 #[cfg(test)]
