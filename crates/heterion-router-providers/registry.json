@@ -9887,6 +9887,14 @@
       {
         "id": "north-mini-code-free",
         "target_format": null
+      },
+      {
+        "id": "glm-5.3-flash-free",
+        "target_format": null
+      },
+      {
+        "id": "deepseek-v4.1-flash-free",
+        "target_format": null
       }
     ]
   },
