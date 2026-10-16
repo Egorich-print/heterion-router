@@ -40,6 +40,44 @@ Codestral обслуживается, чат-модели лимитируютс
 Размещение в комбо корректно: small (262K) в main-262k, codestral (256K) в
 main-128k.
 
+## Mistral-only перестройка (14.10, вечер) — «костыль» без рестарта OpenCode
+
+Пользователь: main-262k = только mistral/codestral-latest (reliable агентское
+комбо), остальное — в новое `fallback-free`. Имя main-262k сохранено
+(OpenCode-конфиг ссылается на него), контекстная метка честная — 131072
+(доки Mistral: Codestral 128k; 256K из OpenRouter API — цифра их деплоя).
+
+| Комбо | Цепочка |
+|-------|---------|
+| `main-262k` (имя историческое) | mistral/codestral-latest — ТОЛЬКО |
+| `fallback-free` (новое) | zai/glm-5.3-flash → groq → pollinations → openrouter (paid tail) |
+| `main-128k` | mistral/codestral → zai → groq → pollinations |
+| `main-1m`, `google`, `openrouter-free` | без изменений |
+
+### Лимиты организации Mistral (из консоли пользователя, docs.mistral.ai)
+
+| Модель | TPM | RPS |
+|--------|-----|-----|
+| **codestral-2508** | **625 000** | **2.08** |
+| mistral-small-2603 | 20 000 | 1.00 |
+| mistral-medium-latest | 20 000 | 1.00 |
+| mistral-large-4 | 20 000 | 0.83 |
+| zai-glm-5-3 (hosted) | 20 000 | 1.00 |
+
+### Стресс-проверка Codestral (14.10 вечер, всё через шлюз)
+
+| Тест | Результат |
+|------|-----------|
+| Burst 10 уникальных подряд | **10/10**, фактические 2.6 RPS (выше лимита 2.08 — без 429), p50 329ms, max 711ms |
+| Sustained 3×~500-600 tok out | 3/3, ~3s каждый, ~150-200 tok/s |
+| Параллельно 3 | 3/3 (305-519ms) |
+| Tool calling стрим | finish=tool_calls, id/name валидны |
+| Расход | ~1581 токенов = 0.25% от 625K TPM |
+
+Вывод: Codestral стабилен, лимиты не достижимы для одиночного агента.
+Первые прогоны «1ms» были семантическим кэшем шлюза — повторные замеры
+только с уникальными промптами.
+
 ## Exa (ADR-019)
 
 - Исполнитель реализован; base_url реестра исправлен на `https://api.exa.ai`
