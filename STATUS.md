@@ -217,4 +217,4 @@ macOS-раннере. Остаётся: `cargo check`/`cargo tauri build` для
 | Changelog | `CHANGELOG.md` |
 | ChatHub evidence | `docs/research/CHATHUB-2026-09.md` |
 | Frozen upstream history | `docs/history/` |
-| Референс OmniRoute | `~/ai-workstation/Archives/OmniRoute/` |
+| Референс OmniRoute | `/Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/` |

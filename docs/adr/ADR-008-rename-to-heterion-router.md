@@ -17,7 +17,7 @@
 ## Решение
 
 1. **Имя: Heterion Router.** Репозиторий `Egorich-print/heterion-router`
-   (public, как предшественник), каталог `~/ai-workstation/Projects/heterion-router`.
+   (public, как предшественник), каталог `/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router`.
 2. **Новый репозиторий, не fork.** История Rust-поверхности перенесена
    `git filter-repo` (keep: `crates/`, `desktop/`, `Cargo.*`,
    `rust-toolchain.toml`, `docs/adr/`, `docs/history/`, `STATUS.md`,
@@ -30,7 +30,7 @@
 4. **Лицензия MIT**, с сохранением `Copyright (c) 2026 diegosouzapw` +
    `Copyright (c) 2026 Egorich-print` (требование MIT при копировании).
 5. **OmniRoute — замороженный референс**, не вендорится: репозиторий
-   OmniRoute-Rust (архив), `~/ai-workstation/Archives/OmniRoute/`,
+   OmniRoute-Rust (архив), `/Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/`,
    upstream `diegosouzapw/OmniRoute`.
 6. **Замороженные interop-константы** (переименование их ломает молча):
    - `STATIC_SALT = "omniroute-field-encryption-v1"` + префикс `enc:v1:`

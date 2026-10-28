@@ -747,7 +747,7 @@ mission DOC-3 wants to standardise — sequence after B-1 and R-1.
 
 ## Commands run
 
-All read-only. Run from `/Users/egorich/ai-workstation/Projects/heterion-router`.
+All read-only. Run from `/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router`.
 
 ```
 git rev-parse --abbrev-ref HEAD; git log --oneline -5

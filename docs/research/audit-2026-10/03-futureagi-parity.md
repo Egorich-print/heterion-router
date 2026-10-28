@@ -579,7 +579,7 @@ Local research commands (all read-only; the report file in
 
 ```sh
 # 1. Prior-art check across the workstation
-rg -i "future-?agi" /Users/egorich/ai-workstation/Projects \
+rg -i "future-?agi" /Volumes/Netac_SSD/ai-workstation/Projects \
    "/Users/egorich/Documents/Obsidian Vault" 2>/dev/null | head -20
 
 # 2. Registry census (provider / auth_type / format / executor counts)

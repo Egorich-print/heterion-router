@@ -2,7 +2,7 @@
 
 **Author:** principal architect 3/6
 **Date:** 2026-09-29
-**Canonical repo:** `~/ai-workstation/Projects/heterion-router` (read-only; nothing in it was modified, staged or committed)
+**Canonical repo:** `/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router` (read-only; nothing in it was modified, staged or committed)
 **Deliverable:** this file only, under `/var/folders/.../T/opencode/heterion-mission/`
 **Audit inputs:** working tree at `51dfe6d` + **dirty overlay** (32 modified tracked files, 5 untracked docs). Every finding below describes the *working tree*, matching the caveat in `docs/research/PROJECT-AUDIT-2026-09.md:9-10`.
 
@@ -78,7 +78,7 @@ Two facts the audit does not call out and that change the shape of the fix:
 ### 1.4 Reproduction script (read-only)
 
 ```sh
-cd ~/ai-workstation/Projects/heterion-router
+cd /Volumes/Netac_SSD/ai-workstation/Projects/heterion-router
 python3 - <<'PY'
 import json, collections
 d=json.load(open('crates/heterion-router-providers/registry.json'))

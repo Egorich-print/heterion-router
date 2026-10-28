@@ -2,7 +2,7 @@
 
 **Mission role:** principal architect 2/6
 **Scope:** `heterion-router` Responses request/response translation, streaming translator, reasoning & signatures, state store/replay, tools, JS parity fixtures.
-**Canonical repo:** `/Users/egorich/ai-workstation/Projects/heterion-router` (read-only for this mission; nothing was modified or committed).
+**Canonical repo:** `/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router` (read-only for this mission; nothing was modified or committed).
 **Baseline verified in-session:** `cargo test --workspace` → **213 passed, 0 failed** (matches `STATUS.md:114`). `git log -1` = `51dfe6d`, working tree already dirty (docs + sources modified) per `docs/research/PROJECT-AUDIT-2026-09.md:9-10`.
 
 Everything labelled **[EXT]** is an external claim from vendor documentation, not from this repository. Everything else is anchored to `file:line` in the working tree.

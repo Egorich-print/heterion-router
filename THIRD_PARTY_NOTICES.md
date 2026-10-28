@@ -7,4 +7,4 @@ metadata (predominantly MIT / Apache-2.0).
 
 The former `wreq-js` native-transport notices belonged to the frozen JS tree
 and stay with the reference: archived OmniRoute-Rust repository and
-`~/ai-workstation/Archives/OmniRoute/`.
+`/Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/`.

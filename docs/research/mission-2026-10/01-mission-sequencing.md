@@ -1,7 +1,7 @@
 # 01 — Mission Charter: Heterion Router (следующая миссия)
 
 **Роль:** principal architect 1/6 · **Дата:** 2026-09-29
-**Репозиторий (read-only):** `~/ai-workstation/Projects/heterion-router`
+**Репозиторий (read-only):** `/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router`
 **Канонический репозиторий не модифицирован и не закоммичен.** Единственный
 записанный файл — этот отчёт.
 

@@ -1,7 +1,7 @@
 # 04 — Security & Data-Retention Planning Audit
 
 **Subject:** `heterion-router` (Rust LLM gateway + Tauri desktop shell)
-**Canonical repo:** `~/ai-workstation/Projects/heterion-router` @ `51dfe6d` (working tree, dirty — includes `docs/adr/ADR-009`, `ADR-010`, `docs/research/PROJECT-AUDIT-2026-09.md`, `docs/ROADMAP-2026-09.md`)
+**Canonical repo:** `/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router` @ `51dfe6d` (working tree, dirty — includes `docs/adr/ADR-009`, `ADR-010`, `docs/research/PROJECT-AUDIT-2026-09.md`, `docs/ROADMAP-2026-09.md`)
 **Author role:** principal architect 4/6 (read-only audit; no canonical writes, no commits, no live-data mutations)
 **Date:** 2026-09-29
 **Companion docs:** `docs/adr/ADR-009-runtime-security-boundaries.md` (decision + 2026-09-29 addendum), `docs/research/PROJECT-AUDIT-2026-09.md` §"Security and data findings" (the authoritative current matrix this document refines and extends), `docs/ROADMAP-2026-09.md` §"Security and operations status".

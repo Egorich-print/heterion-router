@@ -86,7 +86,7 @@ format/base-URL gate. Список проверенных runtime-транспо
 
 JS-реализация заморожена и сюда не входит: архивный репозиторий
 [OmniRoute-Rust](https://github.com/Egorich-print/OmniRoute-Rust),
-`~/ai-workstation/Archives/OmniRoute/`, upstream
+`/Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/`, upstream
 [diegosouzapw/OmniRoute](https://github.com/diegosouzapw/OmniRoute).
 Осознанно не портировано: `/api/mcp/*`, OAuth-перелогин провайдеров,
 служебные страницы (биллинг, телеграм, геймификация).

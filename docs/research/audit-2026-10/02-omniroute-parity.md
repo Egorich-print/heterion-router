@@ -1,9 +1,9 @@
 # OmniRoute → heterion-router parity
 
 > **Audit date:** 2026-10-02
-> **Upstream baseline:** frozen OmniRoute **v3.8.50** — `/Users/egorich/ai-workstation/Projects/OmniRoute-Rust`
+> **Upstream baseline:** frozen OmniRoute **v3.8.50** — `/Volumes/Netac_SSD/ai-workstation/Projects/OmniRoute-Rust`
 > (Next.js 15 / Node 24 app; last commit `c77542e5fc docs: archived 2026-09-19 — continues as heterion-router`).
-> Frozen build artifacts: `/Users/egorich/ai-workstation/Archives/OmniRoute/releases/OmniRoute-release-3.8.51-2026-09-09.tgz`.
+> Frozen build artifacts: `/Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/releases/OmniRoute-release-3.8.51-2026-09-09.tgz`.
 > Legacy live data (read-only): `/Users/egorich/.omniroute/storage.sqlite` (schema of 132 base tables, 351 indexes, 28 triggers).
 > **Target:** `heterion-router` working tree, baseline commit `51dfe6d` + 35 modified / 5 untracked (per `STATUS.md:19`).
 > **Method:** read-only. No production code, test, Cargo file or database was modified. No commit.
@@ -708,16 +708,16 @@ printed (only table names, column names, setting **key** names and match counts)
 
 **Upstream discovery**
 ```sh
-ls -la /Users/egorich/ai-workstation/Archives/OmniRoute/
-cat /Users/egorich/ai-workstation/Archives/OmniRoute/README.md
-ls -R /Users/egorich/ai-workstation/Archives/OmniRoute/js-removal-2026-09-18/
-ls /Users/egorich/ai-workstation/Archives/OmniRoute/releases/
+ls -la /Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/
+cat /Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/README.md
+ls -R /Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/js-removal-2026-09-18/
+ls /Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/releases/
 tar -tzf releases/OmniRoute-release-3.8.51-2026-09-09.tgz | head -30
 tar -tzf releases/OmniRoute-release-3.8.51-2026-09-09.tgz | wc -l          # 7746
 
-ls -la /Users/egorich/ai-workstation/Projects/OmniRoute-Rust/
+ls -la /Volumes/Netac_SSD/ai-workstation/Projects/OmniRoute-Rust/
 grep -n '^#\{1,3\} ' README.md
-git -C /Users/egorich/ai-workstation/Projects/OmniRoute-Rust log --oneline -15
+git -C /Volumes/Netac_SSD/ai-workstation/Projects/OmniRoute-Rust log --oneline -15
 find src/app/api -name "route.ts" | sed 's|src/app||; s|/route.ts||' | sort | wc -l   # 608
 find src/app/api -name "route.ts" | sed 's|src/app||; s|/route.ts||' | sort
 find src/app -name "page.tsx" | wc -l                                                # 133
@@ -762,7 +762,7 @@ comm -13 /tmp/up_tables.txt /tmp/rust_tables.txt        # empty
 
 **Target discovery**
 ```sh
-cd /Users/egorich/ai-workstation/Projects/heterion-router
+cd /Volumes/Netac_SSD/ai-workstation/Projects/heterion-router
 find crates desktop -type f \( -name "*.rs" -o -name "*.json" -o -name "*.toml" -o -name "*.sql" \) \
   -not -path "*/target/*" | sort
 find desktop/ui/src desktop/src-tauri/src -type f | sort

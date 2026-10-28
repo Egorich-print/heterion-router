@@ -1,7 +1,7 @@
 # 05 — Desktop, service и release: операционный план
 
 > **Роль:** principal architect 5/6 · **Дата аудита:** 2026-09-29
-> **Объект:** `~/ai-workstation/Projects/heterion-router` @ `51dfe6d` + рабочее дерево
+> **Объект:** `/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router` @ `51dfe6d` + рабочее дерево
 > **Канонический репозиторий не модифицирован.** Все проверки — read-only либо
 > изолированные (см. §1.2). Единственный запись — этот файл.
 

@@ -659,7 +659,7 @@ removed, nothing under `~/.heterion-router` or `~/.omniroute` was touched.
 
 | Command | Outcome |
 |---------|---------|
-| `ls -la /Users/egorich/ai-workstation/Projects/heterion-router` | 10 crates + `desktop/`; workspace excluded `desktop/src-tauri` |
+| `ls -la /Volumes/Netac_SSD/ai-workstation/Projects/heterion-router` | 10 crates + `desktop/`; workspace excluded `desktop/src-tauri` |
 | `find crates -name '*.rs' -not -path '*/tests/*' \| xargs wc -l \| sort -rn` | 16 503 LOC of production Rust; largest: `gateway/src/lib.rs` 2324, `db/src/repos.rs` 1368, `gateway/src/grok_cli.rs` 1166 |
 | `rg -n '\.unwrap()\|\.expect(\|unwrap_or_default()\|todo!\|unimplemented!\|panic!\|unsafe \|println!\|eprintln!\|dbg!\|format!\("SELECT\|…' crates` | Every `.unwrap()`/`.expect(` outside `#[cfg(test)]` is in `translate/requests.rs:539` (guarded by `:536`), `translate/responses.rs:400`, `translate/claude.rs:313`, `translate/gemini.rs:353` (all `expect("chunk is an object")` on a `json!` literal), `providers/registry.rs:65` (compile-time invariant of an `include_str!`), `crypto/src/lib.rs:87`/`:93` (`# Panics` documented at `:77-80`), `restart.rs:118` (test). No `todo!`, `unimplemented!`, `panic!` or `unsafe` anywhere in `crates/`. **No findings.** `unwrap_or_default()` hits are benign optional-field defaults (`lib.rs:662`, `admin.rs:108`, `admin.rs:505`, `claude.rs:171`). |
 | `rg -n 'format!\("(SELECT\|INSERT\|UPDATE\|DELETE' crates` | No string-formatted SQL with user data. `repos.rs:881` interpolates a *fixed* column identifier chosen by the caller (documented at `:880`), `repos.rs:107` interpolates a hardcoded column list, `migrate.rs:107` interpolates a hardcoded column name. **No SQL injection.** |

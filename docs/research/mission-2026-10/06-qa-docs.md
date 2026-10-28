@@ -1,7 +1,7 @@
 # WS-6 — Mission QA & Documentation Workstream
 
 > Architect 6/6. Deliverable only; the canonical repo was **read** and never
-> written. Written: 2026-09-29. Target: `~/ai-workstation/Projects/heterion-router`.
+> written. Written: 2026-09-29. Target: `/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router`.
 
 ---
 
@@ -496,7 +496,7 @@ byte-oriented and is exactly the code where hand-written cases are weakest:
 produced by running the JavaScript translator". There is **no script, no
 provenance metadata, and no JS reference copy in-tree** to regenerate or
 re-verify it. The frozen JS lives outside the repo
-(`~/ai-workstation/Archives/OmniRoute/`, `README.md:87-90`). Consequence: a
+(`/Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/`, `README.md:87-90`). Consequence: a
 fixture cannot be re-derived by a third party, so "JS parity" is an
 **unfalsifiable claim** inside the repo.
 

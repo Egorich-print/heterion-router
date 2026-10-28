@@ -3,7 +3,7 @@
 ## Snapshot and method
 
 This document consolidates six parallel read-only audits of the working tree at
-`~/ai-workstation/Projects/heterion-router`.
+`/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router`.
 
 - Branch: `main`; last commit at audit start: `51dfe6d`.
 - The tree was already dirty before this audit (modified code and untracked
