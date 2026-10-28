@@ -297,6 +297,10 @@ pub(crate) fn response_to_completion(model: &str, payload: &Value) -> ChatComple
 
     let mut text = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    // The upstream stopped on its token cap: `status: "incomplete"` with
+    // `incomplete_details.reason: "max_output_tokens"`. The answer is cut
+    // off, so the client must be told it was cut off.
+    let truncated = payload.get("status").and_then(Value::as_str) == Some("incomplete");
     if let Some(output) = payload.get("output").and_then(Value::as_array) {
         for item in output {
             match item.get("type").and_then(Value::as_str) {
@@ -375,7 +379,16 @@ pub(crate) fn response_to_completion(model: &str, payload: &Value) -> ChatComple
         choices: vec![ChatChoice {
             index: 0,
             message,
-            finish_reason: if has_calls { "tool_calls" } else { "stop" }.to_string(),
+            finish_reason: if has_calls {
+                "tool_calls"
+            } else if truncated {
+                // The upstream stopped on its token cap: the answer is
+                // cut off, and OpenAI's contract for that is `length`.
+                "length"
+            } else {
+                "stop"
+            }
+            .to_string(),
         }],
         usage: Usage {
             prompt_tokens: prompt,
@@ -484,6 +497,55 @@ mod tests {
             .expect("a null error field is not a refusal");
         assert_eq!(response.choices[0].message.text(), "PONG");
         server.verify().await;
+    }
+
+    /// An answer the upstream cut off is not a finished answer.
+    ///
+    /// The upstream says so with `status: "incomplete"` and
+    /// `incomplete_details.reason: "max_output_tokens"`. Reporting that as
+    /// `finish_reason: "stop"` tells the client the model finished normally
+    /// while the answer is empty — which is what a reasoning model does when
+    /// its whole `max_tokens` budget goes into thinking (probed live on
+    /// agentrouter 2026-10-28). OpenAI's contract for this is `"length"`.
+    #[tokio::test]
+    async fn a_truncated_answer_is_reported_as_length_not_stop() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp-cut",
+                "status": "incomplete",
+                "error": null,
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [{
+                    "type": "message",
+                    "status": "incomplete",
+                    "content": [{"type": "output_text", "text": "начало ответа"}],
+                }],
+                "usage": {
+                    "input_tokens": 27,
+                    "output_tokens": 600,
+                    "total_tokens": 627,
+                    "output_tokens_details": {"reasoning_tokens": 600},
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = ResponsesBackend::new(
+            "deepseek".to_string(),
+            format!("{}/responses", server.uri()),
+            vec!["test-key".to_string()],
+        )
+        .unwrap();
+
+        let response = backend
+            .complete(request())
+            .await
+            .expect("a cut answer is not a failure");
+        assert_eq!(response.choices[0].finish_reason, "length");
+        assert_eq!(response.choices[0].message.text(), "начало ответа");
     }
 
     /// A `reqwest::Response` over `body`, so the pump decodes a real byte

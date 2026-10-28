@@ -27,11 +27,20 @@ BASE_URL = os.environ.get("HETERION_BASE_URL", "http://127.0.0.1:20128/v1").rstr
 # The router's client key is a credential: it is read from the environment
 # only and never stored in the repository.
 API_KEY = os.environ.get("HETERION_API_KEY", "")
-if not API_KEY:
-    raise SystemExit(
-        "HETERION_API_KEY is unset: export the router's client key "
-        "(see the router's API-key list) before running this script."
-    )
+
+
+def require_api_key() -> str:
+    """The router's client key, which comes from the environment only.
+
+    Checked when a call is actually made, not at import time: `session_scan.py`
+    imports this module to reuse `measure()` and never talks to the router.
+    """
+    if not API_KEY:
+        raise SystemExit(
+            "HETERION_API_KEY is unset: export the router's client key "
+            "(see the router's API-key list) before running this script."
+        )
+    return API_KEY
 
 # A prompt that asks for a long enumeration of similar names: the shape that
 # made Codestral repeat itself on 2026-10-26.
@@ -103,7 +112,7 @@ def ask(model):
         data=json.dumps(body).encode(),
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {API_KEY}",
+            "Authorization": f"Bearer {require_api_key()}",
         },
         method="POST",
     )

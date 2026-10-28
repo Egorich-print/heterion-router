@@ -317,6 +317,19 @@ pub fn convert_event(state: &mut ResponsesState, event_type: &str, data: &Value)
             let usage = extract_usage(data);
             Converted::Emit(finish_chunk(state, compute_finish_reason(state), usage))
         }
+        "response.incomplete" => {
+            // The upstream stopped on its token cap and said so. The answer
+            // is truncated, and OpenAI's contract for a truncated answer is
+            // `length` — without this arm the event was ignored, so the
+            // stream ended without a terminal chunk and the whole call
+            // failed instead of returning a short answer.
+            if state.finish_sent {
+                return Converted::Ignore;
+            }
+            state.finish_sent = true;
+            let usage = extract_usage(data);
+            Converted::Emit(finish_chunk(state, "length", usage))
+        }
         "response.failed" | "error" => {
             state.finish_sent = true;
             Converted::Fail(error_message(data))
@@ -540,5 +553,35 @@ mod tests {
             ),
             Converted::Fail("boom".to_string())
         );
+    }
+
+    /// The upstream stopped on the token cap and said so with
+    /// `response.incomplete`. OpenAI's contract for a truncated answer is
+    /// `finish_reason: "length"`, not `"stop"` — and the terminal chunk must
+    /// exist at all, or the stream is a failure instead of a short answer
+    /// (probed live on agentrouter 2026-10-28: a reasoning model spent the
+    /// whole `max_output_tokens` budget thinking and the answer never came).
+    #[test]
+    fn an_incomplete_response_finishes_with_length() {
+        let mut state = state();
+        let event = json!({
+            "response": {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {
+                    "input_tokens": 27,
+                    "output_tokens": 600,
+                    "output_tokens_details": {"reasoning_tokens": 600},
+                },
+            }
+        });
+        match convert_event(&mut state, "response.incomplete", &event) {
+            Converted::Emit(chunk) => {
+                assert_eq!(chunk["choices"][0]["finish_reason"], json!("length"));
+                assert_eq!(chunk["usage"]["completion_tokens"], json!(600));
+                assert_eq!(chunk["usage"]["prompt_tokens"], json!(27));
+            }
+            other => panic!("expected a terminal chunk, got {other:?}"),
+        }
     }
 }
