@@ -130,6 +130,12 @@ def ask(model):
 
 def main():
     models = sys.argv[1:] or MODELS
+    # The prompt itself names the same lint list four times, so an answer that
+    # faithfully reproduces it scores high on the repeat ratio without the
+    # model having degenerated. The prompt's own score is the baseline: a
+    # verdict only means a loop when the answer is far above it.
+    baseline = repeat_ratio(PROMPT)
+    print(f"prompt baseline: ngram={baseline:.3f}")
     for model in models:
         result, error = ask(model)
         if error:
@@ -137,7 +143,7 @@ def main():
             continue
         finish, text = result
         ratio = repeat_ratio(text)
-        verdict = "LOOP" if ratio >= 0.5 else "ok"
+        verdict = "LOOP" if ratio >= 0.5 and ratio > baseline + 0.2 else "ok"
         print(
             f"{model}: finish={finish} chars={len(text)} ngram={ratio:.3f} {verdict}"
         )
