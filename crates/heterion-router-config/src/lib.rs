@@ -7,4 +7,4 @@
 
 pub mod config;
 
-pub use config::GatewayConfig;
+pub use config::{DEFAULT_MAX_BODY_BYTES, GatewayConfig};

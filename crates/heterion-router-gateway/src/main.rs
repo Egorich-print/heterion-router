@@ -607,6 +607,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let state = AppState::with_db(backend, db)
         .with_require_auth(config.require_auth)
+        .with_max_body_bytes(config.max_body_bytes)
         .with_catalog(registry, backend_names)
         .with_ui_dir(ui_dir)
         .with_data_dir(config.data_dir.clone());

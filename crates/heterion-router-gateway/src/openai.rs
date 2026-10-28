@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{ChatBackend, ChunkStream, next_token, openai_request_body};
+use crate::continuation;
 use crate::ids;
 use crate::responses::{MissingTerminal, ResponsesBackend, pump_sse_stream};
 
@@ -149,7 +150,11 @@ where
     for _ in 0..attempts {
         match attempt().await {
             Ok(payload) => {
-                if let Some(error) = payload.get("error") {
+                // A Responses object always carries an `error` field, `null`
+                // when the response succeeded — only a real error object is a
+                // refusal. Reading the null as one replaces the whole
+                // answer with `upstream error: null`.
+                if let Some(error) = payload.get("error").filter(|error| !error.is_null()) {
                     last_error = Some(GatewayError::Upstream(upstream_refusal(error)));
                     continue;
                 }
@@ -724,9 +729,10 @@ impl ProviderOpenAiBackend {
 
     async fn drive_stream(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
         tx: mpsc::Sender<Result<StreamChunk, GatewayError>>,
     ) -> Result<(), GatewayError> {
+        self.adapt_trailing_assistant(&mut request);
         drive_openai_sse(
             &self.http,
             &self.chat_url,
@@ -735,6 +741,22 @@ impl ProviderOpenAiBackend {
             tx,
         )
         .await
+    }
+
+    /// Turn a trailing assistant turn into a legal request for the providers
+    /// that refuse one (see [`crate::continuation`]).
+    fn adapt_trailing_assistant(&self, request: &mut ChatCompletionRequest) {
+        if !continuation::provider_rejects_trailing_assistant(&self.provider) {
+            return;
+        }
+        if let Some(prefix) = continuation::adapt(&mut request.messages) {
+            tracing::info!(
+                "adapted a trailing assistant turn: provider={} model={} prefix_chars={}",
+                self.provider,
+                request.model,
+                prefix.chars().count()
+            );
+        }
     }
 }
 
@@ -747,7 +769,7 @@ impl ChatBackend for ProviderOpenAiBackend {
 
     async fn complete(
         &self,
-        request: ChatCompletionRequest,
+        mut request: ChatCompletionRequest,
     ) -> Result<ChatCompletionResponse, GatewayError> {
         if request.messages.is_empty() {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
@@ -757,6 +779,7 @@ impl ChatBackend for ProviderOpenAiBackend {
         {
             return responses.complete(request).await;
         }
+        self.adapt_trailing_assistant(&mut request);
         let mut body = openai_request_body(&request);
         body["stream"] = Value::from(false);
 
@@ -1437,15 +1460,24 @@ mod stream_accounting_tests {
         );
     }
 
-    /// Regression guard: a stream whose upstream never sent a usage frame
-    /// books exactly the zeros it booked before, detail included.
+    /// A stream whose upstream never sent a usage frame is booked from the
+    /// local estimate instead of booked as zero.
+    ///
+    /// Contract change (2026-10-26): this used to pin zeros. Ollama Cloud,
+    /// the `vivanta-*` gateways, `OpenRouter-free` and `Google` never send a
+    /// usage frame on a stream, so a zero row made a provider doing real work
+    /// indistinguishable from one that was never called — and the cost of a
+    /// long mission vanished from the books.
     #[tokio::test]
-    async fn a_stream_without_a_usage_frame_books_exactly_what_it_booked_before() {
+    async fn a_stream_without_a_usage_frame_books_the_local_estimate() {
         let db = stream_through_gateway(&sse(None)).await;
+        let (input, output, cache_read, cache_creation, reasoning) = booked(&db);
+        assert!(input > 0, "the prompt estimate must not be zero");
+        assert!(output > 0, "the completion estimate must not be zero");
         assert_eq!(
-            booked(&db),
-            (0, 0, 0, 0, 0),
-            "no usage frame means no tokens to attribute"
+            (cache_read, cache_creation, reasoning),
+            (0, 0, 0),
+            "an estimate invents no cache or reasoning detail"
         );
     }
 

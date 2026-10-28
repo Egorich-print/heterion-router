@@ -11,7 +11,7 @@ use heterion_router_core::{
     StreamChunk, Usage,
 };
 use heterion_router_http::HttpClient;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -21,6 +21,21 @@ use crate::openai::try_each_credential;
 
 /// How many results one search asks for.
 const NUM_RESULTS: u32 = 5;
+/// The most results one search may ask for. Exa's own ceiling is 100.
+const MAX_RESULTS: u32 = 100;
+/// Search modes Exa's `/search` accepts. An unknown mode is dropped, not
+/// forwarded: the upstream answers 400 for a mode it does not know.
+/// The list follows the Exa search reference (2026-10-26).
+const SEARCH_TYPES: [&str; 8] = [
+    "auto",
+    "neural",
+    "fast",
+    "deep",
+    "lite",
+    "deep-lite",
+    "deep-reasoning",
+    "instant",
+];
 
 /// Render one search result as a cited line block.
 fn render_result(index: usize, result: &Value) -> String {
@@ -86,6 +101,97 @@ fn search_query(request: &ChatCompletionRequest) -> String {
         .to_string()
 }
 
+/// Search options a client may set on the request under `"exa"`.
+///
+/// The chat surface carries only a query, so the knobs ride along as an extra
+/// top-level object — the request struct keeps unknown fields, and a client
+/// that does not know about them is unaffected.
+#[derive(Debug, Clone, Default)]
+struct SearchOptions {
+    num_results: Option<u32>,
+    kind: Option<String>,
+    category: Option<String>,
+    include_domains: Vec<String>,
+    exclude_domains: Vec<String>,
+    start_published: Option<String>,
+    end_published: Option<String>,
+}
+
+impl SearchOptions {
+    /// Read the options off the request; unknown or unusable values are
+    /// dropped rather than forwarded.
+    fn from_request(request: &ChatCompletionRequest) -> Self {
+        let Some(raw) = request.extra.get("exa").and_then(Value::as_object) else {
+            return Self::default();
+        };
+        let text = |key: &str| {
+            raw.get(key)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|value| !value.trim().is_empty())
+        };
+        let list = |key: &str| {
+            raw.get(key)
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .filter(|value| !value.trim().is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Self {
+            num_results: raw
+                .get("numResults")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32),
+            kind: text("type").filter(|value| SEARCH_TYPES.contains(&value.as_str())),
+            category: text("category"),
+            include_domains: list("includeDomains"),
+            exclude_domains: list("excludeDomains"),
+            start_published: text("startPublishedDate"),
+            end_published: text("endPublishedDate"),
+        }
+    }
+}
+
+/// Build the upstream `/search` body for a query and its options.
+fn search_body(query: &str, options: &SearchOptions) -> Value {
+    let mut body = Map::new();
+    body.insert("query".to_string(), Value::from(query));
+    let num_results = options
+        .num_results
+        .unwrap_or(NUM_RESULTS)
+        .clamp(1, MAX_RESULTS);
+    body.insert("numResults".to_string(), Value::from(num_results));
+    if let Some(kind) = &options.kind {
+        body.insert("type".to_string(), Value::from(kind.clone()));
+    }
+    if let Some(category) = &options.category {
+        body.insert("category".to_string(), Value::from(category.clone()));
+    }
+    if !options.include_domains.is_empty() {
+        body.insert("includeDomains".to_string(), json!(options.include_domains));
+    }
+    if !options.exclude_domains.is_empty() {
+        body.insert("excludeDomains".to_string(), json!(options.exclude_domains));
+    }
+    if let Some(date) = &options.start_published {
+        body.insert("startPublishedDate".to_string(), Value::from(date.clone()));
+    }
+    if let Some(date) = &options.end_published {
+        body.insert("endPublishedDate".to_string(), Value::from(date.clone()));
+    }
+    // Highlights are requested explicitly: without `contents` the API returns
+    // only title/url/date metadata (Exa OpenAPI spec).
+    let contents = json!({ "highlights": true });
+    body.insert("contents".to_string(), contents);
+    Value::Object(body)
+}
+
 /// Exa search executor over HTTP with token rotation.
 #[derive(Debug, Clone)]
 pub struct ExaBackend {
@@ -120,14 +226,12 @@ impl ExaBackend {
     }
 
     /// One `/search` POST with the rotating key in `x-api-key`.
-    async fn run_search(&self, query: &str) -> Result<Value, GatewayError> {
-        // Highlights are requested explicitly: without `contents` the API
-        // returns only title/url/date metadata (Exa OpenAPI spec).
-        let body = json!({
-            "query": query,
-            "numResults": NUM_RESULTS,
-            "contents": { "highlights": true },
-        });
+    async fn run_search(
+        &self,
+        query: &str,
+        options: &SearchOptions,
+    ) -> Result<Value, GatewayError> {
+        let body = search_body(query, options);
         let url = format!("{}/search", self.endpoint_url);
         let payload = try_each_credential(&self.provider, self.tokens.len().max(1), || {
             let body = body.clone();
@@ -169,7 +273,8 @@ impl ChatBackend for ExaBackend {
                 "search query is empty: send the query as the last user message".into(),
             ));
         }
-        let payload = self.run_search(&query).await?;
+        let options = SearchOptions::from_request(&request);
+        let payload = self.run_search(&query, &options).await?;
         let answer = render_search_answer(&query, &payload);
         Ok(ChatCompletionResponse {
             id: format!("chatcmpl-search-{}", ids::unix_seconds()),
@@ -206,7 +311,8 @@ impl ChatBackend for ExaBackend {
                         "search query is empty: send the query as the last user message".into(),
                     ));
                 }
-                let payload = backend.run_search(&query).await?;
+                let options = SearchOptions::from_request(&request);
+                let payload = backend.run_search(&query, &options).await?;
                 let answer = render_search_answer(&query, &payload);
                 let _ = tx
                     .send(Ok(StreamChunk {
@@ -341,6 +447,95 @@ mod tests {
         .unwrap();
         let error = backend.complete(request("   ")).await.unwrap_err();
         assert!(error.to_string().contains("query is empty"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn search_options_on_the_request_reach_the_upstream() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": [] })))
+            .mount(&server)
+            .await;
+
+        let backend = ExaBackend::new(
+            "exa-search".to_string(),
+            server.uri(),
+            vec!["sk-exa".to_string()],
+        )
+        .unwrap();
+        let mut request = request("rust release notes");
+        request.extra.insert(
+            "exa".to_string(),
+            json!({
+                "numResults": 12,
+                "type": "neural",
+                "includeDomains": ["blog.rust-lang.org"],
+                "startPublishedDate": "2026-01-01"
+            }),
+        );
+        backend.complete(request).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["query"], json!("rust release notes"));
+        assert_eq!(body["numResults"], json!(12));
+        assert_eq!(body["type"], json!("neural"));
+        assert_eq!(body["includeDomains"], json!(["blog.rust-lang.org"]));
+        assert_eq!(body["startPublishedDate"], json!("2026-01-01"));
+        assert_eq!(body["contents"]["highlights"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn without_options_the_upstream_request_keeps_its_default_shape() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": [] })))
+            .mount(&server)
+            .await;
+
+        let backend = ExaBackend::new(
+            "exa-search".to_string(),
+            server.uri(),
+            vec!["sk-exa".to_string()],
+        )
+        .unwrap();
+        backend.complete(request("plain query")).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["numResults"], json!(5));
+        assert_eq!(body["contents"]["highlights"], json!(true));
+        assert!(body.get("type").is_none(), "{body}");
+    }
+
+    #[tokio::test]
+    async fn an_unusable_option_is_clamped_or_dropped_rather_than_passed_on() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "results": [] })))
+            .mount(&server)
+            .await;
+
+        let backend = ExaBackend::new(
+            "exa-search".to_string(),
+            server.uri(),
+            vec!["sk-exa".to_string()],
+        )
+        .unwrap();
+        let mut request = request("query");
+        request.extra.insert(
+            "exa".to_string(),
+            json!({ "numResults": 900, "type": "telepathy" }),
+        );
+        backend.complete(request).await.unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["numResults"], json!(100), "{body}");
+        assert!(body.get("type").is_none(), "{body}");
     }
 
     #[tokio::test]

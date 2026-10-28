@@ -42,3 +42,7 @@ desktop/ui/dist/
 .idea/
 .vscode/
 *.swp
+
+# Python (scripts/subagent/ helpers)
+__pycache__/
+*.py[cod]

@@ -23,6 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::backend::{
     ChatBackend, ChunkStream, next_token, openai_chunk_to_stream_chunk, openai_request_body,
 };
+use crate::client_profile;
 use crate::ids;
 use crate::openai::try_each_credential;
 
@@ -169,6 +170,8 @@ pub struct ResponsesBackend {
     endpoint_url: String,
     tokens: Vec<String>,
     next: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Client fingerprint for upstreams that only answer a recognised client.
+    headers: Vec<(&'static str, &'static str)>,
 }
 
 impl ResponsesBackend {
@@ -178,12 +181,14 @@ impl ResponsesBackend {
         endpoint_url: String,
         tokens: Vec<String>,
     ) -> Result<Self, heterion_router_http::client::HttpError> {
+        let headers = client_profile::headers_for(&provider).to_vec();
         Ok(Self {
             http: HttpClient::new(600)?,
             provider,
             endpoint_url: endpoint_url.trim_end_matches('/').to_string(),
             tokens,
             next: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            headers,
         })
     }
 
@@ -208,9 +213,10 @@ impl ResponsesBackend {
         upstream["stream"] = Value::from(true);
         let response = self
             .http
-            .post_json(
+            .post_json_with_headers(
                 &self.endpoint_url,
                 next_token(&self.tokens, &self.next),
+                &self.headers,
                 &upstream,
             )
             .await
@@ -249,9 +255,10 @@ impl ChatBackend for ResponsesBackend {
         let payload = try_each_credential(&self.provider, self.tokens.len().max(1), || async {
             let response = self
                 .http
-                .post_json(
+                .post_json_with_headers(
                     &self.endpoint_url,
                     next_token(&self.tokens, &self.next),
+                    &self.headers,
                     &upstream,
                 )
                 .await
@@ -439,6 +446,44 @@ mod tests {
         let sent = server.received_requests().await.unwrap();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].headers["authorization"], "Bearer test-key");
+    }
+
+    /// The Responses API always carries an `error` field in its objects —
+    /// `null` when the response succeeded. A successful answer must not be
+    /// read as a refusal (probed live on agentrouter 2026-10-27: the whole
+    /// answer was replaced by `upstream error: null`).
+    #[tokio::test]
+    async fn a_successful_payload_whose_error_field_is_null_is_not_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp-ok",
+                "status": "completed",
+                "error": null,
+                "output": [{
+                    "type": "message",
+                    "content": [{"type": "output_text", "text": "PONG"}]
+                }],
+                "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let backend = ResponsesBackend::new(
+            "deepseek".to_string(),
+            format!("{}/responses", server.uri()),
+            vec!["test-key".to_string()],
+        )
+        .unwrap();
+
+        let response = backend
+            .complete(request())
+            .await
+            .expect("a null error field is not a refusal");
+        assert_eq!(response.choices[0].message.text(), "PONG");
+        server.verify().await;
     }
 
     /// A `reqwest::Response` over `body`, so the pump decodes a real byte

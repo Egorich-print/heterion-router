@@ -6,6 +6,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// Default request-body ceiling: 32 MiB.
+///
+/// Large enough for a 1M-token context (~4 MiB of text) plus tool schemas
+/// and JSON escaping with room to spare, small enough that a runaway client
+/// cannot make the gateway buffer unbounded memory.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// Gateway configuration sourced from the environment.
 ///
 /// `HETERION_ROUTER_*` wins; the `OMNIROUTE_*` spellings are honored as a
@@ -26,6 +33,13 @@ pub struct GatewayConfig {
     /// (`HETERION_ROUTER_REQUIRE_AUTH=1`). When false, auth is still enforced as
     /// soon as at least one key exists.
     pub require_auth: bool,
+    /// Largest request body the gateway accepts, in bytes
+    /// (`HETERION_ROUTER_MAX_BODY_BYTES`, default 32 MiB).
+    ///
+    /// axum's own default is 2 MiB, which caps every request at roughly
+    /// 500k tokens and makes the 1M-context models unusable for the thing
+    /// they exist for: one repository, one request.
+    pub max_body_bytes: usize,
 }
 
 impl GatewayConfig {
@@ -81,6 +95,11 @@ impl GatewayConfig {
                 get2("HETERION_ROUTER_REQUIRE_AUTH", "OMNIROUTE_REQUIRE_AUTH"),
                 "1" | "true" | "yes"
             ),
+            max_body_bytes: get2("HETERION_ROUTER_MAX_BODY_BYTES", "OMNIROUTE_MAX_BODY_BYTES")
+                .parse()
+                .ok()
+                .filter(|value: &usize| *value > 0)
+                .unwrap_or(DEFAULT_MAX_BODY_BYTES),
         }
     }
 }
@@ -103,6 +122,21 @@ mod tests {
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.log_filter, "info");
         assert!(!config.require_auth);
+        assert_eq!(config.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn max_body_bytes_is_configurable_and_never_zero() {
+        let config =
+            GatewayConfig::from_map(&vars(&[("HETERION_ROUTER_MAX_BODY_BYTES", "1048576")]));
+        assert_eq!(config.max_body_bytes, 1_048_576);
+
+        // Zero would reject every request; a non-number is a typo, not a
+        // request to disable the limit.
+        for bad in ["0", "nope", "-1"] {
+            let config = GatewayConfig::from_map(&vars(&[("HETERION_ROUTER_MAX_BODY_BYTES", bad)]));
+            assert_eq!(config.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
+        }
     }
 
     #[test]

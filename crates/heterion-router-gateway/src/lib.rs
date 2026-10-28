@@ -13,7 +13,9 @@ pub mod budgets;
 pub mod cache;
 pub mod claude;
 pub mod claude_endpoint;
+pub mod client_profile;
 pub mod combos;
+pub mod continuation;
 pub mod cors;
 pub mod credentials;
 pub mod embeddings;
@@ -24,10 +26,12 @@ pub mod guardrails;
 pub mod ids;
 pub mod openai;
 pub mod reasoning;
+pub mod repetition_guard;
 pub mod responses;
 pub mod restart;
 pub mod routing;
 pub mod ui;
+pub mod usage_estimate;
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -224,6 +228,12 @@ pub struct AppState {
     /// Unix time the process built this state: lets the dashboard tell a
     /// restarted gateway apart from the one it just asked to restart.
     pub(crate) started_unix: u64,
+    /// Largest request body the router accepts, in bytes.
+    ///
+    /// axum's own default is 2 MiB, which caps a request at roughly 500k
+    /// tokens and makes the 1M-context models unusable for a whole
+    /// repository in one call.
+    pub(crate) max_body_bytes: usize,
 }
 
 /// Seconds since the unix epoch, or 0 when the clock is unavailable.
@@ -247,6 +257,7 @@ impl AppState {
             data_dir: None,
             ui_dir: None,
             started_unix: now_unix(),
+            max_body_bytes: heterion_router_config::DEFAULT_MAX_BODY_BYTES,
         }
     }
 
@@ -262,6 +273,7 @@ impl AppState {
             data_dir: None,
             ui_dir: None,
             started_unix: now_unix(),
+            max_body_bytes: heterion_router_config::DEFAULT_MAX_BODY_BYTES,
         }
     }
 
@@ -292,6 +304,18 @@ impl AppState {
     /// Force API-key auth even when the `api_keys` table is empty.
     pub fn with_require_auth(mut self, require: bool) -> Self {
         self.require_auth = require;
+        self
+    }
+
+    /// Set the largest request body the router accepts.
+    ///
+    /// Defaults to [`heterion_router_config::DEFAULT_MAX_BODY_BYTES`]; a value
+    /// of zero is ignored so a misconfigured environment cannot turn every
+    /// request into a rejection.
+    pub fn with_max_body_bytes(mut self, bytes: usize) -> Self {
+        if bytes > 0 {
+            self.max_body_bytes = bytes;
+        }
         self
     }
 }
@@ -367,6 +391,7 @@ pub fn build_router_with(state: AppState, cache_layer: cache::CacheLayer) -> Rou
             guardrails::middleware,
         ))
         .layer(axum::middleware::from_fn(cors::cors))
+        .layer(axum::extract::DefaultBodyLimit::max(state.max_body_bytes))
         .with_state(state)
 }
 
@@ -439,10 +464,20 @@ async fn chat_completions(
     let model = request.model.clone();
     let summary = request_summary(&request);
     let started = std::time::Instant::now();
+    let prompt_estimate = usage_estimate::estimate_prompt_tokens(&request);
     tracing::info!("completion model={model} stream=false");
     match state.backend.complete(request).await {
-        Ok(response) => {
+        Ok(mut response) => {
             let latency_ms = millis_since(started);
+            if let Some(hit) = repetition_guard::apply_to_response(&mut response) {
+                tracing::warn!(
+                    "repetition guard model={model} source={} ratio={} repeats={} words={} — answer truncated",
+                    hit.source,
+                    hit.repeat_ratio,
+                    hit.repeats,
+                    hit.total_words
+                );
+            }
             tracing::info!(
                 "completion ok model={model} resolved={} finish={} pt={} ct={} ms={latency_ms}",
                 response.model,
@@ -451,7 +486,15 @@ async fn chat_completions(
                 response.usage.completion_tokens,
             );
             let served = response.model.clone();
-            let usage = response.usage;
+            let mut usage = response.usage;
+            // A provider that reports no usage must not look free.
+            let output_bytes = usage_estimate::value_text_bytes(
+                response
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.message.content.as_ref()),
+            );
+            usage_estimate::fill_missing(&mut usage, prompt_estimate, output_bytes);
             let details = cached_usage(&response);
             record_completion_usage(
                 &state,
@@ -755,6 +798,30 @@ struct StreamAccounting {
     /// Counts-only description of the request; never its content.
     summary: String,
     recorded: bool,
+    /// Prompt size the gateway estimated for this request.
+    ///
+    /// Used only when the upstream reports no usage at all: some upstreams
+    /// (Ollama Cloud, the `vivanta-*` gateways, `OpenRouter-free`, `Google`)
+    /// never send a usage frame on a stream, and a row that books zero tokens
+    /// makes a provider doing real work look like one that was never called.
+    prompt_estimate: u32,
+    /// Bytes of assistant text seen so far in the stream.
+    output_bytes: usize,
+    /// Bytes of reasoning text seen so far, kept apart so the reasoning
+    /// premium can still be priced when the upstream reports no counts.
+    reasoning_bytes: usize,
+    /// Whether the upstream sent its own usage counts. A provider that did
+    /// is never re-estimated, so nothing is ever double booked.
+    usage_reported: bool,
+}
+
+/// What the stream accounting needs to know about the request besides the
+/// model: which endpoint it was, a counts-only description of it, and the
+/// prompt size estimated from it.
+struct StreamRequest {
+    request_type: &'static str,
+    summary: String,
+    prompt_estimate: u32,
 }
 
 impl StreamAccounting {
@@ -764,8 +831,7 @@ impl StreamAccounting {
         token: String,
         requested_model: String,
         started: std::time::Instant,
-        request_type: &'static str,
-        summary: String,
+        request: StreamRequest,
     ) -> Self {
         Self {
             state,
@@ -778,9 +844,49 @@ impl StreamAccounting {
             status: 200,
             started,
             ttft_ms: None,
-            request_type,
-            summary,
+            request_type: request.request_type,
+            summary: request.summary,
             recorded: false,
+            prompt_estimate: request.prompt_estimate,
+            output_bytes: 0,
+            reasoning_bytes: 0,
+            usage_reported: false,
+        }
+    }
+
+    /// Count the bytes the stream produced, so a provider that reports no
+    /// usage can still be billed for what it actually emitted.
+    fn count_output(&mut self, chunk: &StreamChunk) {
+        if let Some(content) = &chunk.content {
+            self.output_bytes += content.len();
+        }
+        if let Some(reasoning) = &chunk.reasoning {
+            self.output_bytes += reasoning.len();
+            self.reasoning_bytes += reasoning.len();
+        }
+    }
+
+    /// Fill in the counts the upstream did not report.
+    ///
+    /// A provider that sent its own usage keeps it untouched: this only runs
+    /// for the upstreams that say nothing at all, and it never runs twice.
+    fn synthesize_missing_usage(&mut self) {
+        if self.usage_reported {
+            return;
+        }
+        let prompt = self.prompt_estimate.max(1);
+        let completion = usage_estimate::estimate_output_tokens(self.output_bytes);
+        self.usage = heterion_router_core::Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            total_tokens: prompt.saturating_add(completion),
+        };
+        // Reasoning tokens sit inside the completion total, so they are
+        // priced through the premium rate rather than added on top. Only a
+        // stream that actually produced reasoning text gets a count — an
+        // estimate must not invent detail it cannot see.
+        if self.reasoning_bytes > 0 && self.details.reasoning == 0 {
+            self.details.reasoning = usage_estimate::estimate_output_tokens(self.reasoning_bytes);
         }
     }
 
@@ -801,6 +907,7 @@ impl StreamAccounting {
             return;
         }
         self.recorded = true;
+        self.synthesize_missing_usage();
         let latency_ms = millis_since(self.started);
         if self.success {
             tracing::info!(
@@ -880,9 +987,23 @@ fn stream_response(
     let summary = request_summary(&request);
     let started = std::time::Instant::now();
     let token = backend::request_token(&request).unwrap_or_default();
+    let prompt_estimate = usage_estimate::estimate_prompt_tokens(&request);
     let stream = state.backend.stream(request);
-    let mut books =
-        StreamAccounting::new(state, auth, token, model.clone(), started, "chat", summary);
+    // A model that degenerates repeats itself until the token cap; the guard
+    // stops the stream there instead of passing the loop on.
+    let stream = repetition_guard::guard_stream(stream, &model);
+    let mut books = StreamAccounting::new(
+        state,
+        auth,
+        token,
+        model.clone(),
+        started,
+        StreamRequest {
+            request_type: "chat",
+            summary,
+            prompt_estimate,
+        },
+    );
     let mut role_emitted = false;
     let events = stream.map(move |item| {
         Ok(match item {
@@ -890,8 +1011,10 @@ fn stream_response(
                 // The clock starts when the request left, so this measures the
                 // client's wait for the first token, not just the pump's.
                 books.first_token();
+                books.count_output(&chunk);
                 if let Some(usage) = chunk.usage {
                     books.usage = usage;
+                    books.usage_reported = true;
                 }
                 if let Some(details) = backend::chunk_cached_usage(&chunk) {
                     books.details = details;
@@ -1674,12 +1797,30 @@ async fn responses(
     let model = request.model.clone();
     let summary = request_summary(&request);
     let started = std::time::Instant::now();
+    let prompt_estimate = usage_estimate::estimate_prompt_tokens(&request);
     tracing::info!("responses model={model} stream=false");
     match state.backend.complete(request).await {
-        Ok(response) => {
+        Ok(mut response) => {
             let latency_ms = millis_since(started);
+            if let Some(hit) = repetition_guard::apply_to_response(&mut response) {
+                tracing::warn!(
+                    "repetition guard model={model} source={} ratio={} repeats={} words={} — answer truncated",
+                    hit.source,
+                    hit.repeat_ratio,
+                    hit.repeats,
+                    hit.total_words
+                );
+            }
             let served = response.model.clone();
-            let usage = response.usage;
+            let mut usage = response.usage;
+            // A provider that reports no usage must not look free.
+            let output_bytes = usage_estimate::value_text_bytes(
+                response
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.message.content.as_ref()),
+            );
+            usage_estimate::fill_missing(&mut usage, prompt_estimate, output_bytes);
             let details = cached_usage(&response);
             record_completion_usage(
                 &state,
@@ -2027,15 +2168,22 @@ fn responses_stream(
     let created = ids::unix_seconds();
     let started = std::time::Instant::now();
     let token = backend::request_token(&request).unwrap_or_default();
+    let prompt_estimate = usage_estimate::estimate_prompt_tokens(&request);
     let stream = state.backend.stream(request);
+    // A model that degenerates repeats itself until the token cap; the guard
+    // stops the stream there instead of passing the loop on.
+    let stream = repetition_guard::guard_stream(stream, &model);
     let mut books = StreamAccounting::new(
         state,
         auth,
         token,
         model.clone(),
         started,
-        "responses",
-        summary,
+        StreamRequest {
+            request_type: "responses",
+            summary,
+            prompt_estimate,
+        },
     );
 
     let events = stream.flat_map(move |item| {
@@ -2043,8 +2191,10 @@ fn responses_stream(
         let (events, success) = match item {
             Ok(chunk) => {
                 books.first_token();
+                books.count_output(&chunk);
                 if let Some(usage) = chunk.usage {
                     books.usage = usage;
+                    books.usage_reported = true;
                 }
                 if let Some(details) = backend::chunk_cached_usage(&chunk) {
                     books.details = details;
@@ -2287,6 +2437,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_without_upstream_usage_still_books_tokens() {
+        // Ollama Cloud — and the vivanta-* gateways, OpenRouter-free and
+        // Google — never send a usage frame on a stream. Without a local
+        // estimate the row books zero tokens, so a provider doing real work
+        // looks exactly like one that was never called.
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        let router =
+            build_router_with_state(AppState::with_db(Arc::new(SilentStreamBackend), db.clone()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "grok-4.6",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let guard = db.connection();
+        let usage: (i64, i64) = guard
+            .query_row(
+                "SELECT tokens_input, tokens_output FROM usage_history WHERE model = 'grok-4.6'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            usage.0 > 0,
+            "prompt tokens should be estimated when the upstream reports nothing, got {}",
+            usage.0
+        );
+        assert!(
+            usage.1 > 0,
+            "completion tokens should be estimated when the upstream reports nothing, got {}",
+            usage.1
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_with_upstream_usage_is_not_re_estimated() {
+        // The estimate is a fallback, never a second opinion: a provider that
+        // reports its own counts keeps them.
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        let router =
+            build_router_with_state(AppState::with_db(Arc::new(UsageStreamBackend), db.clone()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "grok-4.6",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "stream": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let guard = db.connection();
+        let usage: (i64, i64) = guard
+            .query_row(
+                "SELECT tokens_input, tokens_output FROM usage_history WHERE model = 'grok-4.6'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(usage, (3, 2));
+    }
+
+    /// A stream that never reports usage: the shape of Ollama Cloud and the
+    /// other upstreams whose OpenAI-compatible stream omits the usage frame.
+    #[derive(Clone)]
+    struct SilentStreamBackend;
+
+    #[async_trait::async_trait]
+    impl ChatBackend for SilentStreamBackend {
+        fn name(&self) -> &'static str {
+            "silent-stream"
+        }
+
+        async fn complete(
+            &self,
+            _request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Err(GatewayError::InvalidRequest("stream backend".into()))
+        }
+
+        fn stream(&self, _request: ChatCompletionRequest) -> backend::ChunkStream {
+            futures::stream::iter(vec![
+                Ok(StreamChunk::content(
+                    "hello there, this is a streamed answer",
+                )),
+                Ok(StreamChunk {
+                    finish_reason: Some("stop".to_string()),
+                    ..Default::default()
+                }),
+            ])
+            .boxed()
+        }
+    }
+
+    /// A completion backend that reports no usage at all: the non-streaming
+    /// shape of Ollama Cloud and the other silent upstreams.
+    #[derive(Clone)]
+    struct SilentCompleteBackend;
+
+    #[async_trait::async_trait]
+    impl ChatBackend for SilentCompleteBackend {
+        fn name(&self) -> &'static str {
+            "silent-complete"
+        }
+
+        async fn complete(
+            &self,
+            _request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                id: crate::ids::completion_id(),
+                object: "chat.completion",
+                created: crate::ids::unix_seconds(),
+                model: "grok-4.6".to_string(),
+                choices: vec![heterion_router_core::ChatChoice {
+                    index: 0,
+                    message: heterion_router_core::ChatMessage::plain(
+                        "assistant",
+                        "an answer that the upstream never counted",
+                    ),
+                    finish_reason: "stop".to_string(),
+                }],
+                usage: heterion_router_core::Usage::default(),
+                raw: None,
+            })
+        }
+
+        fn stream(&self, _request: ChatCompletionRequest) -> backend::ChunkStream {
+            futures::stream::empty().boxed()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_streaming_call_without_upstream_usage_still_books_tokens() {
+        // The same silence as the streaming case, on the plain endpoint: a
+        // provider doing real work must not book zero tokens and look free.
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        let router = build_router_with_state(AppState::with_db(
+            Arc::new(SilentCompleteBackend),
+            db.clone(),
+        ));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "grok-4.6",
+                            "messages": [{"role": "user", "content": "hi"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let guard = db.connection();
+        let usage: (i64, i64) = guard
+            .query_row(
+                "SELECT tokens_input, tokens_output FROM usage_history WHERE model = 'grok-4.6'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            usage.0 > 0,
+            "prompt tokens should be estimated when the upstream reports nothing, got {}",
+            usage.0
+        );
+        assert!(
+            usage.1 > 0,
+            "completion tokens should be estimated when the upstream reports nothing, got {}",
+            usage.1
+        );
+    }
+
+    #[tokio::test]
     async fn healthz_reports_ok() {
         let response = test_router()
             .oneshot(
@@ -2480,6 +2838,198 @@ mod tests {
             value["choices"][0]["message"]["content"],
             json!("echo: hello")
         );
+    }
+
+    /// A backend whose answer degenerates into a loop, the way Codestral did
+    /// on 2026-10-26: a good sentence, then the same lint name thousands of
+    /// times, until the token cap.
+    #[derive(Clone)]
+    struct LoopingBackend;
+
+    fn looping_text() -> String {
+        format!(
+            "warning: unused variable: `cargo_cmd` at host-test.sh:32:5. {}",
+            "(clippy::unused_variables) ".repeat(2000)
+        )
+    }
+
+    #[async_trait::async_trait]
+    impl ChatBackend for LoopingBackend {
+        fn name(&self) -> &'static str {
+            "looping"
+        }
+
+        async fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                id: ids::completion_id(),
+                object: "chat.completion",
+                created: ids::unix_seconds(),
+                model: request.model.clone(),
+                choices: vec![heterion_router_core::ChatChoice {
+                    index: 0,
+                    message: ChatMessage::plain("assistant".to_string(), looping_text()),
+                    finish_reason: "length".to_string(),
+                }],
+                usage: heterion_router_core::Usage {
+                    prompt_tokens: 7,
+                    completion_tokens: 32768,
+                    total_tokens: 32775,
+                },
+                raw: None,
+            })
+        }
+
+        fn stream(&self, _request: ChatCompletionRequest) -> backend::ChunkStream {
+            // Many chunks, not one: the guard has to end the stream, not just
+            // replace the chunk it caught the loop in.
+            let mut chunks = vec![StreamChunk::content(
+                "warning: unused variable: `cargo_cmd` at host-test.sh:32:5. ",
+            )];
+            chunks.extend(
+                (0..20).map(|_| StreamChunk::content("(clippy::unused_variables) ".repeat(200))),
+            );
+            chunks.push(StreamChunk::done("length"));
+            Box::pin(futures::stream::iter(
+                chunks.into_iter().map(Ok).collect::<Vec<_>>(),
+            ))
+        }
+    }
+
+    fn looping_router() -> Router {
+        build_router(Arc::new(LoopingBackend))
+    }
+
+    #[tokio::test]
+    async fn chat_completions_cuts_a_looping_answer() {
+        let body = json!({
+            "model": "grok-4.6",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string();
+
+        let response = looping_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let content = value["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            content.starts_with("warning: unused variable"),
+            "the good prefix was lost: {content}"
+        );
+        assert!(
+            content.len() < 200,
+            "the loop was not cut: {} bytes",
+            content.len()
+        );
+        assert_eq!(value["choices"][0]["finish_reason"], json!("length"));
+    }
+
+    #[tokio::test]
+    async fn chat_completions_keeps_a_normal_answer() {
+        let body = json!({
+            "model": "grok-4.6",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string();
+
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            json!("echo: hello")
+        );
+        assert_eq!(value["choices"][0]["finish_reason"], json!("stop"));
+    }
+
+    #[tokio::test]
+    async fn a_looping_stream_stops_instead_of_running_to_the_cap() {
+        let body = json!({
+            "model": "grok-4.6",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": true
+        })
+        .to_string();
+
+        let response = looping_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.len() < 20000,
+            "the loop was streamed through: {} bytes",
+            text.len()
+        );
+        assert!(
+            text.contains("\"finish_reason\":\"length\""),
+            "the truncated answer was not reported: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_completions_accepts_a_body_larger_than_the_axum_default() {
+        // A 1M-token context is roughly 4 MiB of text. axum's default body
+        // limit is 2 MiB, which silently caps every request at ~500k tokens
+        // and makes the large-context models (beam, GLM, Kimi) unreachable
+        // exactly where they are worth using: a whole repository in one call.
+        let big = "x".repeat(3 * 1024 * 1024);
+        let body = json!({
+            "model": "grok-4.6",
+            "messages": [{"role": "user", "content": big}]
+        })
+        .to_string();
+
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

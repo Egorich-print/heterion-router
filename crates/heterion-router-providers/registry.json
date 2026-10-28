@@ -40,17 +40,17 @@
   {
     "id": "agentrouter",
     "alias": "agentrouter",
-    "format": "claude",
+    "format": "openai-responses",
     "executor": "default",
     "auth_type": "apikey",
-    "base_url": "https://agentrouter.org/v1/messages",
+    "base_url": "https://agentrouter.org/v1/responses",
     "models": [
       {
-        "id": "claude-opus-4-8",
+        "id": "gpt-6.1-sol",
         "target_format": null
       },
       {
-        "id": "claude-opus-5",
+        "id": "gpt-6-astra",
         "target_format": null
       },
       {
@@ -6602,6 +6602,30 @@
       {
         "id": "gemini-2.5-flash-lite",
         "target_format": null
+      },
+      {
+        "id": "gemini-3.5-flash",
+        "target_format": null
+      },
+      {
+        "id": "gemini-3.6-flash",
+        "target_format": null
+      },
+      {
+        "id": "gemini-3.5-flash-lite",
+        "target_format": null
+      },
+      {
+        "id": "gemini-3.1-flash-lite-preview",
+        "target_format": null
+      },
+      {
+        "id": "gemini-flash-lite-latest",
+        "target_format": null
+      },
+      {
+        "id": "gemma-4-26b-a4b-it",
+        "target_format": null
       }
     ]
   },
@@ -9669,19 +9693,27 @@
     "base_url": "https://ollama.com/v1/chat/completions",
     "models": [
       {
-        "id": "gpt-oss:20b",
+        "id": "beam",
         "target_format": null
       },
       {
-        "id": "gpt-oss:120b",
+        "id": "glm-5.3",
         "target_format": null
       },
       {
-        "id": "deepseek-v4-pro",
+        "id": "glm-5.3-flash",
         "target_format": null
       },
       {
-        "id": "deepseek-v4-flash",
+        "id": "glm-5.2",
+        "target_format": null
+      },
+      {
+        "id": "kimi-k3",
+        "target_format": null
+      },
+      {
+        "id": "kimi-k2.7-code",
         "target_format": null
       },
       {
@@ -9689,11 +9721,7 @@
         "target_format": null
       },
       {
-        "id": "glm-5.1",
-        "target_format": null
-      },
-      {
-        "id": "glm-5.2",
+        "id": "minimax-m3.1-flash",
         "target_format": null
       },
       {
@@ -9705,7 +9733,31 @@
         "target_format": null
       },
       {
+        "id": "muse-spark-open",
+        "target_format": null
+      },
+      {
         "id": "gemma4:31b",
+        "target_format": null
+      },
+      {
+        "id": "gpt-oss:120b",
+        "target_format": null
+      },
+      {
+        "id": "gpt-oss:20b",
+        "target_format": null
+      },
+      {
+        "id": "mistral-large-4",
+        "target_format": null
+      },
+      {
+        "id": "mistral-large-3:675b",
+        "target_format": null
+      },
+      {
+        "id": "nemotron-3-ultra",
         "target_format": null
       },
       {
@@ -9713,7 +9765,19 @@
         "target_format": null
       },
       {
-        "id": "qwen3.5:397b",
+        "id": "nemotron-3-nano:30b",
+        "target_format": null
+      },
+      {
+        "id": "deepseek-v4-pro:0813",
+        "target_format": null
+      },
+      {
+        "id": "deepseek-v4.1-flash",
+        "target_format": null
+      },
+      {
+        "id": "deepseek-v4.1-flash:1017",
         "target_format": null
       }
     ]

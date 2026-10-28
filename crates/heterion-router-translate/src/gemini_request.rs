@@ -5,8 +5,12 @@
 //! extraction, `contents` with `user`/`model` roles, `generationConfig`,
 //! function declarations and tool results.
 //!
+//! Inline pictures are carried as `inlineData` parts, the only shape the
+//! Gemini API accepts for an image that travels with the request.
+//!
 //! Explicitly deferred: thinking/reasoning config, safety overrides,
-//! multimodal inline data beyond text, and cached content.
+//! cached content, and pictures that are not inline bytes (a remote URL
+//! has to be fetched by the caller first — see [`content_parts`]).
 
 use heterion_router_core::content_text;
 use serde_json::{Map, Value, json};
@@ -33,11 +37,7 @@ pub fn openai_to_gemini(body: &Value) -> Value {
                     }
                 }
                 "assistant" => {
-                    let mut parts: Vec<Value> = Vec::new();
-                    let text = content_text(message.get("content"));
-                    if !text.is_empty() {
-                        parts.push(json!({"text": text}));
-                    }
+                    let mut parts: Vec<Value> = content_parts(message.get("content"));
                     if let Some(calls) = message.get("tool_calls").and_then(Value::as_array) {
                         for call in calls {
                             let name = call
@@ -93,9 +93,9 @@ pub fn openai_to_gemini(body: &Value) -> Value {
                     );
                 }
                 _ => {
-                    let text = content_text(message.get("content"));
-                    if !text.is_empty() {
-                        push_turn(&mut contents, "user", vec![json!({"text": text})]);
+                    let parts = content_parts(message.get("content"));
+                    if !parts.is_empty() {
+                        push_turn(&mut contents, "user", parts);
                     }
                 }
             }
@@ -217,6 +217,85 @@ pub fn openai_to_gemini(body: &Value) -> Value {
     }
 
     Value::Object(result)
+}
+
+/// Convert a chat message content value into Gemini parts.
+///
+/// A plain string becomes one `text` part. An array becomes one part per
+/// element, so text and pictures keep the order the client sent them in.
+///
+/// A picture becomes an `inlineData` part — the only shape the Gemini API
+/// accepts for an image that travels with the request. A picture that is
+/// not inline bytes (a remote URL) cannot be forwarded: the API refuses a
+/// `fileData` part pointing at an ordinary https URL with "Cannot fetch
+/// content from the provided URL" (measured against the v1beta API on
+/// 2026-10-26). Such a picture leaves a note in its place, because a
+/// silently dropped image lets the model describe a picture it never saw.
+fn content_parts(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::String(text)) => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"text": text})]
+            }
+        }
+        Some(Value::Array(parts)) => parts.iter().filter_map(content_part).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One chat content part → one Gemini part.
+fn content_part(part: &Value) -> Option<Value> {
+    let kind = part.get("type").and_then(Value::as_str).unwrap_or("");
+    match kind {
+        "text" => {
+            let text = part.get("text").and_then(Value::as_str).unwrap_or("");
+            (!text.is_empty()).then(|| json!({"text": text}))
+        }
+        "image_url" => {
+            let url = image_url(part.get("image_url"))?;
+            Some(picture_part(&url))
+        }
+        "image" => {
+            // AI-SDK data-URL form: `{"type": "image", "image": "data:…"}`.
+            let url = part.get("image").and_then(Value::as_str)?;
+            Some(picture_part(url))
+        }
+        _ => None,
+    }
+}
+
+/// The URL of an `image_url` part, in both the string and the object spelling.
+fn image_url(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(url) => Some(url.clone()),
+        Value::Object(_) => value.get("url").and_then(Value::as_str).map(str::to_string),
+        _ => None,
+    }
+}
+
+/// A picture → an `inlineData` part, or a note when the bytes are not inline.
+fn picture_part(url: &str) -> Value {
+    if let Some((mime, data)) = data_url(url) {
+        return json!({"inlineData": {"mimeType": mime, "data": data}});
+    }
+    json!({"text": format!("[image omitted: the provider cannot fetch {url}]")})
+}
+
+/// Split a `data:` URL into its mime type and base64 payload.
+///
+/// The JS adapter matches `^data:([^;]+);base64,(.+)$`; the same shape is
+/// matched here.
+fn data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    let mime = meta.strip_suffix(";base64")?;
+    if mime.is_empty() || data.is_empty() {
+        return None;
+    }
+    Some((mime.to_string(), data.to_string()))
 }
 
 /// Build a `functionCall` part, replaying the thought signature when the
@@ -538,6 +617,58 @@ mod tests {
         assert_eq!(
             parameters["properties"]["options"]["properties"]["cwd"]["anyOf"][0]["type"],
             "string"
+        );
+    }
+
+    #[test]
+    fn maps_an_image_data_url_to_a_gemini_inline_data_part() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is this?"},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64,QUJD"
+                }}
+            ]}]
+        });
+
+        let out = openai_to_gemini(&body);
+        let parts = out["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], json!("what is this?"));
+        assert_eq!(parts[1]["inlineData"]["mimeType"], json!("image/png"));
+        assert_eq!(parts[1]["inlineData"]["data"], json!("QUJD"));
+    }
+
+    #[test]
+    fn maps_the_ai_sdk_image_form_to_a_gemini_inline_data_part() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image", "image": "data:image/jpeg;base64,WFla"}
+            ]}]
+        });
+
+        let out = openai_to_gemini(&body);
+        let parts = out["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts[0]["inlineData"]["mimeType"], json!("image/jpeg"));
+        assert_eq!(parts[0]["inlineData"]["data"], json!("WFla"));
+    }
+
+    #[test]
+    fn a_remote_image_url_is_reported_instead_of_being_dropped_silently() {
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {
+                    "url": "https://example.invalid/pic.png"
+                }}
+            ]}]
+        });
+
+        let out = openai_to_gemini(&body);
+        let parts = out["contents"][0]["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "the image must leave a trace: {parts:?}");
+        let text = parts[0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("https://example.invalid/pic.png"),
+            "the unreachable URL must be named, got {text}"
         );
     }
 

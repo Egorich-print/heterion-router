@@ -1233,7 +1233,7 @@ mod tests {
         let server = MockServer::start().await;
         let (state, db) = open();
 
-        // `agentrouter` is a `claude`-format provider: it has no
+        // `agentrouter` is an `openai-responses`-format provider: it has no
         // OpenAI-shaped /v1/embeddings here, and nothing falls back to chat.
         let (status, body) = handle(
             &state,
@@ -1248,7 +1248,9 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(message.contains("embeddings"), "{body}");
-        assert!(message.contains("claude"), "{body}");
+        // The refusal names the provider, not its wire format: the format of
+        // a given provider may change, the refusal must not.
+        assert!(message.contains("agentrouter"), "{body}");
         assert!(
             server
                 .received_requests()

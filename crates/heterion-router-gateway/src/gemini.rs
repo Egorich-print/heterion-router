@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{ChatBackend, ChunkStream, next_token, openai_request_body};
+use crate::continuation;
 use crate::ids;
 use crate::openai::try_each_credential;
 use crate::responses::{MissingTerminal, pump_sse_stream};
@@ -431,6 +432,21 @@ impl GeminiBackend {
         openai_to_gemini(&openai_request_body(request))
     }
 
+    /// Turn a trailing assistant turn into a legal request.
+    ///
+    /// Gemini refuses a conversation that ends with a model turn ("Requests
+    /// ending with a model turn are not supported"), and every Gemini-format
+    /// provider speaks that protocol — see [`crate::continuation`].
+    fn adapt_trailing_assistant(request: &mut ChatCompletionRequest) {
+        if let Some(prefix) = continuation::adapt(&mut request.messages) {
+            tracing::info!(
+                "adapted a trailing assistant turn: provider=gemini model={} prefix_chars={}",
+                request.model,
+                prefix.chars().count()
+            );
+        }
+    }
+
     async fn drive_stream(
         &self,
         mut request: ChatCompletionRequest,
@@ -439,6 +455,7 @@ impl GeminiBackend {
         if request.messages.is_empty() {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
+        Self::adapt_trailing_assistant(&mut request);
         inject_signatures(&mut request, &self.signatures, self.message_id().clone());
         let body = Self::gemini_body(&request);
         let url = self.method_url(&request.model, true);
@@ -494,6 +511,7 @@ impl ChatBackend for GeminiBackend {
         if request.messages.is_empty() {
             return Err(GatewayError::InvalidRequest("messages is empty".into()));
         }
+        Self::adapt_trailing_assistant(&mut request);
         inject_signatures(&mut request, &self.signatures, self.message_id().clone());
         let body = Self::gemini_body(&request);
         let url = self.method_url(&request.model, false);

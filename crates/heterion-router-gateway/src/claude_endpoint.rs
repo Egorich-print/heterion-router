@@ -74,6 +74,7 @@ pub async fn messages(
     let model = request.model.clone();
     let summary = request_summary(&request);
     let started = std::time::Instant::now();
+    let prompt_estimate = crate::usage_estimate::estimate_prompt_tokens(&request);
     tracing::info!("claude messages model={model} stream=false");
     // A completion the dialect cannot render is an upstream fault, not an
     // answer: it must be booked and reported as a failure, never as an empty
@@ -93,7 +94,15 @@ pub async fn messages(
                 response.usage.completion_tokens,
             );
             let served = response.model.clone();
-            let usage = response.usage;
+            let mut usage = response.usage;
+            // A provider that reports no usage must not look free.
+            let output_bytes = crate::usage_estimate::value_text_bytes(
+                response
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.message.content.as_ref()),
+            );
+            crate::usage_estimate::fill_missing(&mut usage, prompt_estimate, output_bytes);
             let details = cached_usage(&response);
             record_completion_usage(
                 &state,
@@ -176,27 +185,8 @@ pub async fn count_tokens(auth: Authenticated, JsonBody(request): JsonBody<Value
     if !auth.allows_model(&request.model) {
         return forbidden_response("model is not allowed for this api key");
     }
-    Json(json!({ "input_tokens": estimate_prompt_tokens(&request) })).into_response()
-}
-
-/// Rough prompt size in tokens: bytes / 4 over the flattened turns, the tool
-/// calls riding on them and the tool definitions, plus four tokens of framing
-/// per turn. Floored at one so even an empty body reports a positive count.
-fn estimate_prompt_tokens(request: &ChatCompletionRequest) -> u32 {
-    let mut bytes = 0usize;
-    for message in &request.messages {
-        bytes += message.role.len() + message.text().len() + 16;
-        if let Some(calls) = &message.tool_calls {
-            bytes += calls.to_string().len();
-        }
-        if let Some(id) = &message.tool_call_id {
-            bytes += id.len();
-        }
-    }
-    if let Some(tools) = &request.tools {
-        bytes += tools.to_string().len();
-    }
-    (bytes / 4 + 1) as u32
+    Json(json!({ "input_tokens": crate::usage_estimate::estimate_prompt_tokens(&request) }))
+        .into_response()
 }
 
 /// Translate an Anthropic Messages request into the internal chat request.
@@ -531,15 +521,22 @@ fn claude_stream(
     let summary = request_summary(&request);
     let token = backend::request_token(&request).unwrap_or_default();
     let started = std::time::Instant::now();
+    let prompt_estimate = crate::usage_estimate::estimate_prompt_tokens(&request);
     let stream = state.backend.stream(request);
+    // A model that degenerates repeats itself until the token cap; the guard
+    // stops the stream there instead of passing the loop on.
+    let stream = crate::repetition_guard::guard_stream(stream, &model);
     let mut books = StreamAccounting::new(
         state,
         auth,
         token,
         model.clone(),
         started,
-        "messages",
-        summary,
+        crate::StreamRequest {
+            request_type: "messages",
+            summary,
+            prompt_estimate,
+        },
     );
     let mut dialect = ClaudeDialect::new(&model);
 
@@ -554,8 +551,10 @@ fn claude_stream(
             Step::Close => dialect.finish(),
             Step::Chunk(Ok(chunk)) => {
                 books.first_token();
+                books.count_output(&chunk);
                 if let Some(usage) = chunk.usage {
                     books.usage = usage;
+                    books.usage_reported = true;
                 }
                 if let Some(details) = backend::chunk_cached_usage(&chunk) {
                     books.details = details;

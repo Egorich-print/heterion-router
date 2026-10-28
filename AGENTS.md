@@ -48,6 +48,59 @@ Toolchain закреплён `1.99.0` в `rust-toolchain.toml`, `rust-version = 
   `20128`, поэтому для dev gateway нужен `VITE_GATEWAY_URL=...:20129`.
 - Keyless-бэкенды не шлют `Authorization` (тест `keyless_provider_sends_no_bearer`).
 - 4xx вышестоящего провайдера не роняют breaker (не «чинить» это поведение).
+- Вырожденный повтор в ответе модели **обрезается роутером**
+  (`repetition_guard.rs`): доля повторяющихся 8-грамм в хвостовом окне (128
+  слов) ≥ 0.5 при повторе одного окна ≥ 4 раз → ответ режется до начала
+  петли, `finish_reason` становится `length`, поток обрывается (апстрим
+  больше не тратит токены на петлю). Два семейства — два правила: петля из
+  handful слов (≤ 16 различных слов в окне) режется сразу; структурное
+  повторение списка — только когда ответ перевалил за 2000 слов (иначе
+  режется честная цитата, которую модель повторяет по просьбе промпта).
+  Логируется как `WARN repetition guard model=… source=content|reasoning
+  ratio=… repeats=… words=…`. Здоровый текст даёт 0.0; петля — 0.99+. Не
+  «чинить» пороги на глаз — у них есть тесты (`repetition_guard::tests`) и
+  сквозной тест на фейковом апстриме
+  (`crates/heterion-router-gateway/tests/repetition_guard.rs`).
+- Запрос с завершающим assistant-ходом (prefill) **адаптируется только для
+  провайдеров, которые такую форму отвергают** (`continuation.rs`): Mistral
+  отвечает 400 `invalid_request_message_order` (code 3230, «Expected last
+  role User or Tool»), Gemini — 400 «Requests ending with a model turn are not
+  supported». Для них в историю добавляется один user-ход с просьбой
+  продолжить (`CONTINUATION_INSTRUCTION`), а ответ остаётся текстом модели:
+  префикс остаётся у клиента, как при нативном prefill OpenAI. Для
+  openai-форматных провайдеров префикс остаётся дословным — адаптация там
+  ломала бы verbatim prefill (тест
+  `a_provider_that_serves_prefills_keeps_the_verbatim_turn`). Assistant-ход с
+  `tool_calls` не адаптируется: переписка без результата инструмента
+  невалидна для любого провайдера (OpenAI тоже её отвергает).
+- Картинка в запросе **не должна исчезать на переводе**: OpenAI→Gemini
+  (`gemini_request.rs`) кладёт `image_url` c data-URL в `inlineData`. Gemini не
+  умеет забирать картинку по URL — `fileData` с https отвергается («Cannot fetch
+  content from the provided URL»); URL, который не data, остаётся в теле
+  текстовой заметкой, а не пропадает. Проверка способности «читает картинку» —
+  по `usage.prompt_tokens` (текст ~28 против картинки ~1120) и
+  `promptTokensDetails: [{modality: IMAGE}]`, а не по тексту ответа модели:
+  модель способна правдоподобно описать картинку, которую не получила.
+  История: `docs/research/GEMINI-VISION-FIX-REPORT-2026-10-26.md`.
+- Поиск Exa живёт на **чат-поверхности** как модель `exa/exa-search`
+  (`executor: "exa"`, ADR-016/019): последнее сообщение пользователя — запрос,
+  ответ — цитированный блок. Параметры поиска (`numResults`, `type`, `category`,
+  `includeDomains`, `excludeDomains`, даты) едут в теле запроса под объектом
+  `"exa"`; без него тело не меняется. Ключи Exa лежат только в БД роутера —
+  потребитель (плагин `~/.minimax/plugins/exa-search/`) берёт ключ **роутера** и
+  ходит в `http://127.0.0.1:20128`, а не в Exa напрямую.
+- Провайдер `agentrouter` — **Responses-протокол + идентификация клиента**
+  (ADR-021). Формат в реестре `openai-responses`, адрес
+  `https://agentrouter.org/v1/responses`; `/v1/chat/completions` площадка
+  отвергает, а живой каталог (`GET /v1/models` с ключом) — ровно
+  `gpt-6.1-sol`, `gpt-6-astra`, `gpt-5.6-sol` (Claude-модели нашей группе
+  `default` недоступны). Площадка **меряет квоту по типу клиента**: без
+  распознанного клиента — `401 unauthorized_client_error` даже с валидным
+  ключом. Отпечаток (`originator: codex_cli_rs`) — политика провайдера в
+  `client_profile.rs`, не глобальное правило; свой user-agent роутера не
+  влияет на группу и множитель. Перечень моделей в реестре берётся **из
+  площадки**, а не из памяти: устаревшие id в реестре обещают клиенту
+  модели, которой нет.
 
 ## Сервис (macOS)
 
