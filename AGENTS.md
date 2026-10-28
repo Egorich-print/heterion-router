@@ -6,6 +6,9 @@
 
 ## Layout
 
+- Рабочая копия — на внешнем SSD: `/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router`
+  (переехала 2026-10-28). Старый путь `/Users/egorich/ai-workstation/...` — устаревшая
+  копия: правки туда не попадают, коммить и гонять CI нужно в Netac-копии.
 - `crates/heterion-router-{config,core,crypto,db,gateway,http,providers,routing,translate,usage}` —
   workspace; бинарь `heterion-router-gateway` (`crates/heterion-router-gateway/src/main.rs`).
 - `desktop/` — Tauri v2 оболочка (`src-tauri`, исключён из workspace) + Svelte-дашборд (`ui`).
