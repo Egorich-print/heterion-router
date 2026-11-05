@@ -172,6 +172,20 @@
     ]
   },
   {
+    "id": "aihubmix",
+    "alias": "ahm",
+    "format": "openai",
+    "executor": "default",
+    "auth_type": "apikey",
+    "base_url": "https://aihubmix.com/v1/chat/completions",
+    "models": [
+      {
+        "id": "crouton-alpha-free",
+        "target_format": null
+      }
+    ]
+  },
+  {
     "id": "aihorde",
     "alias": null,
     "format": "openai",

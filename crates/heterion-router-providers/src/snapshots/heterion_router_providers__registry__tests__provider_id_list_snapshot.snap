@@ -1,6 +1,5 @@
 ---
 source: crates/heterion-router-providers/src/registry.rs
-assertion_line: 348
 expression: ids
 ---
 [
@@ -10,6 +9,7 @@ expression: ids
     "agnes-cn",
     "agy",
     "ai21",
+    "aihubmix",
     "aihorde",
     "aimlapi",
     "ainative",
