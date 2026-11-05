@@ -1827,6 +1827,10 @@
         "target_format": null
       },
       {
+        "id": "stealth/crouton-alpha",
+        "target_format": null
+      },
+      {
         "id": "deepseek/deepseek-v4-flash",
         "target_format": null
       },
