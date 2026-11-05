@@ -57,16 +57,23 @@ pub fn needs_explicit_tool_choice(model: &str) -> bool {
 /// families (`default_effort` is `None`), so the field can only arrive from
 /// the client — and for this family the only safe move is to drop it.
 /// Probed live 2026-10-16.
+///
+/// `open-mistral-nemo` answers the same 400 (probed live 2026-11-05) but the
+/// prefix is `open-mistral`, so the family check must cover it too.
 pub fn rejects_reasoning_effort(model: &str) -> bool {
     let bare = model.rsplit('/').next().unwrap_or(model);
     let bare = bare.to_ascii_lowercase();
-    bare.starts_with("codestral") || bare.starts_with("mistral") || bare.starts_with("ministral")
+    bare.starts_with("codestral")
+        || bare.starts_with("mistral")
+        || bare.starts_with("ministral")
+        || bare.starts_with("open-mistral")
 }
 
 #[cfg(test)]
 mod tests {
     use super::default_effort;
     use super::needs_explicit_tool_choice;
+    use super::rejects_reasoning_effort;
 
     #[test]
     fn evidenced_families_get_their_predefined_level() {
@@ -111,5 +118,22 @@ mod tests {
         assert!(!needs_explicit_tool_choice("grok-4.6"));
         assert!(!needs_explicit_tool_choice("openai/gpt-oss-20b"));
         assert!(!needs_explicit_tool_choice(""));
+    }
+
+    #[test]
+    fn mistral_families_reject_reasoning_effort() {
+        // Mistral answers 400 "reasoning_effort is not enabled for this
+        // model" (code 3051) for the whole family, open-mistral included.
+        assert!(rejects_reasoning_effort("codestral-latest"));
+        assert!(rejects_reasoning_effort("mistral/codestral-latest"));
+        assert!(rejects_reasoning_effort("mistral-large-latest"));
+        assert!(rejects_reasoning_effort("ministral-8b-latest"));
+        assert!(rejects_reasoning_effort("open-mistral-nemo"));
+        assert!(rejects_reasoning_effort("mistral/open-mistral-nemo"));
+        assert!(rejects_reasoning_effort("OPEN-MISTRAL-NEMO"));
+        assert!(!rejects_reasoning_effort("glm-5.3-flash"));
+        assert!(!rejects_reasoning_effort("grok-4.6"));
+        assert!(!rejects_reasoning_effort("gpt-5.6-sol"));
+        assert!(!rejects_reasoning_effort(""));
     }
 }
