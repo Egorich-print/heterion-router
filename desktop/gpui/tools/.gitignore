@@ -1,0 +1,4 @@
+# Runtime artefacts of the visual-QA harness — never committed.
+/app.pid
+/app.log
+/shots/
