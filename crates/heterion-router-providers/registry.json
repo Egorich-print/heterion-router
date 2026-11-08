@@ -8259,6 +8259,14 @@
         "target_format": null
       },
       {
+        "id": "stealth/glyph-cluster",
+        "target_format": null
+      },
+      {
+        "id": "stealth/crouton-alpha",
+        "target_format": null
+      },
+      {
         "id": "openai/gpt-5.6-sol",
         "target_format": null
       },
@@ -10394,6 +10402,10 @@
     "models": [
       {
         "id": "auto",
+        "target_format": null
+      },
+      {
+        "id": "stealth/crouton-alpha",
         "target_format": null
       }
     ]
