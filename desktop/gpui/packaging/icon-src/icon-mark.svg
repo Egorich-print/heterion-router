@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Heterion Router — mark only, transparent background.
+
+  This is the Windows asset master: Square*Logo.png and StoreLogo.png are
+  the bare mark (the same convention the previous Tauri icon set used), so
+  Windows can apply its own tile and mask.
+
+  Rendered by icon-src/make-icons.sh — edit this file, not the PNGs.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="196 196 632 632">
+
+  <defs>
+    <linearGradient id="plate" x1="0.1" y1="0" x2="0.6" y2="1">
+      <stop offset="0" stop-color="#1e2836"/>
+      <stop offset="0.45" stop-color="#141b25"/>
+      <stop offset="1" stop-color="#0a0e14"/>
+    </linearGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.42" r="0.6">
+      <stop offset="0" stop-color="#4f8cff" stop-opacity="0.30"/>
+      <stop offset="0.55" stop-color="#4f8cff" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#4f8cff" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="sheen" cx="0.32" cy="0.18" r="0.72">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.10"/>
+      <stop offset="0.6" stop-color="#ffffff" stop-opacity="0.02"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.20"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.25"/>
+    </linearGradient>
+    <radialGradient id="blueDot" cx="0.35" cy="0.3" r="0.85">
+      <stop offset="0" stop-color="#7fb0ff"/>
+      <stop offset="0.55" stop-color="#4f8cff"/>
+      <stop offset="1" stop-color="#2f63cc"/>
+    </radialGradient>
+    <radialGradient id="greenDot" cx="0.35" cy="0.3" r="0.85">
+      <stop offset="0" stop-color="#6fd47c"/>
+      <stop offset="0.55" stop-color="#3fb950"/>
+      <stop offset="1" stop-color="#2a8a38"/>
+    </radialGradient>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="22" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <g filter="url(#glow)">
+
+  <g id="mark">
+    <g fill="none" stroke="#4f8cff" stroke-width="46" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 378 368 L 524 512 L 378 656"/>
+      <path d="M 524 512 L 698 512"/>
+    </g>
+    <circle cx="318" cy="368" r="60" fill="url(#blueDot)"/>
+    <circle cx="318" cy="656" r="60" fill="url(#blueDot)"/>
+    <circle cx="698" cy="512" r="70" fill="url(#greenDot)"/>
+  </g>
+  </g>
+</svg>

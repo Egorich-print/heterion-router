@@ -164,6 +164,16 @@ fn serve(
     overview_requests: &AtomicUsize,
     answers: &AtomicUsize,
 ) {
+    // The listener is non-blocking so that the accept loop can poll it, and
+    // on macOS the accepted socket inherits that flag. A read that finds no
+    // data yet would then fail with `WouldBlock` instead of waiting for it,
+    // and the gateway would close the connection without an answer — the
+    // client sees an incomplete message and reports a transport error.
+    // Put the connection back into blocking mode; the read timeout keeps a
+    // silent client from wedging the worker forever.
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
     let Ok(read_half) = stream.try_clone() else {
         return;
     };

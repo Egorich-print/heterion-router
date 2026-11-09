@@ -266,7 +266,15 @@ impl FakeGateway {
             std::thread::spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match worker_listener.accept() {
-                        Ok((stream, _)) => serve(stream, handler.as_ref(), seen.as_ref()),
+                        // One thread per connection: a slow answer must not
+                        // hold back the next request as well.
+                        Ok((stream, _)) => {
+                            let handler = Arc::clone(&handler);
+                            let seen = Arc::clone(&seen);
+                            std::thread::spawn(move || {
+                                serve(stream, handler.as_ref(), seen.as_ref())
+                            });
+                        }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(2));
                         }
@@ -308,7 +316,17 @@ impl Drop for FakeGateway {
 }
 
 /// Answer one request and close the connection.
-fn serve(stream: TcpStream, handler: &dyn Fn(&str) -> Reply, seen: &Mutex<Vec<Seen>>) {
+fn serve(mut stream: TcpStream, handler: &dyn Fn(&str) -> Reply, seen: &Mutex<Vec<Seen>>) {
+    // The listener is non-blocking so that the accept loop can poll it, and
+    // on macOS the accepted socket inherits that flag. A read that finds no
+    // data yet would then fail with `WouldBlock` instead of waiting for it,
+    // and the gateway would close the connection without an answer — the
+    // client sees an incomplete message and reports a transport error.
+    // Put the connection back into blocking mode; the read timeout keeps a
+    // silent client from wedging the worker forever.
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
@@ -367,7 +385,6 @@ fn serve(stream: TcpStream, handler: &dyn Fn(&str) -> Reply, seen: &Mutex<Vec<Se
         reply.body.len()
     );
 
-    let mut stream = stream;
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(reply.body.as_bytes());
     let _ = stream.flush();
