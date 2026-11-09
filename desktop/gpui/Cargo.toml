@@ -1,0 +1,46 @@
+[package]
+name = "heterion-router-desktop"
+version = "0.1.0"
+description = "Heterion Router desktop shell (GPUI)"
+authors = ["Heterion Router Contributors"]
+license = "MIT"
+repository = "https://github.com/Egorich-print/heterion-router"
+edition = "2024"
+rust-version = "1.99"
+
+# The shell stands outside the parent workspace (the root `Cargo.toml` excludes
+# it), so it needs a resolver of its own. Version 3 keeps the test-only
+# features of the dev-dependencies out of the production build: without it
+# `gpui/test-support` — and with it gpui's leak detection — would end up in
+# the shipped app.
+[workspace]
+resolver = "3"
+
+[[bin]]
+name = "heterion-router-desktop"
+path = "src/main.rs"
+
+# The desktop shell is a heavy, standalone binary: it stays out of the fast
+# gateway workspace/CI loop (see the root `Cargo.toml` `exclude` list).
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+gpui = { version = "0.2.2", default-features = false, features = ["font-kit"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+# `test-support` gives the tests gpui's headless `TestAppContext`; the
+# production build does not need it.
+gpui = { version = "0.2.2", default-features = false, features = [
+    "font-kit",
+    "test-support",
+] }
+tempfile = "3"

@@ -1,0 +1,22 @@
+{
+  "name": "heterion-router-mcp",
+  "version": "0.1.0",
+  "description": "MCP stdio server that exposes the Heterion Router admin API and the native GPUI shell to an agent",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "server.js",
+  "bin": {
+    "heterion-router-mcp": "server.js"
+  },
+  "files": [
+    "server.js",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node server.js"
+  }
+}

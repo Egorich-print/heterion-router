@@ -1,7 +1,8 @@
 # STATUS
 
 > Heterion Router — Rust-шлюз, дашборд и десктоп-оболочка.
-> Обновлено: 2026-10-02
+> Обновлено: 2026-11-09 (десктоп переведён с Tauri v2 на GPUI — ADR-023;
+> снимок миссии ниже датирован 2026-10-02 и описывает состояние до перевода)
 > Миссия: **MISSION-2026-10 «Fail-closed & reproducible»** — в работе; P0- и P1-срезы
 > закрыты вместе с hardening-пакетом из аудита 2026-10 (ADR-012).
 
@@ -82,9 +83,10 @@ Mission started: 2026-09-29
   `0.0.0.0:20128`. Plist машинно-локальный и не входит в репозиторий; его
   `ProgramArguments` указывает на `target/release/` dev-дерева, а сам запущенный
   бинарь новее `HEAD` — живой инстанс **не** пригоден для проверки mission-правок.
-- Tauri sidecar и чистый dev gateway используют `20129`; Vite dev-proxy по
-  умолчанию использует `20128`, а `tauri dev` не поднимает sidecar ⇒ dev-окно
-  пишет в БД живого launchd-сервиса. Требует исправления (MISSION-2026-10, F1/F2).
+- Sidecar десктопа и чистый dev gateway используют `20129`; Vite dev-proxy по
+  умолчанию использует `20128`, а debug-сборка десктопа sidecar не поднимает ⇒
+  dev-окно пишет в БД живого launchd-сервиса. Требует исправления
+  (MISSION-2026-10, F1/F2).
 - В БД 24 активных провайдера, в логе — 19 backends. `heterion-local` не
   настроен. `exa-search` имеет 5 активных connection-строк, но отсутствует в
   `registry.json` и молча теряется при построении backends. У `kimi-coding`,
@@ -130,8 +132,8 @@ scripts/ci/check.sh    # fmt + clippy + test, ровно то, что гоняе
 
 ```sh
 npm --prefix desktop/ui run build
-cargo check --manifest-path desktop/src-tauri/Cargo.toml --locked
-cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check
+cargo check --manifest-path desktop/gpui/Cargo.toml --locked
+cargo fmt --manifest-path desktop/gpui/Cargo.toml -- --check
 ```
 
 На 2026-10-02: `scripts/ci/check.sh` = `all green` на **Rust 1.99.0**

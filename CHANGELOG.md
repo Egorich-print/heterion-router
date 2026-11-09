@@ -5,6 +5,85 @@
 > do not point at the Rust gateway. Gateway artifacts use the separate
 > `gateway-YYYYMMDD-<sha>` release naming.
 
+## Unreleased — 2026-11-09 (desktop: Tauri v2 → GPUI)
+
+### Changed
+
+- **Десктоп-оболочка переведена с Tauri v2 на GPUI** (ADR-023). Нативное
+  приложение на [gpui](https://gpui.rs) 0.2.2 живёт в `desktop/gpui`
+  (`heterion-router-desktop`, вне workspace) и говорит с тем же admin-API,
+  что и веб-дашборд; `desktop/ui` остаётся веб-дашбордом, который раздаёт
+  шлюз. Контракт зафиксирован в `desktop/gpui/src/api.rs` — типизированное
+  зеркало `crates/heterion-router-gateway/src/admin.rs`; правка одного без
+  другого ломает один из фронтендов.
+- **Живые виджеты — свои.** В gpui нет ни `Button`, ни `Input`, ни `Table`:
+  только `div` с flex/grid-стилями, `uniform_list`, текст и изображения.
+  `desktop/gpui/src/widgets/` — общие элементы оболочки, стилизованные под
+  `desktop/ui/src/app.css` (те же цвета, радиусы и тона).
+- **Ключ оператора больше не в `localStorage` WebView**, а в файле
+  `<data dir>/desktop/operator-key.json` с правами `0600` (каталог `0700`,
+  запись атомарная через temp+rename, симлинк отвергается). В БД шлюза его
+  нет: `api_keys.key` хранит маркер `hash-only:<id>`.
+- **Упаковка — без Tauri.** `desktop/scripts/build-app.sh` собирает
+  `Heterion Router.app` (Info.plist, иконки, sidecar рядом с бинарём,
+  adhoc-подпись) в `desktop/gpui/dist/`. Как и прежний Tauri-бандл — без
+  notarization.
+- CI: job `tauri-fmt` заменён на `desktop-fmt` (`desktop/gpui`), пути
+  `desktop/gpui/**` в триггерах; локальный `scripts/ci/check.sh` проверяет
+  fmt исключённого крейта.
+
+### Removed
+
+- `desktop/src-tauri` (Tauri v2), `desktop/scripts/stage-sidecar.sh` и
+  Tauri-скрипты в `desktop/package.json`.
+
+### Added
+
+- Инструменты работы с нативным окном: `desktop/gpui/tools/screenshot.sh`
+  (запуск/скриншот/статус) и `desktop/gpui/tools/mcp/server.js` — MCP-сервер,
+  отдающий агенту состояние шлюза и снимок экрана.
+- `docs/port/GPUI-API-NOTES.md` (проверенные факты по API gpui 0.2.2) и
+  `docs/port/GPUI-PORT-SPEC.md` (контракт порта).
+- **Поле ввода — настоящее.** `desktop/gpui/src/widgets/input.rs` (1093 строки)
+  рисует каретку по глифам, подсвечивает выделение, переносит его через
+  `cmd+C`/`cmd+X`, держит UTF-16-корректные диапазоны и реализует
+  `gpui::EntityInputHandler` (marked text, `bounds_for_range`,
+  `character_index_for_point`). Ввод по клавишам оставлен намеренно: на macOS
+  платформа вызывает `insertText:` только для клавиш, которых виджет не
+  обработал, — routed через IME, обычный набор перестал бы печататься.
+- **175 тестов у крейта.** 40 модульных + 7 файлов интеграционных
+  (`desktop/gpui/tests/`): фейковый HTTP-шлюз на голом `std::net` для
+  `api_client`, права и атомарность файла ключа, разбор портов и
+  эксклюзивность instance-lock, сверка полей контракта с `admin.rs`,
+  headless-тест кнопки Refresh через `gpui::test`, клики по кнопке и по
+  настоящей оболочке (`gpui/test-support` — только в dev-зависимостях).
+- **Инструменты для работы с gpui:** скилл `.minimax/skills/gpui-heterion/`
+  (проверенные факты по API и контракт порта), кастомный агент
+  `gpui-port` и плагин `heterion-gpui` с этим же MCP-сервером.
+
+### Fixed
+
+- **Кнопки нажимаются.** gpui хранит состояние взаимодействия элемента
+  (`pending_mouse_down`, `clicked_state`) **по element id**; прежний
+  `theme::unique_id()` выдавал новый id на каждом кадре, поэтому между
+  mouse-down и mouse-up состояние терялось и `on_click` не срабатывал ни
+  разу. Теперь id стабильный (`theme::element_id(name)`), а ключ протягивает
+  вызывающий код — в списках это id строки (`providers-active:{row.id}`).
+  Закрыто headless-тестами (`tests/button_click.rs`, `tests/app_click.rs`) и
+  живой проверкой: настоящий клик по Refresh перечитывает шлюз.
+- **Экран Providers больше не падает.** Шлюз отдаёт nullable-колонки как
+  `null` (`provider_connections.name` и `.auth_type` — 2 из 66 соединений с
+  пустым именем), а модель клиента ждала строку: `#[serde(default)]` спасает
+  только от *отсутствующего* поля, не от `null`. Добавлен
+  `null_to_default` — `null` читается как значение по умолчанию, а виджет
+  рисует «—», как веб-дашборд (`row.name ?? "—"`). То же для
+  `api_keys.key_prefix` и `usage_history.provider`.
+- **График usage не вылезает за окно.** `gpui::relative()` ждёт **долю**
+  `0.0..=1.0`, а `widgets/chart.rs` передавал проценты (`fraction * 100`):
+  каждая полоска была в сто раз длиннее, чем должна быть, и карточка
+  «Top providers» уезжала за край экрана. Проверено пиксельно: доли
+  100% / 10.7% / 9.7% / 3.1% теперь совпадают с данными.
+
 ## Unreleased — working tree snapshot 2026-10-02 (rust-review)
 
 ### Fixed

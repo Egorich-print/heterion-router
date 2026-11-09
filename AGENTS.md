@@ -11,8 +11,10 @@
   копия: правки туда не попадают, коммить и гонять CI нужно в Netac-копии.
 - `crates/heterion-router-{config,core,crypto,db,gateway,http,providers,routing,translate,usage}` —
   workspace; бинарь `heterion-router-gateway` (`crates/heterion-router-gateway/src/main.rs`).
-- `desktop/` — Tauri v2 оболочка (`src-tauri`, исключён из workspace) + Svelte-дашборд (`ui`).
-  Тот же бандл, что отдаёт шлюз сам.
+- `desktop/` — нативная оболочка на **GPUI** (`desktop/gpui`, исключён из
+  workspace) + Svelte-дашборд (`desktop/ui`), который шлюз раздаёт сам.
+  Десктоп — отдельное нативное приложение поверх того же admin-API
+  (ADR-023), веб-дашборд остаётся как был.
 - `docs/adr/` — решения (ADR-008 — переименование); ADR-001..007 —
   исторические решения с addenda; `docs/history/` — frozen upstream JS
   OmniRoute material, не история Rust-порта.
@@ -30,12 +32,13 @@ cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && carg
 
 То же, что гоняет CI, одной командой: `scripts/ci/check.sh`.
 
-Тяжёлое отдельно: `npm --prefix desktop/ui ci/build` и
-`cargo tauri build` в `desktop/` (локальный cold build ≈5m15s; bundle
-adhoc-signed, не notarized). Workspace fmt не покрывает исключённый
-`desktop/src-tauri`; для него нужен отдельный check
-(`cargo fmt --manifest-path desktop/src-tauri/Cargo.toml -- --check`; в CI это
-job `tauri-fmt`).
+Тяжёлое отдельно: `npm --prefix desktop/ui ci/build`,
+`cargo build --manifest-path desktop/gpui/Cargo.toml` (cold ≈2m; нужен Xcode —
+gpui компилирует Metal-шейдеры через `xcrun metal`) и `desktop/scripts/build-app.sh`
+(bundle adhoc-signed, не notarized). Workspace fmt не покрывает исключённый
+`desktop/gpui`; для него нужен отдельный check
+(`cargo fmt --manifest-path desktop/gpui/Cargo.toml -- --check`; в CI это job
+`desktop-fmt`).
 
 Toolchain закреплён `1.99.0` в `rust-toolchain.toml`, `rust-version = "1.99"` в
 обоих манифестах, CI использует тот же пин — не `@stable`. Новый крейт обязан
@@ -47,7 +50,7 @@ Toolchain закреплён `1.99.0` в `rust-toolchain.toml`, `rust-version = 
   (`heterion-router-crypto`) — живые БД держат значения с этой солью.
 - Env: `HETERION_ROUTER_*` первичен, `OMNIROUTE_*` — fallback на один цикл.
   Data dir: `~/.heterion-router` → legacy `~/.omniroute`.
-- Порты: сервис `20128`, Tauri sidecar `20129`; Vite dev-proxy по умолчанию
+- Порты: сервис `20128`, sidecar `20129`; Vite dev-proxy по умолчанию
   `20128`, поэтому для dev gateway нужен `VITE_GATEWAY_URL=...:20129`.
 - Keyless-бэкенды не шлют `Authorization` (тест `keyless_provider_sends_no_bearer`).
 - 4xx вышестоящего провайдера не роняют breaker (не «чинить» это поведение).
@@ -158,6 +161,39 @@ Toolchain закреплён `1.99.0` в `rust-toolchain.toml`, `rust-version = 
 - У Responses-объекта поле `error` присутствует всегда (`null` при успехе) —
   отказом считается **непустой** объект ошибки, иначе весь ответ подменяется
   на `upstream error: null`.
+
+## Десктоп на GPUI (ADR-023)
+
+Нативная оболочка — Rust-приложение на [gpui](https://gpui.rs) 0.2.2 в
+`desktop/gpui` (крейт `heterion-router-desktop`, вне workspace). Tauri v2 и
+`desktop/src-tauri` удалены.
+
+- **Крейт:** `gpui = { version = "0.2.2", default-features = false, features =
+  ["font-kit"] }`. Фича `font-kit` обязательна на macOS (без неё нет
+  текст-системы). Фича `macos-blade` не нужна: gpui рисует своим
+  Metal-рендерером, шейдеры компилируются на сборке через `xcrun metal` —
+  **нужен Xcode**. Шрифты — системные macOS (`.SystemUIFont`), свои файлы
+  не нужны.
+- **Структура:** `src/api.rs` — типизированный контракт admin-API (зеркало
+  `crates/heterion-router-gateway/src/admin.rs`); `src/theme.rs` — палитра из
+  `desktop/ui/src/app.css`; `src/widgets/` — свои виджеты (в gpui нет ни
+  `Button`, ни `Input`, ни `Table`); `src/views/` — по представлению на
+  секцию; `src/sidecar.rs` — sidecar-шлюз; `src/secret.rs` — файл ключа.
+- **Контракт — один на оба фронтенда.** Правка `src/api.rs` обязана идти
+  вместе с правкой gateway-обработчиков; расхождение ломает либо веб, либо
+  десктоп.
+- **Ключ оператора** лежит в `<data dir>/desktop/operator-key.json` (0600,
+  каталог 0700), а не в `localStorage` WebView. В БД шлюза его нет.
+- **Sidecar:** release-сборка поднимает `heterion-router-gateway` из каталога
+  рядом со своим бинарём на порту 20129 (`HETERION_ROUTER_SIDECAR_PORT` /
+  `OMNIROUTE_SIDECAR_PORT`) с `HETERION_ROUTER_PARENT_PID`; debug-сборка
+  говорит с уже запущенным шлюзом (20128).
+- **Факты по API gpui** — `docs/port/GPUI-API-NOTES.md`, контракт порта —
+  `docs/port/GPUI-PORT-SPEC.md`. Не выдумывать имена API: исходники крейта в
+  `~/.cargo/registry/src/index.crates.io-*/gpui-0.2.2/src/`.
+- **Инструменты:** `desktop/gpui/tools/screenshot.sh` (запуск, скриншот,
+  статус окна) и `desktop/gpui/tools/mcp/server.js` (MCP-сервер: состояние
+  шлюза + снимок экрана для агента).
 
 ## Сервис (macOS)
 

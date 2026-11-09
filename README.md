@@ -1,7 +1,7 @@
 # Heterion Router
 
 > OpenAI-совместимый шлюз к LLM-провайдерам на Rust: один `baseURL`, один ключ,
-> роутинг по комбо, failover, встроенный дашборд, Tauri-десктоп.
+> роутинг по комбо, failover, встроенный дашборд, нативный десктоп на GPUI.
 > Sibling of [Heterion](https://github.com/Egorich-print/heterion) (там —
 > инференс; здесь — маршрутизация). Successor of OmniRoute-Rust.
 
@@ -33,12 +33,14 @@ curl -s http://127.0.0.1:20128/healthz
 Сборка дашборда и десктопа:
 
 ```sh
-npm --prefix desktop/ui ci && npm --prefix desktop/ui run build
-(cd desktop && cargo tauri build)
+npm --prefix desktop/ui ci && npm --prefix desktop/ui run build   # веб-дашборд
+desktop/scripts/build-app.sh                                       # нативный .app
 ```
 
-Локальный Tauri build проверен, но текущий `.app`/`.dmg` adhoc-signed и не
-notarized; это developer-machine artifact, не готовый дистрибутив.
+Десктоп — нативное приложение на GPUI (`desktop/gpui`, ADR-023); собирается
+под macOS и требует Xcode (gpui компилирует Metal-шейдеры через `xcrun metal`).
+Локальная сборка проверена, но `.app` adhoc-signed и не notarized: это
+developer-machine artifact, не готовый дистрибутив.
 
 ## Как это устроено
 

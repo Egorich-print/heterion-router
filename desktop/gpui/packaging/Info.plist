@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Bundle metadata for the GPUI desktop shell.
+
+  The values mirror the retired Tauri shell (desktop/src-tauri/tauri.conf.json):
+  product name "Heterion Router", identifier "com.heterion.router", version
+  0.1.0. The Tauri `app_id` in desktop/gpui/src/main.rs is the same string.
+
+  Notes:
+    * LSUIElement is deliberately absent — the shell has a Dock icon and a
+      menu bar, so it is a regular foreground app.
+    * NSLocalNetworkUsageDescription is deliberately absent: the shell only
+      talks to a loopback gateway (127.0.0.1) and binds a loopback instance
+      lock (127.0.0.1:20130). Loopback traffic never triggers the macOS local
+      network privacy prompt.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Heterion Router</string>
+	<key>CFBundleExecutable</key>
+	<string>heterion-router-desktop</string>
+	<key>CFBundleIconFile</key>
+	<string>icon.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.heterion.router</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Heterion Router</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 Heterion Router Contributors</string>
+	<key>NSPrincipalClass</key>
+	<string>NSApplication</string>
+</dict>
+</plist>

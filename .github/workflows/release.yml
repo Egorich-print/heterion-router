@@ -1,6 +1,6 @@
 # On-demand release: gateway binaries as release assets.
-# Manual only (`workflow_dispatch`); the Tauri desktop bundle stays a local
-# build (`cargo tauri build` needs macOS for real .app/.dmg artifacts).
+# Manual only (`workflow_dispatch`); the desktop bundle stays a local build
+# (`desktop/scripts/build-app.sh` needs macOS for a real .app artifact).
 name: release
 
 on:

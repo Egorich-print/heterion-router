@@ -1,7 +1,8 @@
-# Heterion Router CI: fast gates only. The Tauri desktop app is excluded
-# (heavy, platform-specific, needs a macOS runner for real bundles);
-# build it locally with `cargo tauri` in desktop/. Release artifacts
-# (gateway binaries) come from `release.yml` on demand.
+# Heterion Router CI: fast gates only. The GPUI desktop app is excluded
+# (heavy, macOS-only: it needs a Metal toolchain to compile gpui's shaders);
+# build it locally with `cargo build` in desktop/gpui and package it with
+# desktop/scripts/build-app.sh. Release artifacts (gateway binaries) come
+# from `release.yml` on demand.
 name: ci
 
 on:
@@ -11,7 +12,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
-      - "desktop/src-tauri/**"
+      - "desktop/gpui/**"
       - "desktop/ui/**"
       - "docs/**"
       - "rust-toolchain.toml"
@@ -22,7 +23,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
-      - "desktop/src-tauri/**"
+      - "desktop/gpui/**"
       - "desktop/ui/**"
       - "docs/**"
       - "rust-toolchain.toml"
@@ -45,10 +46,11 @@ jobs:
       - name: Gates (same script as local)
         run: scripts/ci/check.sh
 
-  tauri-fmt:
-    # desktop/src-tauri is excluded from the workspace, so `cargo fmt --all`
-    # in check.sh never sees it. `cargo fmt` only parses sources, so this
-    # job needs no webkit2gtk/GTK system libraries and runs on any runner.
+  desktop-fmt:
+    # desktop/gpui is excluded from the workspace, so `cargo fmt --all` in
+    # check.sh never sees it. `cargo fmt` only parses sources, so this job
+    # needs neither a Metal toolchain nor a window server and runs on any
+    # runner. The full build of gpui is macOS-only and stays local.
     name: desktop fmt
     runs-on: ubuntu-latest
     steps:
@@ -57,7 +59,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@1.99.0
       - name: fmt --check (excluded crate)
-        working-directory: desktop/src-tauri
+        working-directory: desktop/gpui
         run: cargo fmt -- --check
 
   ui:

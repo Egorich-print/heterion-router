@@ -3,8 +3,7 @@
 **/target/
 **/*.rs.bk
 
-# Tauri
-desktop/src-tauri/binaries/
+# Desktop app bundle (built by desktop/scripts/build-app.sh)
 *.app
 *.dmg
 *.AppImage
@@ -16,6 +15,15 @@ desktop/ui/dist/
 **/dist/
 **/build/
 **/artifacts/
+
+# Desktop harness artifacts (screenshots, app logs, pid files)
+desktop/gpui/tools/shots/
+desktop/gpui/tools/runtime/
+desktop/gpui/tools/mcp/shots/
+desktop/gpui/tools/mcp/runtime/
+desktop/gpui/tools/*.log
+desktop/gpui/tools/*.env
+desktop/gpui/tools/*.pid
 
 # Local databases and WAL sidecars (runtime state, never tracked)
 *.sqlite

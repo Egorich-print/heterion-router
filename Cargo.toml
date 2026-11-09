@@ -18,9 +18,9 @@ members = [
     "crates/heterion-router-translate",
     "crates/heterion-router-usage",
 ]
-# The Tauri desktop app is a heavy, standalone binary app: keep it out of the
-# fast gateway workspace/CI loop. Build it with `cargo tauri` in desktop/.
-exclude = ["desktop/src-tauri"]
+# The desktop app is a heavy, standalone binary app: keep it out of the
+# fast gateway workspace/CI loop. Build it with `cargo build` in desktop/gpui.
+exclude = ["desktop/gpui"]
 
 [workspace.package]
 version = "0.1.0"
