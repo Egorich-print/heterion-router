@@ -28,6 +28,10 @@ const WINDOWS: [(u32, &str); 4] = [
     (90, "90 days"),
 ];
 
+/// The number of columns in each metric-card row so every card keeps the same
+/// width regardless of how many cards the row shows.
+const STAT_COLUMNS: usize = 5;
+
 /// The usage section.
 pub struct UsageView {
     /// The loaded payload.
@@ -39,6 +43,12 @@ pub struct UsageView {
     /// The selected reporting window, in days. Changing it re-queries the
     /// gateway.
     pub days: u32,
+    /// The number of the request that is in flight.
+    ///
+    /// Every refresh bumps it. A reply that belongs to an older request is
+    /// dropped: two clicks in a row must not show the older window's numbers
+    /// under the newer window's label.
+    request: u64,
 }
 
 /// The gateway's answer to `GET /api/usage`.
@@ -65,6 +75,7 @@ impl UsageView {
             error: None,
             loading: true,
             days: 7,
+            request: 0,
         };
         view.refresh(cx);
         view
@@ -76,11 +87,19 @@ impl UsageView {
             return;
         };
         self.loading = true;
+        self.request += 1;
+        let request = self.request;
         let path = format!("/api/usage?days={}&limit={LIMIT}", self.days);
         api::spawn_request(
             cx,
             move || client.get_json::<UsagePayload>(&path),
-            |result, view: &mut UsageView, cx| {
+            move |result, view: &mut UsageView, cx| {
+                // A reply for a window that has been superseded must not
+                // overwrite the newer one: the numbers would belong to
+                // another period than the one on screen.
+                if view.request != request {
+                    return;
+                }
                 match result {
                     Ok(payload) => {
                         view.data = Some(payload.usage);
@@ -117,7 +136,7 @@ impl UsageView {
             let active = days == self.days;
             pills.push(
                 div()
-                    .id(theme::element_id("usage-window"))
+                    .id(theme::element_id(format!("usage-window:{days}")))
                     .flex()
                     .items_center()
                     .px(px(10.0))
@@ -179,29 +198,20 @@ impl UsageView {
             None => "—".to_string(),
         };
 
-        let cards = [
-            widgets::stat_card("requests", compact(usage.requests)),
+        let cards = vec![
+            widgets::stat_card("requests", format_number(usage.requests)),
             widgets::stat_card("success", success),
-            widgets::stat_card("tokens in", compact(usage.tokens_input)),
-            widgets::stat_card("tokens out", compact(usage.tokens_output)),
-            widgets::stat_card("cache read", compact(usage.tokens_cache_read)),
+            widgets::stat_card("tokens in", format_number(usage.tokens_input)),
+            widgets::stat_card("tokens out", format_number(usage.tokens_output)),
+            widgets::stat_card("cache read", format_number(usage.tokens_cache_read)),
         ];
 
-        div()
-            .flex()
-            .flex_wrap()
-            .gap_3()
-            .children(
-                cards
-                    .into_iter()
-                    .map(|card| div().flex_1().min_w(px(140.0)).child(card)),
-            )
-            .into_any_element()
+        card_grid(cards)
     }
 
     /// The latency percentiles of the window.
     fn render_latency(&self, usage: &Usage) -> Vec<AnyElement> {
-        let cards = [
+        let cards = vec![
             widgets::stat_card("p50", percentile(usage.latency.p50_ms)),
             widgets::stat_card("p95", percentile(usage.latency.p95_ms)),
             widgets::stat_card("p99", percentile(usage.latency.p99_ms)),
@@ -209,16 +219,7 @@ impl UsageView {
 
         vec![
             widgets::section_title("Latency").into_any_element(),
-            div()
-                .flex()
-                .flex_wrap()
-                .gap_3()
-                .children(
-                    cards
-                        .into_iter()
-                        .map(|card| div().flex_1().min_w(px(140.0)).child(card)),
-                )
-                .into_any_element(),
+            card_grid(cards),
         ]
     }
 
@@ -242,17 +243,20 @@ impl UsageView {
             .iter()
             .map(|bucket| {
                 BarItem::new(bucket.key.clone(), bucket.requests as f64)
-                    .with_caption(format!("{} req", compact(bucket.requests)))
+                    .with_caption(format!("{} req", format_number(bucket.requests)))
             })
             .collect();
 
         sections.push(
             div()
+                .id(theme::element_id(format!("usage-chart:{title}")))
                 .p(px(12.0))
                 .bg(theme::panel())
                 .border_1()
                 .border_color(theme::border())
                 .rounded(px(theme::RADIUS))
+                .max_h(px(360.0))
+                .overflow_y_scroll()
                 .child(widgets::bar_chart(items))
                 .into_any_element(),
         );
@@ -267,9 +271,9 @@ impl UsageView {
         for bucket in buckets {
             rows.push(bucket_row([
                 widgets::mono(bucket.key.clone()).into_any_element(),
-                widgets::number(compact(bucket.requests)).into_any_element(),
-                widgets::number(compact(bucket.tokens_input)).into_any_element(),
-                widgets::number(compact(bucket.tokens_output)).into_any_element(),
+                widgets::number(format_number(bucket.requests)).into_any_element(),
+                widgets::number(format_number(bucket.tokens_input)).into_any_element(),
+                widgets::number(format_number(bucket.tokens_output)).into_any_element(),
             ]));
         }
         sections.push(widgets::table(rows).into_any_element());
@@ -280,9 +284,9 @@ impl UsageView {
 
 impl Render for UsageView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut sections: Vec<AnyElement> = Vec::new();
+        let mut content = div().flex().flex_col().w_full().gap(px(16.0));
 
-        sections.push(
+        content = content.child(
             widgets::page_header(
                 "Usage",
                 "Aggregated from usage_history, the table both the JS and Rust gateways write.",
@@ -293,7 +297,7 @@ impl Render for UsageView {
         if let Some(message) = self.error.clone() {
             // `error_banner` carries the margin of the shell's content column;
             // this view pads itself, so cancel that margin again.
-            sections.push(
+            content = content.child(
                 div()
                     .mx(px(-theme::CONTENT_PADDING_X))
                     .child(widgets::error_banner(message))
@@ -301,45 +305,92 @@ impl Render for UsageView {
             );
         }
 
-        sections.push(self.render_window_selector(cx));
+        content = content.child(self.render_window_selector(cx));
 
         match self.data.as_ref() {
             Some(usage) => {
-                sections.push(self.render_totals(usage));
-                sections.extend(self.render_latency(usage));
-                sections.extend(self.render_buckets(
-                    "Top providers",
-                    "provider",
-                    &usage.by_provider,
-                ));
-                sections.extend(self.render_buckets("Top models", "model", &usage.by_model));
+                content = content.child(self.render_totals(usage));
+                for section in self.render_latency(usage) {
+                    content = content.child(section);
+                }
+                for section in self.render_buckets("Top providers", "provider", &usage.by_provider)
+                {
+                    content = content.child(section);
+                }
+                for section in self.render_buckets("Top models", "model", &usage.by_model) {
+                    content = content.child(section);
+                }
             }
             None => {
                 if self.loading {
-                    sections.push(widgets::muted("loading…").into_any_element());
+                    content = content.child(widgets::muted("loading…").into_any_element());
                 }
             }
         }
 
+        // The scrollable page: the content keeps its own height so everything
+        // below the fold remains reachable.
+        let page = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .w_full()
+            .id(theme::element_id("usage-page"))
+            .overflow_y_scroll()
+            .items_start()
+            .child(content);
+
         div()
             .flex()
             .flex_col()
-            .p(px(26.0))
-            .gap(px(16.0))
-            .children(sections)
+            .flex_1()
+            .w_full()
+            .p(px(theme::CONTENT_PADDING_X))
+            .child(page)
     }
 }
 
-/// A short number, the way the Svelte view prints it: `1.2k`, `3.4M`.
-fn compact(value: i64) -> String {
-    let value = value as f64;
-    if value >= 1_000_000.0 {
-        format!("{:.1}M", value / 1_000_000.0)
-    } else if value >= 1_000.0 {
-        format!("{:.1}k", value / 1_000.0)
-    } else {
-        format!("{}", value as i64)
+/// A grid of metric cards with a fixed number of columns so every row uses the
+/// same card width, regardless of how many cards it contains.
+fn card_grid(cards: Vec<impl IntoElement + 'static>) -> AnyElement {
+    let mut cells: Vec<AnyElement> = Vec::with_capacity(STAT_COLUMNS);
+    for card in cards.into_iter().take(STAT_COLUMNS) {
+        cells.push(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(card.into_any_element())
+                .into_any_element(),
+        );
     }
+    while cells.len() < STAT_COLUMNS {
+        cells.push(div().flex_1().min_w(px(0.0)).into_any_element());
+    }
+
+    div()
+        .flex()
+        .gap_3()
+        .w_full()
+        .children(cells)
+        .into_any_element()
+}
+
+/// Format an integer with a space as the thousands separator.
+pub fn format_number(value: i64) -> String {
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3 + 1);
+    for (index, ch) in digits.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            out.push(' ');
+        }
+        out.push(ch);
+    }
+    let mut grouped: String = out.chars().rev().collect();
+    if negative {
+        grouped.insert(0, '-');
+    }
+    grouped
 }
 
 /// The share of successful requests, or `None` when nothing was requested.
@@ -353,15 +404,15 @@ fn success_rate(usage: &Usage) -> Option<i64> {
 /// A latency percentile in milliseconds, or a dash when the gateway has none.
 fn percentile(value: Option<f64>) -> String {
     match value {
-        Some(ms) if ms.is_finite() => format!("{ms:.0} ms"),
+        Some(ms) if ms.is_finite() => format!("{} ms", format_number(ms.round() as i64)),
         _ => "—".to_string(),
     }
 }
 
 /// The header of a bucket table.
 ///
-/// The shared `table_header` draws three columns; the bucket lists have four,
-/// so the header is built here, in the same style.
+/// The bucket lists have four columns, so the header is built here, in the
+/// same style as the shared table header.
 fn bucket_header(columns: [&'static str; 4]) -> AnyElement {
     div()
         .flex()
@@ -404,19 +455,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn numbers_are_shortened_like_the_web_view() {
-        assert_eq!(compact(0), "0");
-        assert_eq!(compact(999), "999");
-        assert_eq!(compact(1_500), "1.5k");
-        assert_eq!(compact(1_000), "1.0k");
-        assert_eq!(compact(2_400_000), "2.4M");
+    fn numbers_use_thousands_separators() {
+        assert_eq!(format_number(0), "0");
+        assert_eq!(format_number(999), "999");
+        assert_eq!(format_number(1_000), "1 000");
+        assert_eq!(format_number(2_854), "2 854");
+        assert_eq!(format_number(24_929), "24 929");
+        assert_eq!(format_number(61_081), "61 081");
+        assert_eq!(format_number(1_234_567), "1 234 567");
+        assert_eq!(format_number(-2_854), "-2 854");
     }
 
     #[test]
     fn a_missing_percentile_is_a_dash() {
         assert_eq!(percentile(None), "—");
-        assert_eq!(percentile(Some(1234.0)), "1234 ms");
+        assert_eq!(percentile(Some(1234.0)), "1 234 ms");
         assert_eq!(percentile(Some(12.4)), "12 ms");
+        assert_eq!(percentile(Some(24_929.0)), "24 929 ms");
     }
 
     #[test]

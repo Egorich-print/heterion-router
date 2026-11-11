@@ -4,7 +4,10 @@
 //! colors, same muted/ok/warn/bad tones.
 
 use gpui::prelude::*;
-use gpui::{App, CursorStyle, FontWeight, Hsla, IntoElement, SharedString, Window, div, px, rgba};
+use gpui::{
+    AnyElement, App, CursorStyle, FontWeight, Hsla, IntoElement, SharedString, Window, div, px,
+    rgba,
+};
 
 use crate::theme;
 
@@ -44,6 +47,12 @@ pub fn nav_item(
 ) -> impl IntoElement {
     let label = label.into();
     let selector = nav_selector(&label);
+    let base_bg = if active {
+        theme::panel_2()
+    } else {
+        gpui::transparent_black()
+    };
+    let hover_bg = theme::panel_2();
     div()
         .id(theme::element_id(format!("nav:{}", label)))
         .flex()
@@ -62,11 +71,8 @@ pub fn nav_item(
         } else {
             FontWeight::NORMAL
         })
-        .bg(if active {
-            theme::panel_2()
-        } else {
-            gpui::transparent_black()
-        })
+        .bg(base_bg)
+        .hover(move |style| style.bg(hover_bg).text_color(theme::text()))
         .cursor(CursorStyle::PointingHand)
         .debug_selector(move || selector.clone())
         .on_click(move |_event, window, cx| on_click(window, cx))
@@ -98,6 +104,7 @@ pub fn button(
         .bg(theme::panel())
         .text_size(px(13.0))
         .text_color(theme::text())
+        .hover(|style| style.bg(theme::panel_2()).border_color(theme::muted()))
         .cursor(CursorStyle::PointingHand)
         .debug_selector(move || selector.clone())
         .on_click(move |_event, window, cx| on_click(window, cx))
@@ -144,6 +151,7 @@ pub fn primary_button(
         .text_color(Hsla::from(rgba(0x06101fff)))
         .when(enabled, |this| {
             this.cursor(CursorStyle::PointingHand)
+                .hover(|style| style.opacity(0.9))
                 .on_click(move |_event, window, cx| on_click(window, cx))
         })
         .child(label.into())
@@ -164,9 +172,68 @@ pub fn badge(label: impl Into<SharedString>, tone: Tone) -> impl IntoElement {
         .child(label.into())
 }
 
-/// A neutral tag — the `.tag` of the CSS bundle.
-pub fn tag(label: impl Into<SharedString>) -> impl IntoElement {
-    badge(label, Tone::Neutral)
+/// A status pill that keeps the width of its text.
+///
+/// [`badge`] is a block-level box, so inside a table cell it stretches to the
+/// whole column and the text sits at its left edge. This one is sized by its
+/// content — the pill of a table row looks like a pill, not like a field.
+pub fn compact_badge(label: impl Into<SharedString>, tone: Tone) -> AnyElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_none()
+        .px(px(8.0))
+        .py(px(2.0))
+        .rounded(px(theme::RADIUS_SM))
+        .border_1()
+        .border_color(tone.color())
+        .text_size(px(11.0))
+        .text_color(tone.color())
+        .child(label.into())
+        .into_any_element()
+}
+
+/// A table button that keeps the width of its text.
+///
+/// The rows of every table carry their own actions, and they have to look
+/// like one family: the same height, the same radius, the same type size. A
+/// disabled button stays visible but dead — the row is saving.
+pub fn compact_button(
+    key: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    enabled: bool,
+    on_click: impl Fn(&mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let key = key.into();
+    let label = label.into();
+    let base = div()
+        .id(theme::element_id(key))
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_none()
+        .h(px(24.0))
+        .px(px(10.0))
+        .rounded(px(theme::RADIUS_SM))
+        .border_1()
+        .border_color(theme::border())
+        .bg(theme::panel())
+        .text_size(px(11.0))
+        .text_color(if enabled {
+            theme::text()
+        } else {
+            theme::muted()
+        });
+
+    if enabled {
+        base.cursor(CursorStyle::PointingHand)
+            .on_click(move |_event, window, cx| on_click(window, cx))
+            .child(label)
+            .into_any_element()
+    } else {
+        base.opacity(0.55).child(label).into_any_element()
+    }
 }
 
 /// A bordered panel.

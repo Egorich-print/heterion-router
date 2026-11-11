@@ -7,9 +7,14 @@
 use std::collections::HashMap;
 
 use gpui::prelude::*;
-use gpui::{AnyElement, AnyView, App, Context, Entity, FontWeight, Render, Window, div, px, size};
+use gpui::{
+    AnyElement, AnyView, App, Context, Entity, FontWeight, Render, Subscription, Window, div, px,
+    size,
+};
 
-use crate::api::{self, ApiClient, ApiError, Health, Session};
+use crate::api::{
+    self, ApiClient, ApiError, CreateKeyBody, CreatedKey, Health, KeysResponse, Session,
+};
 use crate::theme;
 use crate::views;
 
@@ -58,6 +63,35 @@ impl Section {
     }
 }
 
+/// The state of the first-run check on the sign-in screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FirstRunState {
+    /// The probe has not completed yet.
+    Unknown,
+    /// A fresh database: no keys exist and auth is open.
+    Fresh,
+    /// Keys exist or auth is required — show the normal sign-in.
+    Normal,
+}
+
+/// Classify the result of `GET /api/keys` for the first-run flow.
+///
+/// - 200 with an empty key list and no read error means a fresh install.
+/// - 401/403, a non-empty list, or a gateway-side read error means the
+///   normal sign-in should be shown.
+/// - A transport or other error is treated as the normal sign-in; the caller
+///   surfaces the gateway-unreachable banner.
+pub fn classify_first_run(result: Result<KeysResponse, ApiError>) -> FirstRunState {
+    match result {
+        Ok(response) if response.error.is_none() && response.keys.is_empty() => {
+            FirstRunState::Fresh
+        }
+        Ok(_) => FirstRunState::Normal,
+        Err(error) if error.status == 401 || error.status == 403 => FirstRunState::Normal,
+        Err(_) => FirstRunState::Normal,
+    }
+}
+
 /// The root view of the desktop app.
 pub struct AppShell {
     section: Section,
@@ -65,11 +99,16 @@ pub struct AppShell {
     key_input: Entity<crate::widgets::TextInput>,
     health: Option<Health>,
     banner: Option<String>,
+    first_run: FirstRunState,
+    creating_key: bool,
+    /// Keeps the session watcher alive: dropping it would stop the shell from
+    /// learning that the session ended.
+    _session_watch: Option<Subscription>,
 }
 
 impl AppShell {
     /// Build the shell. A stored operator key signs the operator straight in;
-    /// otherwise nothing is fetched until they sign in.
+    /// otherwise the first-run probe runs when the sign-in screen appears.
     pub fn new(cx: &mut Context<Self>) -> Self {
         let key_input = cx.new(|cx| crate::widgets::TextInput::new(cx, ""));
         key_input.update(cx, |input, _| {
@@ -83,11 +122,30 @@ impl AppShell {
             key_input,
             health: None,
             banner: None,
+            first_run: FirstRunState::Unknown,
+            creating_key: false,
+            _session_watch: None,
         };
+
+        // The session can end anywhere: the operator signs out, or a view
+        // gets a 401 and drops it (`report_error`). The shell must follow —
+        // otherwise the dashboard stays on screen with a session that no
+        // longer exists, and the operator cannot sign in again.
+        shell._session_watch = Some(cx.observe_global::<Session>(|shell, cx| {
+            if !api::app_mut(cx).global::<Session>().is_authenticated() {
+                shell.views.clear();
+                shell.section = Section::Overview;
+                shell.banner = None;
+                shell.first_run = FirstRunState::Unknown;
+            }
+            cx.notify();
+        }));
 
         if let Some(key) = crate::secret::load() {
             cx.update_global::<Session, _>(|session, _| session.sign_in(key));
             shell.check_health(cx);
+        } else {
+            shell.probe_first_run(cx);
         }
 
         shell
@@ -121,6 +179,15 @@ impl AppShell {
             |result, shell: &mut AppShell, cx| match result {
                 Ok(health) => {
                     shell.health = Some(health);
+                    // The gateway is back: an old "unreachable" banner would
+                    // keep lying about the state of the connection.
+                    if shell
+                        .banner
+                        .as_deref()
+                        .is_some_and(|message| message.starts_with("gateway unreachable"))
+                    {
+                        shell.banner = None;
+                    }
                     cx.notify();
                 }
                 Err(error) => {
@@ -128,6 +195,75 @@ impl AppShell {
                     shell.banner = Some(format!("gateway unreachable: {error}"));
                     cx.notify();
                 }
+            },
+        );
+    }
+
+    /// Probe the gateway to decide whether the first-run key creation should
+    /// be offered. Runs without a bearer token so a fresh database stays open.
+    fn probe_first_run(&mut self, cx: &mut Context<Self>) {
+        self.first_run = FirstRunState::Unknown;
+        let base = api::app_mut(cx).global::<Session>().base().to_string();
+        let client = ApiClient::new(base, "");
+        api::spawn_request(
+            cx,
+            move || client.get_json::<KeysResponse>("/api/keys"),
+            |result, shell: &mut AppShell, cx| {
+                shell.first_run = classify_first_run(result.clone());
+                match result {
+                    Err(error) if error.status == 0 => {
+                        shell.banner = Some(format!("gateway unreachable: {error}"));
+                    }
+                    Err(error) if error.status >= 500 => {
+                        shell.banner = Some(format!("gateway unavailable: {error}"));
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Create the first operator key on a fresh gateway and sign in with it.
+    fn create_first_key(&mut self, cx: &mut Context<Self>) {
+        if self.creating_key {
+            return;
+        }
+        self.creating_key = true;
+        self.banner = None;
+        cx.notify();
+
+        let base = api::app_mut(cx).global::<Session>().base().to_string();
+        let client = ApiClient::new(base, "");
+        let body = CreateKeyBody {
+            name: "operator".to_string(),
+        };
+        api::spawn_request(
+            cx,
+            move || client.post_json::<CreatedKey, _>("/api/keys", &body),
+            |result, shell: &mut AppShell, cx| {
+                shell.creating_key = false;
+                match result {
+                    Ok(created) => {
+                        let key = created.key.trim().to_string();
+                        let mut store_failed = None;
+                        if let Err(error) = crate::secret::store(&key) {
+                            // A failed credential write is not fatal: the
+                            // operator can still work in this session, they
+                            // just have to create or paste a key again after
+                            // a restart.
+                            store_failed = Some(format!("could not store the key: {error}"));
+                        }
+                        cx.update_global::<Session, _>(|session, _| session.sign_in(&key));
+                        shell.key_input.update(cx, |input, _| input.clear());
+                        shell.banner = store_failed;
+                        shell.check_health(cx);
+                    }
+                    Err(error) => {
+                        shell.banner = Some(error.message);
+                    }
+                }
+                cx.notify();
             },
         );
     }
@@ -144,6 +280,8 @@ impl AppShell {
             // work in this session, they just have to paste the key again
             // after a restart.
             self.banner = Some(format!("could not store the key: {error}"));
+        } else {
+            self.banner = None;
         }
 
         cx.update_global::<Session, _>(|session, _| session.sign_in(key.trim()));
@@ -159,58 +297,114 @@ impl AppShell {
         self.views.clear();
         self.section = Section::Overview;
         self.banner = None;
+        self.first_run = FirstRunState::Unknown;
+        self.creating_key = false;
+        self.probe_first_run(cx);
         cx.notify();
     }
 
     /// Render the sign-in screen.
     fn render_login(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let shell = cx.entity();
-        let on_submit = move |_: &mut Window, cx: &mut App| {
-            shell.update(cx, |shell, cx| shell.sign_in(cx));
+        let on_submit = {
+            let shell = shell.clone();
+            move |_: &mut Window, cx: &mut App| {
+                shell.update(cx, |shell, cx| shell.sign_in(cx));
+            }
         };
 
-        div()
+        let mut card = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .w(px(420.0))
+            .p(px(22.0))
+            .bg(theme::panel())
+            .border_1()
+            .border_color(theme::border())
+            .rounded(px(theme::RADIUS))
+            .child(
+                div()
+                    .text_size(px(15.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child("Heterion Router"),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(theme::muted())
+                    .child(
+                        "Paste an API key from api_keys. It is stored on this machine and sent as a bearer token.",
+                    ),
+            );
+
+        if self.first_run == FirstRunState::Fresh {
+            let on_create = {
+                let shell = shell.clone();
+                move |_: &mut Window, cx: &mut App| {
+                    shell.update(cx, |shell, cx| shell.create_first_key(cx));
+                }
+            };
+            let create_label = if self.creating_key {
+                "Creating…"
+            } else {
+                "Create first key"
+            };
+            card =
+                card.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .pt(px(4.0))
+                        .pb(px(4.0))
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::text())
+                                .child("First run"),
+                        )
+                        .child(div().text_size(px(13.0)).text_color(theme::muted()).child(
+                            "This gateway has no keys yet. Create the first one to continue.",
+                        ))
+                        .child(crate::widgets::primary_button(
+                            "login-create-first-key",
+                            create_label,
+                            !self.creating_key,
+                            on_create,
+                        )),
+                );
+        }
+
+        card = card
+            .child(self.key_input.clone())
+            .child(crate::widgets::primary_button(
+                "app-open-dashboard",
+                "Open dashboard",
+                true,
+                on_submit,
+            ));
+
+        let mut root = div()
             .flex()
             .flex_col()
             .items_center()
             .justify_center()
             .size_full()
-            .bg(theme::bg())
-            .child(
+            .gap_3()
+            .bg(theme::bg());
+
+        if let Some(message) = self.banner.clone() {
+            root = root.child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
                     .w(px(420.0))
-                    .p(px(22.0))
-                    .bg(theme::panel())
-                    .border_1()
-                    .border_color(theme::border())
-                    .rounded(px(theme::RADIUS))
-                    .child(
-                        div()
-                            .text_size(px(15.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::text())
-                            .child("Heterion Router"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .text_color(theme::muted())
-                            .child(
-                                "Paste an API key from api_keys. It is stored on this machine and sent as a bearer token.",
-                            ),
-                    )
-                    .child(self.key_input.clone())
-                    .child(crate::widgets::primary_button(
-                        "app-open-dashboard",
-                        "Open dashboard",
-                        true,
-                        on_submit,
-                    )),
-            )
-            .into_any_element()
+                    .child(crate::widgets::error_banner(message)),
+            );
+        }
+
+        root.child(card).into_any_element()
     }
 
     /// Render the sidebar.

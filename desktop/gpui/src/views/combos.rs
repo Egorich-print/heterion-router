@@ -15,8 +15,8 @@ use gpui::{
 use crate::api::{self, Combo, ComboModelSpec, CombosResponse, UpdateComboBody};
 use crate::theme;
 use crate::widgets::{
-    TextInput, Tone, badge, button, cells_row, error_banner, mono, muted, notice_banner,
-    page_header, primary_button, table, table_header, table_row, tag,
+    TextInput, Tone, cells_row, compact_badge, compact_button, error_banner, mono, muted,
+    notice_banner, page_header, primary_button, table, table_row,
 };
 
 /// The subtitle of the page — the `.sub` paragraph of the Svelte view.
@@ -408,17 +408,20 @@ impl CombosView {
                     .text_color(theme::muted())
                     .child(combo.name.clone()),
             )
-            .child(badge(servable, tone))
-            .child(tag(combo.strategy.clone()));
+            .child(header_chip(servable, tone))
+            .child(header_chip(combo.strategy.clone(), Tone::Neutral));
 
         if combo.is_hidden {
-            header = header.child(tag("hidden"));
+            header = header.child(header_chip("hidden", Tone::Neutral));
         }
-        header = header.child(tag(format!("order {}", combo.sort_order)));
+        header = header.child(header_chip(
+            format!("order {}", combo.sort_order),
+            Tone::Neutral,
+        ));
 
         if editing {
             let view = view.clone();
-            header = header.child(action_button(
+            header = header.child(compact_button(
                 format!("combo-cancel:{}", combo.id),
                 "cancel",
                 !saving,
@@ -434,7 +437,7 @@ impl CombosView {
         } else {
             let edit_view = view.clone();
             let combo_id = combo.id.clone();
-            header = header.child(action_button(
+            header = header.child(compact_button(
                 format!("combo-edit:{}", combo.id),
                 "edit",
                 !saving,
@@ -454,7 +457,7 @@ impl CombosView {
             let hide_view = view.clone();
             let combo_id = combo.id.clone();
             let hidden = !combo.is_hidden;
-            header = header.child(action_button(
+            header = header.child(compact_button(
                 format!("combo-hide:{}", combo.id),
                 if combo.is_hidden { "unhide" } else { "hide" },
                 !saving,
@@ -608,7 +611,14 @@ impl CombosView {
         }
 
         let mut rows: Vec<AnyElement> = Vec::new();
-        rows.push(table_header(&["provider / model", "weight", ""]).into_any_element());
+        rows.push(
+            cells_row(vec![
+                header_cell("provider / model"),
+                header_cell("weight"),
+                header_cell(""),
+            ])
+            .into_any_element(),
+        );
         for (index, model) in draft.models.iter().enumerate() {
             rows.push(
                 self.render_draft_row(index, model, saving, cx)
@@ -644,6 +654,9 @@ impl CombosView {
         let cells = vec![
             div()
                 .flex_1()
+                .flex()
+                .items_center()
+                .min_w_0()
                 .child(mono(format!("{}/{}", model.provider, model.model)))
                 .into_any_element(),
             div()
@@ -651,7 +664,8 @@ impl CombosView {
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(action_button(
+                .min_w_0()
+                .child(compact_button(
                     format!("draft-weight-down:{index}"),
                     "−",
                     !saving,
@@ -670,7 +684,7 @@ impl CombosView {
                         .text_color(theme::text())
                         .child(model.weight.to_string()),
                 )
-                .child(action_button(
+                .child(compact_button(
                     format!("draft-weight-up:{index}"),
                     "+",
                     !saving,
@@ -686,7 +700,10 @@ impl CombosView {
                 .into_any_element(),
             div()
                 .flex_1()
-                .child(action_button(
+                .flex()
+                .items_center()
+                .min_w_0()
+                .child(compact_button(
                     format!("draft-remove:{index}"),
                     "✕",
                     !saving,
@@ -715,28 +732,30 @@ impl CombosView {
                 .flex_1()
                 .flex()
                 .flex_row()
+                .items_center()
                 .gap_2()
+                .min_w_0()
                 .child(
                     div()
                         .flex_1()
-                        .flex_col()
+                        .min_w_0()
                         .child(self.add_provider_input.clone()),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .flex_col()
-                        .child(self.add_model_input.clone()),
-                )
+                .child(div().flex_1().min_w_0().child(self.add_model_input.clone()))
                 .into_any_element(),
             div()
                 .flex_1()
-                .flex_col()
-                .child(self.add_weight_input.clone())
+                .flex()
+                .items_center()
+                .min_w_0()
+                .child(div().w(px(90.0)).child(self.add_weight_input.clone()))
                 .into_any_element(),
             div()
                 .flex_1()
-                .child(action_button(
+                .flex()
+                .items_center()
+                .min_w_0()
+                .child(compact_button(
                     "draft-add",
                     "add",
                     !saving && can_add,
@@ -774,19 +793,34 @@ impl CombosView {
                 cells_row(vec![
                     div()
                         .flex_1()
+                        .flex()
+                        .items_center()
+                        .min_w_0()
                         .child(mono(entry.provider.clone()))
                         .into_any_element(),
                     div()
                         .flex_1()
+                        .flex()
+                        .items_center()
+                        .min_w_0()
                         .child(mono(entry.model.clone()))
                         .into_any_element(),
-                    div().flex_1().child(mono_muted(backend)).into_any_element(),
                     div()
                         .flex_1()
+                        .flex()
+                        .items_center()
+                        .min_w_0()
+                        .child(mono_muted(backend))
+                        .into_any_element(),
+                    div()
+                        .flex_1()
+                        .flex()
+                        .items_center()
+                        .min_w_0()
                         .child(if entry.servable {
-                            badge("servable", Tone::Ok).into_any_element()
+                            compact_badge("servable", Tone::Ok).into_any_element()
                         } else {
-                            badge("no backend", Tone::Bad).into_any_element()
+                            compact_badge("no backend", Tone::Bad).into_any_element()
                         })
                         .into_any_element(),
                 ])
@@ -835,11 +869,22 @@ impl Render for CombosView {
         }
 
         div()
+            .id(theme::element_id("combos-page"))
             .flex()
             .flex_col()
-            .p(px(26.0))
-            .gap(px(12.0))
-            .children(blocks)
+            .size_full()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .p(px(26.0))
+                    .pb(px(40.0))
+                    .gap(px(12.0))
+                    .children(blocks),
+            )
     }
 }
 
@@ -923,6 +968,9 @@ fn field(label: &str, input: Entity<TextInput>, width: f32) -> AnyElement {
 fn header_cell(text: &str) -> AnyElement {
     div()
         .flex_1()
+        .flex()
+        .items_center()
+        .min_w_0()
         .text_size(px(11.0))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme::muted())
@@ -991,31 +1039,23 @@ fn checkbox(
         .into_any_element()
 }
 
-/// A secondary button that dims while a save is in flight.
-fn action_button(
-    key: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    enabled: bool,
-    on_click: impl Fn(&mut Window, &mut App) + 'static,
-) -> AnyElement {
-    let key = key.into();
-    if enabled {
-        return button(key, label, on_click).into_any_element();
-    }
-
+/// A compact chip for the combo header (status, strategy, order, flags).
+///
+/// Same height, radius and type size as the header actions so the whole row
+/// reads as one family. `flex_none` keeps it at the size of its content.
+fn header_chip(label: impl Into<SharedString>, tone: Tone) -> AnyElement {
     div()
-        .id(theme::element_id(key))
         .flex()
         .items_center()
-        .px(px(12.0))
-        .py(px(6.0))
+        .justify_center()
+        .flex_none()
+        .h(px(24.0))
+        .px(px(8.0))
         .rounded(px(theme::RADIUS_SM))
         .border_1()
-        .border_color(theme::border())
-        .bg(theme::panel())
-        .text_size(px(13.0))
-        .text_color(theme::muted())
-        .opacity(0.55)
+        .border_color(tone.color())
+        .text_size(px(11.0))
+        .text_color(tone.color())
         .child(label.into())
         .into_any_element()
 }

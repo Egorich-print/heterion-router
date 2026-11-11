@@ -544,6 +544,40 @@ fn restrict_data_files(data_dir: &std::path::Path) -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// Make sure the data directory carries a storage key.
+///
+/// The field encryption takes its key from `STORAGE_ENCRYPTION_KEY` — from the
+/// environment or from `<data dir>/.env`. Without one the gateway refuses to
+/// store a provider secret (it fails closed instead of writing a plaintext
+/// one), so a fresh installation could not accept a key at all. Generating a
+/// key on first start keeps the contract: every secret at rest is `enc:v1:`
+/// ciphertext, and the key itself never leaves the data directory.
+///
+/// An existing `.env` is extended, never rewritten — it may carry other
+/// settings, and the operator may have chosen the key themselves.
+fn ensure_storage_key(data_dir: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    if load_secret(Some(data_dir)).is_some() {
+        return Ok(());
+    }
+
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes)?;
+    let secret = hex::encode(bytes);
+
+    let env_path = data_dir.join(".env");
+    let mut contents = std::fs::read_to_string(&env_path).unwrap_or_default();
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    contents.push_str(&format!("STORAGE_ENCRYPTION_KEY={secret}\n"));
+
+    std::fs::write(&env_path, contents)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))?;
+    tracing::info!("storage encryption key generated at {}", env_path.display());
+    Ok(())
+}
+
 fn validate_auth_policy(config: &GatewayConfig, db: &Db) -> Result<(), Box<dyn std::error::Error>> {
     if config.require_auth || is_loopback_host(&config.host) {
         return Ok(());
@@ -567,6 +601,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = GatewayConfig::from_env();
     std::fs::create_dir_all(&config.data_dir)?;
     restrict_data_files(&config.data_dir)?;
+    ensure_storage_key(&config.data_dir)?;
 
     let log_path = config.data_dir.join("gateway.log");
     let file_appender = tracing_appender::rolling::daily(&config.data_dir, "gateway.log");

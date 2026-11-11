@@ -87,6 +87,20 @@ const EXPECTATIONS: &[Expectation] = &[
     },
     Expectation {
         file: "admin.rs",
+        handler: "providers",
+        response: "ProviderCatalog",
+        rows: &[("provider", "ProviderInfo")],
+        nested: &[],
+    },
+    Expectation {
+        file: "admin.rs",
+        handler: "create_connection",
+        response: "CreateConnectionResponse",
+        rows: &[],
+        nested: &[],
+    },
+    Expectation {
+        file: "admin.rs",
         handler: "keys",
         response: "KeysResponse",
         rows: &[("key", "ApiKey")],

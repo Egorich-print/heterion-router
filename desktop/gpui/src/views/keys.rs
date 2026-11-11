@@ -249,6 +249,7 @@ impl Render for KeysView {
         let form = div()
             .flex()
             .items_center()
+            .flex_wrap()
             .gap(px(8.0))
             .mb(px(14.0))
             .child(
@@ -291,24 +292,39 @@ impl Render for KeysView {
             }
         };
 
-        let mut page = div().flex().flex_col().p(px(26.0)).gap(px(14.0));
-        page = page.child(widgets::page_header(
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .p(px(26.0))
+            .pb(px(40.0))
+            .gap(px(14.0));
+        content = content.child(widgets::page_header(
             "Keys",
             "Operator keys for this gateway. Only prefixes are listed — the full secret is shown once, right after creation. Revocation applies immediately, no restart needed.",
         ));
         if let Some(message) = &self.error {
-            page = page.child(widgets::error_banner(message.clone()));
+            content = content.child(widgets::error_banner(message.clone()));
         }
         if let Some(message) = &self.notice {
-            page = page.child(widgets::notice_banner(message.clone()));
+            content = content.child(widgets::notice_banner(message.clone()));
         }
         if let Some(created) = self.fresh.as_ref() {
-            page = page.child(secret_panel(created, &this));
+            content = content.child(secret_panel(created, &this));
         }
         if let Some((id, name)) = self.pending_revoke.as_ref() {
-            page = page.child(confirm_panel(id, name, &this, self.busy));
+            content = content.child(confirm_panel(id, name, &this, self.busy));
         }
-        page.child(form).child(table)
+        content = content.child(form).child(table);
+
+        div()
+            .id(theme::element_id("keys-page"))
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h(px(0.0))
+            .overflow_y_scroll()
+            .child(content)
     }
 }
 
@@ -457,6 +473,9 @@ fn header_row(columns: &[&'static str]) -> AnyElement {
         .map(|label| {
             div()
                 .flex_1()
+                .flex()
+                .items_center()
+                .min_w_0()
                 .text_size(px(11.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme::muted())
@@ -474,9 +493,12 @@ fn key_row(key: &ApiKey, this: &Entity<KeysView>) -> AnyElement {
     } else if key.revoked {
         let this = this.clone();
         let id = key.id.clone();
-        widgets::button(
-            "keys-restore",
+        widgets::compact_button(
+            // The id names the row: two keys in the same state must not
+            // share one element id, or a click can land on the wrong row.
+            format!("keys-restore:{}", key.id),
             "restore",
+            true,
             move |_: &mut Window, cx: &mut App| {
                 this.update(cx, |view, cx| {
                     if view.busy {
@@ -491,9 +513,10 @@ fn key_row(key: &ApiKey, this: &Entity<KeysView>) -> AnyElement {
         let this = this.clone();
         let id = key.id.clone();
         let name = key.name.clone();
-        widgets::button(
-            "keys-revoke-row",
+        widgets::compact_button(
+            format!("keys-revoke:{}", key.id),
             "revoke",
+            true,
             move |_: &mut Window, cx: &mut App| {
                 this.update(cx, |view, cx| {
                     if view.busy {
@@ -512,7 +535,13 @@ fn key_row(key: &ApiKey, this: &Entity<KeysView>) -> AnyElement {
         status_cell(key),
         stamp_cell(short_time(key.created_at.as_deref())),
         stamp_cell(short_time(key.last_used_at.as_deref())),
-        div().flex_1().child(actions).into_any_element(),
+        div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .min_w_0()
+            .child(actions)
+            .into_any_element(),
     ])
     .into_any_element()
 }
@@ -543,10 +572,13 @@ fn status_cell(key: &ApiKey) -> AnyElement {
 
     let mut cell = div()
         .flex_1()
+        .flex()
         .flex_col()
         .items_start()
+        .justify_center()
         .gap_1()
-        .child(widgets::badge(label, tone));
+        .min_w_0()
+        .child(widgets::compact_badge(label, tone));
     if let Some(revoked_at) = key.revoked_at.as_deref() {
         cell = cell.child(muted_line(format!(
             "revoked {}",
@@ -566,6 +598,9 @@ fn status_cell(key: &ApiKey) -> AnyElement {
 fn cell(text: impl Into<SharedString>) -> AnyElement {
     div()
         .flex_1()
+        .flex()
+        .items_center()
+        .min_w_0()
         .text_size(px(13.0))
         .text_color(theme::text())
         .child(text.into())
@@ -576,6 +611,9 @@ fn cell(text: impl Into<SharedString>) -> AnyElement {
 fn mono_cell(text: impl Into<SharedString>) -> AnyElement {
     div()
         .flex_1()
+        .flex()
+        .items_center()
+        .min_w_0()
         .font(gpui::font(theme::MONO_FAMILY))
         .text_size(px(12.0))
         .text_color(theme::text())
@@ -587,6 +625,9 @@ fn mono_cell(text: impl Into<SharedString>) -> AnyElement {
 fn stamp_cell(text: impl Into<SharedString>) -> AnyElement {
     div()
         .flex_1()
+        .flex()
+        .items_center()
+        .min_w_0()
         .font(gpui::font(theme::MONO_FAMILY))
         .text_size(px(12.0))
         .text_color(theme::muted())

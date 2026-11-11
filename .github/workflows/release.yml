@@ -1,16 +1,18 @@
-# On-demand release: gateway binaries as release assets.
-# Manual only (`workflow_dispatch`); the desktop bundle stays a local build
-# (`desktop/scripts/build-app.sh` needs macOS for a real .app artifact).
+# Release: gateway binaries and macOS .app bundle on tag v* or manual dispatch.
+# Jenkins does not publish releases while this workflow exists (see Jenkinsfile).
+
 name: release
 
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       ref:
         description: "Git ref to build"
         default: main
       tag:
-        description: "Release tag (empty = gateway-YYYYMMDD-<sha>)"
+        description: "Release tag (for manual runs; empty = gateway-YYYYMMDD-<sha>)"
         default: ""
 
 permissions:
@@ -26,8 +28,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
-      - uses: dtolnay/rust-toolchain@1.99.0
+          ref: ${{ github.event_name == 'push' && github.ref_name || inputs.ref }}
+      - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release -p heterion-router-gateway
@@ -35,6 +37,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_IN: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -eu
           TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
@@ -48,15 +51,66 @@ jobs:
             shasum -a 256 "$OUT" > "${OUT}.sha256"
           fi
           ls -la "$OUT" "${OUT}.sha256"
-          if [ -z "$TAG_IN" ]; then
-            TAG="gateway-$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
-          else
+          if [ "$EVENT_NAME" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [ -n "${TAG_IN:-}" ]; then
             TAG="$TAG_IN"
+          else
+            TAG="gateway-$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
           fi
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" "$OUT" "${OUT}.sha256" -R "$GITHUB_REPOSITORY" --clobber
           else
             gh release create "$TAG" "$OUT" "${OUT}.sha256" -R "$GITHUB_REPOSITORY" \
               --title "Gateway ${TAG}" \
-              --notes "heterion-router-gateway binary (${TRIPLE}). Built from ${{ inputs.ref }}."
+              --notes "heterion-router-gateway binary (${TRIPLE}). Built from ${{ github.event_name == 'push' && github.ref_name || inputs.ref }}."
+          fi
+
+  app-macos:
+    name: Heterion Router.app (macos-14, arm64)
+    needs: gateway
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'push' && github.ref_name || inputs.ref }}
+      - uses: dtolnay/rust-toolchain@1.99.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build .app bundle
+        env:
+          # Build script may rely on repo layout; keep default behavior.
+        run: |
+          set -eu
+          bash desktop/scripts/build-app.sh
+      - name: Package and publish app to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_IN: ${{ inputs.tag }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -eu
+          APP_DIR="desktop/gpui/dist/Heterion Router.app"
+          test -d "$APP_DIR" || { echo "missing $APP_DIR"; exit 1; }
+          if [ "$EVENT_NAME" = "push" ]; then
+            TAG="${GITHUB_REF_NAME}"
+          elif [ -n "${TAG_IN:-}" ]; then
+            TAG="$TAG_IN"
+          else
+            TAG="gateway-$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
+          fi
+          ZIP="Heterion-Router-macos-arm64.app.zip"
+          # ditto preserves bundle structure and code signature.
+          ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ZIP"
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$ZIP" > "${ZIP}.sha256"
+          else
+            sha256sum "$ZIP" > "${ZIP}.sha256"
+          fi
+          ls -la "$ZIP" "${ZIP}.sha256"
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ZIP" "${ZIP}.sha256" -R "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$ZIP" "${ZIP}.sha256" -R "$GITHUB_REPOSITORY" \
+              --title "Gateway ${TAG}" \
+              --notes "Heterion Router macOS app and binaries. Built from ${{ github.event_name == 'push' && github.ref_name || inputs.ref }}."
           fi

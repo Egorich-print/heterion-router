@@ -43,13 +43,30 @@
 //   /srv/jenkins/archive               -> sdc1 (78 МБ/с) — артефакты
 //
 // Блокировка: flock /var/lib/jenkins/ci/build.lock (путь внутри контейнера).
+//
+// `--close` обязателен на каждом вызове. flock(2) держит блокировку на
+// открытом описании файла, и любой потомок, унаследовавший этот дескриптор,
+// удерживает её после выхода родителя. Тест-хелпер, который переживает
+// тест (в BTP это `btp-server` из проверки epipe), унаследовал дескриптор
+// гейта и держал эксклюзивную блокировку **после** того, как гейт отработал.
+// Следующая сборка вставала на `flock` молча — ноль строк в консоли — и
+// упиралась в таймаут пайплайна. `--close` закрывает дескриптор в дочернем
+// процессе: блокировку держит сам `flock` и отпускает её, когда команда
+// завершилась, а осиротевший потомок её уже не удерживает.
 
 pipeline {
     agent any
 
     options {
         timestamps()
-        timeout(time: 120, unit: 'MINUTES')
+        // The pipeline timeout is a safety net against a stuck build, not a
+        // schedule: the executor is shared and serial, so a build that is
+        // aborted still blocks every other repository behind it. 120 minutes
+        // was too short for a repository whose own gate takes minutes and
+        // whose release build then rebuilds the whole workspace in release
+        // mode — BTP build #23 (2026-11-03) was aborted by this timeout with
+        // the gate already green (see CI-KNOWN-FAILURES.md § Jenkins).
+        timeout(time: 240, unit: 'MINUTES')
         disableConcurrentBuilds()
         buildDiscarder(logRotator(numToKeepStr: '30', artifactNumToKeepStr: '10'))
         skipDefaultCheckout(true)
@@ -63,7 +80,10 @@ pipeline {
         RUST_BACKTRACE     = '1'
         RUST_BACKTRACE_FULL = '1'
         // rustup подхватывает версию из rust-toolchain.toml репозитория
-        // (1.99.0 / 1.98.0 / stable — все три установлены в контейнере).
+        // (репозиторий теперь использует 1.99.1). В контейнере эта версия может
+        // отсутствовать — при первом обращении rustup скачает её при наличии
+        // сети, либо её нужно доставить в образ Jenkins-контейнера. Не
+        // полагайтесь на предустановленные 1.99.0/1.98.0/stable как на гарантии.
         PATH               = '/var/lib/jenkins/.cargo/bin:/opt/node24/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin'
     }
 
@@ -155,7 +175,7 @@ pipeline {
                         sh """
                             set -e
                             chmod +x '${env.REPO_GATE}' 2>/dev/null || true
-                            flock "${LOCK_FILE}" './${env.REPO_GATE}'
+                            flock --close "${LOCK_FILE}" './${env.REPO_GATE}'
                         """
                     } else {
                         switch (env.PROJECT_TYPE) {
@@ -168,11 +188,11 @@ pipeline {
                                     # fmt — предупреждение: в части репозиториев
                                     # (Antigravity) дерево намеренно не отформатировано,
                                     # и строгий гейт остаётся в CI самого репозитория.
-                                    flock "${LOCK_FILE}" cargo fmt --all -- --check || echo "WARN: cargo fmt --check не пройден (строгий гейт — в CI репозитория)"
+                                    flock --close "${LOCK_FILE}" cargo fmt --all -- --check || echo "WARN: cargo fmt --check не пройден (строгий гейт — в CI репозитория)"
                                     # clippy без -D warnings: реальные ошибки компиляции
                                     # валят сборку, а предупреждения — зона CI репозитория.
-                                    flock "${LOCK_FILE}" cargo clippy --all-targets --all-features
-                                    flock "${LOCK_FILE}" cargo test --all-targets
+                                    flock --close "${LOCK_FILE}" cargo clippy --all-targets --all-features
+                                    flock --close "${LOCK_FILE}" cargo test --all-targets
                                 '''
                                 break
                             case 'node':
@@ -181,39 +201,39 @@ pipeline {
                                     node --version
                                     npm --version
                                     npm ci
-                                    flock "${LOCK_FILE}" npm run lint
-                                    flock "${LOCK_FILE}" npm test
+                                    flock --close "${LOCK_FILE}" npm run lint
+                                    flock --close "${LOCK_FILE}" npm test
                                 '''
                                 break
                             case 'make':
                                 sh '''
                                     set -e
                                     if command -v just >/dev/null 2>&1 && [ -f Justfile ]; then
-                                      flock "${LOCK_FILE}" just --list >/dev/null
+                                        flock --close "${LOCK_FILE}" just --list >/dev/null
                                     else
-                                      make -n >/dev/null
+                                        make -n >/dev/null
                                     fi
                                 '''
                                 break
                             default:
                                 // shell-проекты: синтаксис всех tracked *.sh и *.py.
                                 // Списки — во временные файлы: перенаправление
-                                // "done < file" работает в dash, process
+                                // "done < file" работает in dash, process
                                 // substitution "<(...)" — нет.
                                 sh '''
                                     set -e
                                     fail=0
                                     git ls-files '*.sh' > /tmp/jenkins_gate_sh.txt || true
                                     while IFS= read -r f; do
-                                      [ -n "$f" ] || continue
-                                      bash -n "$f" || { echo "syntax error: $f"; fail=1; }
+                                        [ -n "$f" ] || continue
+                                        bash -n "$f" || { echo "syntax error: $f"; fail=1; }
                                     done < /tmp/jenkins_gate_sh.txt
                                     git ls-files '*.py' > /tmp/jenkins_gate_py.txt || true
                                     if command -v python3 >/dev/null 2>&1; then
-                                      while IFS= read -r f; do
-                                        [ -n "$f" ] || continue
-                                        python3 -m py_compile "$f" || { echo "python error: $f"; fail=1; }
-                                      done < /tmp/jenkins_gate_py.txt
+                                        while IFS= read -r f; do
+                                            [ -n "$f" ] || continue
+                                            python3 -m py_compile "$f" || { echo "python error: $f"; fail=1; }
+                                        done < /tmp/jenkins_gate_py.txt
                                     fi
                                     [ "$fail" = 0 ] || exit 1
                                     echo "все tracked shell/python скрипты разбираются"
@@ -231,7 +251,7 @@ pipeline {
                         case 'rust':
                             sh '''
                                 set -e
-                                flock "${LOCK_FILE}" cargo build --release
+                                flock --close "${LOCK_FILE}" cargo build --release
                                 mkdir -p /srv/jenkins/archive/"${JOB_NAME}"
                                 # Копируем бинарники в архив через xargs -0 + cp -t.
                                 #
@@ -251,7 +271,7 @@ pipeline {
                         case 'node':
                             sh '''
                                 set -e
-                                flock "${LOCK_FILE}" npm run build --if-present
+                                flock --close "${LOCK_FILE}" npm run build --if-present
                             '''
                             break
                         default:

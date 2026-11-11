@@ -1,105 +1,172 @@
 # Heterion Router
 
-> OpenAI-совместимый шлюз к LLM-провайдерам на Rust: один `baseURL`, один ключ,
-> роутинг по комбо, failover, встроенный дашборд, нативный десктоп на GPUI.
-> Sibling of [Heterion](https://github.com/Egorich-print/heterion) (там —
-> инференс; здесь — маршрутизация). Successor of OmniRoute-Rust.
+Heterion Router — OpenAI-совместимый шлюз к LLM-провайдерам на Rust: один `baseURL` и один свой API-ключ вместо ключа каждого провайдера, роутинг по комбо с failover, кэш, бюджеты, guardrails, аудит и встроенный админ-интерфейс — веб-дашборд на Svelte и нативное приложение на GPUI. Шлюз держит ключи провайдеров в своей зашифрованной БД, а клиентам (OpenAI SDK, Claude Code, Cursor, агенты) выдаёт уже свои ключи.
 
-**Статус:** Active · **Лицензия:** MIT (см. `LICENSE`: сохранён копирайт
-исходного upstream `diegosouzapw`).
+![License](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)
+![Platform](https://img.shields.io/badge/gateway-Linux%20%7C%20macOS%20%C2%B7%20desktop-macOS-lightgrey.svg)
+![Version](https://img.shields.io/badge/version-0.1.0-informational.svg)
 
-## Быстрый старт
+![Heterion Router](desktop/gpui/packaging/icons/icon.png)
+
+## Быстрый старт для нового пользователя
+
+Терминал и `curl` для настройки **не нужны**: всё делается в приложении.
+
+1. **Установка.** Соберите или возьмите бандл `Heterion Router.app` и перетащите его в `/Applications`.
+   Подпись приложения — ad-hoc, поэтому для первого запуска на чужом Mac нужен один из двух шагов:
+   правой кнопкой по приложению → «Открыть», либо снять карантин:
+   ```sh
+   xattr -cr "/Applications/Heterion Router.app"
+   ```
+   Подробности — в [`docs/INSTALL.md`](docs/INSTALL.md).
+
+2. **Первый запуск.** Приложение само поднимает свой sidecar-шлюз на порту `20129`
+   и работает с каталогом данных `~/.heterion-router` (legacy-каталог `~/.omniroute`
+   читается, но новый используется по умолчанию).
+
+3. **Первый ключ.** На экране входа есть кнопка **Create first key**: на свежей БД
+   аутентификация открыта, поэтому ключ выпускается прямо из приложения. Он сохраняется
+   в `<data dir>/desktop/operator-key.json` (файл `0600`, каталог `0700`) и используется
+   и для входа, и для запросов к `/v1/*`.
+
+4. **Ключ провайдера.** Раздел **Providers** → **Add provider** → выберите провайдера
+   из каталога → вставьте свой API-ключ провайдера → **Save**. Ключ шифруется и ложится
+   в БД шлюза (префикс `enc:v1:`), в открытом виде он больше не показывается. Чтобы
+   провайдер начал обслуживаться, перезапустите шлюз (**Restart now**).
+
+5. **Проверка.** Вызов OpenAI-совместимого эндпоинта (порт sidecar-шлюза — `20129`,
+   у установленного сервиса — `20128`):
+   ```sh
+   curl http://127.0.0.1:20129/v1/chat/completions \
+     -H "Authorization: Bearer sk-ваш-ключ" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "model": "имя-комбо-или-модели",
+       "messages": [{"role": "user", "content": "Привет"}]
+     }'
+   ```
+   `sk-ваш-ключ` — плейсхолдер: подставьте ключ, выпущенный в приложении.
+
+## Возможности
+
+- **Роутинг по комбо.** Вместо выбора одной модели — список кандидатов с приоритетами;
+  шлюз сам выбирает живой backend и переключается на следующего.
+- **Failover и breaker.** Транзиентные ошибки и обрывы до первого байта приводят к
+  переходу на следующего кандидата; breaker отключает заведомо мёртвый backend.
+  4xx от провайдера breaker не роняют.
+- **Кэш с разделением по bearer.** Ответы кэшируются (TTL — час) и разнесены по
+  предъявленному ключу: один ключ не читает ответы, закешированные другим.
+  Стриминг кэш обходит и на чтении, и на записи.
+- **Бюджеты.** Дневные лимиты и лимиты запросов на ключ; по умолчанию всё безлимитно.
+- **Guardrails.** Проверки входящих запросов (по умолчанию — режим `warn`): в тело,
+  заголовок и лог попадает только имя проверки, совпадение — никогда.
+- **Аудит и атрибуция.** `call_logs` и `usage_history` с реальной атрибуцией к
+  провайдеру, подключению и комбо, а не заглушкой `provider = "routing"`.
+- **Стриминг.** SSE для всех поддерживаемых форматов, включая Responses.
+- **Форматы API.** OpenAI Chat (`/v1/chat/completions`), OpenAI Responses
+  (`/v1/responses`), Anthropic Messages (`/v1/messages`), Embeddings
+  (`/v1/embeddings`), список моделей (`/v1/models`).
+- **Поиск Exa как модель.** `exa/exa-search` — обычная модель в чат-поверхности:
+  запрос — последнее сообщение пользователя, ответ — цитированный блок.
+- **Нативный десктоп.** Приложение на GPUI (не Electron, не Tauri): свой sidecar-шлюз,
+  свой операторский ключ в файле, разделы **Overview**, **Combos**, **Providers**, **Keys**,
+  **Usage**, **Logs**, **Playground**.
+- **Веб-дашборд.** Тот же admin-API, что и у десктопа, на Svelte 5 + Vite; шлюз
+  раздаёт его сам.
+
+## Сборка из исходников
+
+Требования:
+
+- **Rust 1.99.1** — пин в `rust-toolchain.toml`; edition `2024`, MSRV манифестов `1.99`.
+- **Node.js 24** — только для веб-дашборда.
+- **macOS + Xcode** — для десктопа: gpui компилирует Metal-шейдеры через `xcrun metal`.
 
 ```sh
-cargo run -p heterion-router-gateway        # :20129 по умолчанию
-# после npm --prefix desktop/ui run build:
-open http://127.0.0.1:20129/                # dev gateway dashboard
+# шлюз
+cargo build -p heterion-router-gateway
+
+# веб-дашборд (собирается в desktop/ui/dist и раздаётся шлюзом)
+npm --prefix desktop/ui ci && npm --prefix desktop/ui run build
+
+# нативное приложение macOS → desktop/gpui/dist/Heterion Router.app
+desktop/scripts/build-app.sh
 ```
 
-`cargo run` поднимает dev gateway на `127.0.0.1:20129`. Vite dev-proxy в
-`desktop/ui/vite.config.js` по умолчанию указывает на `20128`, поэтому для
-одновременного запуска UI и dev gateway нужен явный `VITE_GATEWAY_URL=http://127.0.0.1:20129`.
-
-Установленный launchd-сервис `com.heterion.router` — отдельная машинно-локальная
-конфигурация на `20128`; plist не входит в репозиторий. На текущей машине он
-слушает `0.0.0.0:20128` (LAN bind), поэтому для публичного доступа нужен
-внешний TLS/VPN/reverse-proxy и API key.
+Проверка качества — ровно то, что гоняет CI:
 
 ```sh
+scripts/ci/check.sh    # cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+```
+
+Запуск сервиса на macOS (plist машинно-локальный, в репозитории не хранится):
+
+```sh
+scripts/deploy-service.sh
 launchctl kickstart -k gui/$(id -u)/com.heterion.router   # если job уже установлен
 curl -s http://127.0.0.1:20128/healthz
 ```
 
-Сборка дашборда и десктопа:
+## Карта репозитория
 
-```sh
-npm --prefix desktop/ui ci && npm --prefix desktop/ui run build   # веб-дашборд
-desktop/scripts/build-app.sh                                       # нативный .app
-```
+| Путь | Что внутри |
+| --- | --- |
+| `crates/heterion-router-{config,core,crypto,db,gateway,http,providers,routing,translate,usage}/` | Workspace: конфиг, ядро, крипто (`enc:v1:`), БД (SQLite), axum-шлюз, HTTP-клиент, реестр провайдеров, роутинг, перевод форматов, учёт usage. |
+| `crates/heterion-router-gateway/` | Бинарь `heterion-router-gateway` — `/v1/*`, `/api/*`, раздача дашборда. |
+| `crates/heterion-router-providers/registry.json` | Каталог провайдеров и моделей, из которого берётся UI-список. |
+| `desktop/gpui/` | Нативная оболочка на GPUI (вне workspace, собирается отдельно). |
+| `desktop/ui/` | Веб-дашборд на Svelte 5 + Vite. |
+| `desktop/scripts/build-app.sh` | Сборка `.app`: оболочка + sidecar-шлюз, иконка, `Info.plist`, ad-hoc подпись. |
+| `docs/` | Документация: решения (ADR), отчёты, шпаргалка агента. |
+| `scripts/` | `deploy-service.sh` (launchd-сервис), `ci/check.sh` (гейт CI). |
+| `.github/workflows/`, `Jenkinsfile` | CI: GitHub Actions и локальный Jenkins. |
 
-Десктоп — нативное приложение на GPUI (`desktop/gpui`, ADR-023); собирается
-под macOS и требует Xcode (gpui компилирует Metal-шейдеры через `xcrun metal`).
-Локальная сборка проверена, но `.app` adhoc-signed и не notarized: это
-developer-machine artifact, не готовый дистрибутив.
+## Провайдеры
 
-## Как это устроено
+Каталог провайдеров лежит в `crates/heterion-router-providers/registry.json`; это
+сотни записей, но список в интерфейсе показывает только те, что проходят
+структурную проверку. Полный разбор — каталог, авторизация, форматы, как добавить
+ключ — в [`docs/PROVIDERS.md`](docs/PROVIDERS.md).
 
-```
-[ клиент ] ──► heterion-router-gateway (axum, :20128 сервис / :20129 dev)
-                   ├─ /v1/*      OpenAI-совместимый API (стриминг SSE)
-                   ├─ /api/*     admin-API + Svelte-дашборд
-                   └─ router ──► transports (openai chat / openai-responses /
-                                  gemini / grok-cli / keyless local)
-                 │
-              SQLite (~/.heterion-router/storage.sqlite)
-```
+Ключевой провайдер `heterion-local` работает без ключа (keyless, openai-формат) и
+указывает на локальный инференс-сервер Heterion; адрес переопределяется переменной
+`HETERION_LOCAL_BASE_URL`.
 
-Registry содержит 278 provider entries и 2717 model entries, но это каталог:
-в текущем коде структурно проходят builder 259 providers / 2108 models;
-из них 253 / 1916 имеют HTTP(S) base URL, а 6 / 192 используют неподдерживаемые
-схемы (`wss://`, `stdio`, CLI/ACP). Ещё 19 providers / 609 models не проходят
-format/base-URL gate. Список проверенных runtime-транспортов и ограничений — в
-`docs/research/PROJECT-AUDIT-2026-09.md`.
+## Установка на macOS
 
-- **Комбо** вместо выбора модели: список кандидатов из БД с приоритетами;
-  `weight` сохраняется для dashboard, но Rust router использует порядок
-  списка (см. `STATUS.md` и `crates/heterion-router-gateway/src/combos.rs`).
-- **Heterion (нативно):** провайдер `heterion-local` — keyless
-  OpenAI-совместимый бэкенд на Heterion-сервер
-  (`http://127.0.0.1:8080/v1`, переопределяется `HETERION_LOCAL_BASE_URL`).
-  Подключение:
-   ```sql
-   INSERT INTO provider_connections (id, provider, is_active, created_at, updated_at)
-   VALUES (lower(hex(randomblob(16))), 'heterion-local', 1, datetime('now'), datetime('now'));
-   ```
-   и комбо с моделью `heterion-local/default` (model id проходит транзитом —
-   Heterion отдаёт загруженные веса под любым именем). В текущей рабочей
-   БД активного `provider_connections` для этого провайдера нет, поэтому
-   backend сейчас не поднимается автоматически.
-- **Ключи:** `HETERION_ROUTER_*` первичны, `OMNIROUTE_*` — fallback на один
-  цикл (см. `crates/heterion-router-config/src/config.rs`).
-- **Заморожено навсегда:** `enc:v1:` + соль `omniroute-field-encryption-v1`
-  (в живых БД лежат значения с ней), порты `20128/20129`.
-- **Границы доступа:** `/healthz` и статика SPA публичны; `/v1/*` требует
-  bearer key при наличии ключей, `/api/*` — `manage` scope. Не выставляйте
-  gateway на `0.0.0.0` без TLS/VPN и ключа.
+Подробная инструкция — в [`docs/INSTALL.md`](docs/INSTALL.md): бандл `.app`, первый
+запуск, выпуск ключей, диагностика. Если коротко: приложение подписывается ad-hoc и
+не нотарифицируется, поэтому для первого запуска на чужом Mac нужен один из двух
+шагов (см. раздел «Быстрый старт»).
 
-## OmniRoute — референс
+## API
 
-JS-реализация заморожена и сюда не входит: архивный репозиторий
-[OmniRoute-Rust](https://github.com/Egorich-print/OmniRoute-Rust),
-`/Volumes/Netac_SSD/ai-workstation/Archives/OmniRoute/`, upstream
-[diegosouzapw/OmniRoute](https://github.com/diegosouzapw/OmniRoute).
-Осознанно не портировано: `/api/mcp/*`, OAuth-перелогин провайдеров,
-служебные страницы (биллинг, телеграм, геймификация).
+Публичный API (OpenAI-совместимый):
+
+| Метод и путь | Что это |
+| --- | --- |
+| `POST /v1/chat/completions` | Чаты, стриминг SSE. |
+| `POST /v1/responses` | Responses-протокол OpenAI. |
+| `POST /v1/messages` | Anthropic-формат сообщений. |
+| `POST /v1/embeddings` | Эмбеддинги. |
+| `GET /v1/models` | Список доступных моделей и комбо. |
+| `GET /healthz` | Проверка живости, публичен. |
+
+Admin-API (`/api/*`) — обзор, комбо, подключения, ключи, usage, журнал, бюджеты,
+guardrails; требует ключ оператора со scope `manage`. Полный контракт — в
+[`docs/AGENT-ROUTER-GUIDE.md`](docs/AGENT-ROUTER-GUIDE.md).
+
+## Лицензия
+
+**GPL-3.0-or-later.** Полный текст — в [`LICENSE`](LICENSE).
 
 ## Документы
 
 | Что | Где |
 | --- | --- |
-| Статус | `STATUS.md` |
-| План следующей миссии | `docs/MISSION-2026-10.md` |
-| Решения (ADR) | `docs/adr/` |
-| Аудит проекта | `docs/research/PROJECT-AUDIT-2026-09.md` |
-| Frozen upstream JS history | `docs/history/` (не история Rust-порта) |
-| Обзор и связи | `Obsidian Vault/Projects/heterion-router/` |
+| Текущий статус проекта | [`STATUS.md`](STATUS.md) |
+| Решения (ADR) | [`docs/adr/`](docs/adr/) |
+| Шпаргалка для агента: модели, комбо, exa-search | [`docs/AGENT-ROUTER-GUIDE.md`](docs/AGENT-ROUTER-GUIDE.md) |
+| Поддерживаемые провайдеры | [`docs/PROVIDERS.md`](docs/PROVIDERS.md) |
+| Установка на macOS | [`docs/INSTALL.md`](docs/INSTALL.md) |
+| Changelog | [`CHANGELOG.md`](CHANGELOG.md) |

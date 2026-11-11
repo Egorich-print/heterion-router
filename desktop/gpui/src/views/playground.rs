@@ -303,38 +303,57 @@ impl PlaygroundView {
 
     /// The meta line and the answer of the last request.
     fn render_answer(&self) -> AnyElement {
-        if self.meta.is_empty() {
-            return div().into_any_element();
-        }
-
-        div()
+        let mut section = div()
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .child(muted(self.meta.clone()))
-            .child(
+            .child(crate::widgets::section_title("Response").into_any_element());
+
+        if self.meta.is_empty() {
+            let placeholder = if self.sending {
+                "Sending request…"
+            } else {
+                "Send a request to see the response here."
+            };
+            section = section.child(
                 div()
+                    .id(theme::element_id("playground-response-empty"))
                     .bg(theme::panel())
                     .border_1()
                     .border_color(theme::border())
                     .rounded(px(theme::RADIUS))
                     .p(px(12.0))
+                    .min_h(px(120.0))
+                    .child(muted(placeholder)),
+            );
+        } else {
+            section = section.child(muted(self.meta.clone())).child(
+                div()
+                    .id(theme::element_id("playground-response-body"))
+                    .bg(theme::panel())
+                    .border_1()
+                    .border_color(theme::border())
+                    .rounded(px(theme::RADIUS))
+                    .p(px(12.0))
+                    .min_h(px(120.0))
                     .font(gpui::font(theme::MONO_FAMILY))
                     .text_size(px(12.0))
                     .text_color(theme::text())
                     .whitespace_normal()
                     .child(self.answer.clone()),
-            )
-            .into_any_element()
+            );
+        }
+
+        section.into_any_element()
     }
 }
 
 impl Render for PlaygroundView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let content = div()
             .flex()
             .flex_col()
-            .p(px(26.0))
+            .w_full()
             .gap(px(14.0))
             .child(page_header(
                 "Playground",
@@ -342,7 +361,25 @@ impl Render for PlaygroundView {
             ))
             .child(self.render_error())
             .child(self.render_form(cx))
-            .child(self.render_answer())
+            .child(self.render_answer());
+
+        let page = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .w_full()
+            .id(theme::element_id("playground-page"))
+            .overflow_y_scroll()
+            .items_start()
+            .child(content);
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .w_full()
+            .p(px(theme::CONTENT_PADDING_X))
+            .child(page)
     }
 }
 

@@ -235,9 +235,10 @@ Plist — машинно-локальный (`~/Library/LaunchAgents`), не х�
 code path: в текущей рабочей БД нет активной строки `provider_connections`, и
 backend не поднимается. URL по умолчанию `http://127.0.0.1:8080/v1`, override —
 `HETERION_LOCAL_BASE_URL`. Model id — транзит на Heterion (там один загруженный
-вес). Registry содержит 278 providers; 259 проходят structural builder gate, но
-только 253 имеют HTTP(S) base URL, а 6 используют неподдерживаемые схемы.
-Детали в `docs/research/PROJECT-AUDIT-2026-09.md`.
+вес). Registry содержит 280 providers / 2741 models; в каталог формы добавления
+ключа (`GET /api/providers`) проходят 221 запись, 7 используют неподдерживаемые
+схемы, 43 — без моделей. Перечень: `docs/PROVIDERS.md`; метод аудита:
+`docs/research/PROJECT-AUDIT-2026-09.md`.
 
 ## Деньги и безопасность (M3, действует с 2026-10-02)
 

@@ -15,7 +15,7 @@ Layer: Intelligence / Execution
 Status: Active — planning MISSION-2026-10
 Repository: ai-workstation/Projects/heterion-router
 GitHub: https://github.com/Egorich-print/heterion-router
-License: MIT
+License: GPL-3.0-or-later
 Manifest version: 0.1.0
 Baseline commit: 51dfe6d          # + рабочее дерево аудита поверх него
 Mission started: 2026-09-29
@@ -50,12 +50,16 @@ Mission started: 2026-09-29
   transient retry и pre-first-byte stream failover работают. `weight`,
   `strategy:auto`, `maxSetRetries` и `setRetryDelayMs` парсятся, но не
   влияют на routing.
-- **Registry — каталог, не гарантия доступности**: 278 providers / 2717
-  models в рабочем дереве (в `HEAD` — 278 / 2715) в `registry.json`; structurally
-  проходят builder 259 / 2108, из них 253 / 1916 имеют HTTP(S) base URL, а
-  6 / 192 используют неподдерживаемые схемы. Ещё 19 providers / 609 models не
-  проходят format/base-URL gate; 61 HTTP-capable provider / 959 models игнорируют
-  bespoke `executor` и обслуживаются generic path.
+- **Registry — каталог, не гарантия доступности**: 280 providers / 2741 models в
+  `registry.json`; 274 записей имеют формат, который моделирует ядро, ещё одна
+  (`exa-search`) обслуживается собственным исполнителем. В каталог формы
+  добавления ключа (`GET /api/providers`) проходят 221 запись: смоделированный
+  формат или свой исполнитель + HTTP(S) base URL + хотя бы одна модель. 7
+  записей используют неподдерживаемые схемы (`auggie`, `codex-app-server`,
+  `copilot-m365-web`, `copilot-web`, `devin-cli`, `devin-cli-agentic`,
+  `zcode`), 43 записи не имеют моделей. Перечень и порядок разбора — в
+  `docs/PROVIDERS.md`; метод аудита — в
+  `docs/research/PROJECT-AUDIT-2026-09.md`.
 - **Auth**: DB failures fail closed; admin mutations требуют `manage`;
   model allow-list применяется к Chat/Responses; non-loopback bind без ключа
   не стартует. Новые Rust-issued keys хранятся по SHA-256, legacy plaintext

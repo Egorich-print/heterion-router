@@ -166,7 +166,7 @@ const LOGS: &str = r#"{
             "model": "gpt-5.6-sol",
             "requested_model": "gpt-5.6-sol",
             "provider": "openai",
-            "status": "200",
+            "status": 200,
             "duration_ms": 123,
             "tokens_input": 10,
             "tokens_output": 20,

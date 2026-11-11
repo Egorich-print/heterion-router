@@ -1,19 +1,19 @@
 //! Logs — the API call log and the router's application log.
 //!
 //! Ported from `desktop/ui/src/views/Logs.svelte`: two sources, a row limit
-//! and a refresh action. Both lists are drawn with `gpui::uniform_list`, so a
-//! log with thousands of rows only costs the rows that are on screen.
+//! and a refresh action. The call log uses a shared column model so the
+//! header and every data row stay aligned; both logs render inside bounded,
+//! scrollable panels.
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, CursorStyle, ElementId, FontWeight, IntoElement, Render,
-    SharedString, Window, div, px,
+    AnyElement, App, Context, CursorStyle, FontWeight, IntoElement, Render, SharedString, Window,
+    div, px,
 };
-use serde::Deserialize;
 
 use crate::api::{self, AppLogsResponse, CallLog, LogsResponse};
 use crate::theme;
-use crate::widgets::{self, Tone};
+use crate::widgets::{self, ColumnAlign, ColumnDef, ColumnSizing, Tone};
 
 /// Which of the two logs the page shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,15 +30,63 @@ const LIMITS: [usize; 4] = [25, 50, 100, 250];
 /// The row count the view starts with.
 const DEFAULT_LIMIT: usize = 50;
 
-/// The height of one row of the call log. Every row has the same height —
-/// the virtualized list measures the first one and reuses it.
+/// The height of one row of the call log.
 const ROW_HEIGHT: f32 = 30.0;
 
 /// The width of the status column.
-const STATUS_WIDTH: f32 = 72.0;
+const STATUS_WIDTH: u32 = 72;
 
 /// The width of the numeric columns.
-const NUMBER_WIDTH: f32 = 64.0;
+const NUMBER_WIDTH: u32 = 64;
+
+/// The shared column model of the call log table.
+///
+/// Header and data rows are both built from this definition, so their widths
+/// and alignment cannot drift apart.
+fn call_log_columns() -> [ColumnDef; 8] {
+    [
+        ColumnDef {
+            label: "TIME",
+            sizing: ColumnSizing::Flex,
+            align: ColumnAlign::Left,
+        },
+        ColumnDef {
+            label: "STATUS",
+            sizing: ColumnSizing::Fixed(STATUS_WIDTH),
+            align: ColumnAlign::Left,
+        },
+        ColumnDef {
+            label: "MODEL",
+            sizing: ColumnSizing::Flex,
+            align: ColumnAlign::Left,
+        },
+        ColumnDef {
+            label: "PROVIDER",
+            sizing: ColumnSizing::Flex,
+            align: ColumnAlign::Left,
+        },
+        ColumnDef {
+            label: "MS",
+            sizing: ColumnSizing::Fixed(NUMBER_WIDTH),
+            align: ColumnAlign::Right,
+        },
+        ColumnDef {
+            label: "IN",
+            sizing: ColumnSizing::Fixed(NUMBER_WIDTH),
+            align: ColumnAlign::Right,
+        },
+        ColumnDef {
+            label: "OUT",
+            sizing: ColumnSizing::Fixed(NUMBER_WIDTH),
+            align: ColumnAlign::Right,
+        },
+        ColumnDef {
+            label: "ERROR",
+            sizing: ColumnSizing::GrowBasis(200),
+            align: ColumnAlign::Left,
+        },
+    ]
+}
 
 /// The Logs section.
 pub struct LogsView {
@@ -87,15 +135,13 @@ impl LogsView {
         let limit = self.limit;
         api::spawn_request(
             cx,
-            move || client.get_json::<WireLogsResponse>(&format!("/api/logs?limit={limit}")),
+            move || client.get_json::<LogsResponse>(&format!("/api/logs?limit={limit}")),
             |result, view: &mut LogsView, cx| {
                 match result {
                     Ok(payload) => {
-                        view.data = Some(LogsResponse {
-                            logs: payload.logs.into_iter().map(CallLog::from).collect(),
-                        });
                         // The gateway reports a failed read in the payload itself.
-                        view.error = payload.error;
+                        view.error = payload.error.clone();
+                        view.data = Some(payload);
                     }
                     Err(error) => {
                         view.error = Some(error.to_string());
@@ -235,7 +281,7 @@ impl LogsView {
     }
 
     /// The call log: a table of the most recent calls.
-    fn render_calls(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_calls(&self, _cx: &mut Context<Self>) -> AnyElement {
         let Some(payload) = self.data.as_ref() else {
             // Nothing loaded yet: either the request is in flight or it
             // failed, and the banner says which.
@@ -250,52 +296,47 @@ impl LogsView {
                 .into_any_element();
         };
 
-        let this = cx.entity();
-        let count = payload.logs.len();
-        let list = gpui::uniform_list(
-            ElementId::named_usize("logs-calls", 0),
-            count,
-            move |range, _window, cx| -> Vec<AnyElement> {
-                let view = this.read(cx);
-                let Some(payload) = view.data.as_ref() else {
-                    return Vec::new();
-                };
-                range
-                    .filter_map(|index| payload.logs.get(index))
-                    .map(call_row)
-                    .collect()
-            },
-        );
+        let columns = call_log_columns();
+        let panel = widgets::table_panel(std::iter::empty::<AnyElement>())
+            .flex_1()
+            .min_h_0()
+            .child(widgets::defined_header(&columns));
 
-        let panel = div()
-            .flex()
-            .flex_col()
-            .bg(theme::panel())
-            .border_1()
-            .border_color(theme::border())
-            .rounded(px(theme::RADIUS))
-            .overflow_hidden();
-
-        let body = div().flex().flex_col().flex_1().min_h_0();
-        if count == 0 {
+        if payload.logs.is_empty() {
             // The table keeps its header, the note sits below it.
-            body.child(panel.child(header_row()))
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(panel)
                 .child(widgets::empty_state("No calls recorded yet."))
                 .into_any_element()
         } else {
-            body.child(
-                panel
-                    .flex_1()
-                    .min_h_0()
-                    .child(header_row())
-                    .child(list.flex_1().min_h_0()),
-            )
-            .into_any_element()
+            let rows = div()
+                .id(theme::element_id("logs-calls-scroll"))
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_y_scroll()
+                .children(payload.logs.iter().map(|row| call_row(&columns, row)));
+
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .child(panel.child(rows))
+                .into_any_element()
         }
     }
 
     /// The application log: one mono line per entry.
-    fn render_application(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_application(&self, _cx: &mut Context<Self>) -> AnyElement {
         if self.app_loading {
             return div().child(widgets::muted("loading…")).into_any_element();
         }
@@ -305,26 +346,28 @@ impl LogsView {
                 .into_any_element();
         }
 
-        let this = cx.entity();
-        let count = self.app_lines.len();
-        let list = gpui::uniform_list(
-            ElementId::named_usize("logs-application", 0),
-            count,
-            move |range, _window, cx| -> Vec<AnyElement> {
-                let view = this.read(cx);
-                range
-                    .filter_map(|index| view.app_lines.get(index))
-                    .map(|line| application_line(line))
-                    .collect()
-            },
-        );
+        let lines = div()
+            .id(theme::element_id("logs-app-scroll"))
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scroll()
+            .children(self.app_lines.iter().map(|line| application_line(line)));
 
         div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
-            .child(list.flex_1().min_h_0())
+            .w_full()
+            .child(
+                widgets::table_panel(std::iter::empty::<AnyElement>())
+                    .flex_1()
+                    .min_h_0()
+                    .child(lines),
+            )
             .into_any_element()
     }
 }
@@ -336,102 +379,30 @@ impl Render for LogsView {
             .flex_col()
             .p(px(26.0))
             .gap(px(12.0))
-            .h_full()
+            .size_full()
             .min_h_0()
+            .overflow_hidden()
             .child(widgets::page_header(
                 "Logs",
                 "Recent API calls and the router's own log.",
             ))
             .child(self.render_toolbar(cx))
             .child(self.render_banner())
-            .child(match self.source {
-                LogSource::Calls => self.render_calls(cx),
-                LogSource::Application => self.render_application(cx),
-            })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(match self.source {
+                        LogSource::Calls => self.render_calls(cx),
+                        LogSource::Application => self.render_application(cx),
+                    }),
+            )
             .child(log_note())
             .into_any_element()
     }
-}
-
-/// The call log payload as the gateway sends it.
-///
-/// The typed contract keeps the status in a string, but the gateway sends a
-/// number, so the rows are decoded here and turned into the contract
-/// afterwards.
-#[derive(Debug, Deserialize)]
-struct WireLogsResponse {
-    /// The call log rows.
-    #[serde(default)]
-    logs: Vec<WireCallLog>,
-    /// The failure the gateway reports in the payload itself.
-    #[serde(default)]
-    error: Option<String>,
-}
-
-/// One call log row as the gateway sends it.
-#[derive(Debug, Deserialize)]
-struct WireCallLog {
-    /// Timestamp of the call.
-    #[serde(default)]
-    timestamp: Option<String>,
-    /// Model the gateway served.
-    #[serde(default)]
-    model: Option<String>,
-    /// Model the client asked for.
-    #[serde(default)]
-    requested_model: Option<String>,
-    /// Provider that served the call.
-    #[serde(default)]
-    provider: Option<String>,
-    /// Upstream status — a number on the wire.
-    #[serde(default, deserialize_with = "status_text")]
-    status: Option<String>,
-    /// Duration in milliseconds.
-    #[serde(default)]
-    duration_ms: Option<i64>,
-    /// Input tokens.
-    #[serde(default)]
-    tokens_input: Option<i64>,
-    /// Output tokens.
-    #[serde(default)]
-    tokens_output: Option<i64>,
-    /// Combo the call was routed through.
-    #[serde(default)]
-    combo_name: Option<String>,
-    /// Error summary, when the call failed.
-    #[serde(default)]
-    error_summary: Option<String>,
-}
-
-impl From<WireCallLog> for CallLog {
-    fn from(wire: WireCallLog) -> Self {
-        CallLog {
-            timestamp: wire.timestamp,
-            model: wire.model,
-            requested_model: wire.requested_model,
-            provider: wire.provider,
-            status: wire.status,
-            duration_ms: wire.duration_ms,
-            tokens_input: wire.tokens_input,
-            tokens_output: wire.tokens_output,
-            combo_name: wire.combo_name,
-            error_summary: wire.error_summary,
-        }
-    }
-}
-
-/// Read a status the gateway sends as a number, but the typed contract keeps
-/// as a string.
-fn status_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(match value {
-        serde_json::Value::Null => None,
-        serde_json::Value::String(text) => Some(text),
-        other => Some(other.to_string()),
-    })
 }
 
 /// The tone of a status pill: 5xx is broken, 4xx is degraded, the rest is
@@ -461,113 +432,46 @@ fn short_time(value: &str) -> String {
     text
 }
 
-/// The header of the call log table.
-fn header_row() -> AnyElement {
-    div()
-        .flex()
-        .items_center()
-        .gap_3()
-        .px(px(10.0))
-        .py(px(7.0))
-        .border_b_1()
-        .border_color(theme::border())
-        .child(header_label("TIME").flex_1().min_w_0())
-        .child(header_label("STATUS").w(px(STATUS_WIDTH)).flex_shrink_0())
-        .child(header_label("MODEL").flex_1().min_w_0())
-        .child(header_label("PROVIDER").flex_1().min_w_0())
-        .child(
-            header_label("MS")
-                .w(px(NUMBER_WIDTH))
-                .flex_shrink_0()
-                .text_align(gpui::TextAlign::Right),
-        )
-        .child(
-            header_label("IN")
-                .w(px(NUMBER_WIDTH))
-                .flex_shrink_0()
-                .text_align(gpui::TextAlign::Right),
-        )
-        .child(
-            header_label("OUT")
-                .w(px(NUMBER_WIDTH))
-                .flex_shrink_0()
-                .text_align(gpui::TextAlign::Right),
-        )
-        .child(
-            header_label("ERROR")
-                .flex_grow()
-                .flex_basis(px(200.0))
-                .min_w_0(),
-        )
-        .into_any_element()
-}
-
-/// One header cell.
-fn header_label(text: &str) -> gpui::Div {
-    div()
-        .text_size(px(11.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme::muted())
-        .child(text.to_string())
-}
-
-/// One row of the call log.
-fn call_row(row: &CallLog) -> AnyElement {
+/// Build one call-log data row from the shared column model.
+fn call_row(columns: &[ColumnDef], row: &CallLog) -> AnyElement {
     let model = row
         .model
         .clone()
         .or_else(|| row.requested_model.clone())
         .unwrap_or_else(|| "—".to_string());
+    let time = short_time(row.timestamp.as_deref().unwrap_or_default());
+    let provider = row.provider.clone().unwrap_or_else(|| "—".to_string());
+    let duration = row
+        .duration_ms
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "—".to_string());
+    let input = row
+        .tokens_input
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let output = row
+        .tokens_output
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "0".to_string());
+    let error = row.error_summary.clone().unwrap_or_default();
 
-    div()
-        .flex()
-        .items_center()
-        .gap_3()
-        .px(px(10.0))
-        .h(px(ROW_HEIGHT))
-        .border_b_1()
-        .border_color(theme::border())
-        .child(
-            mono_cell(
-                short_time(row.timestamp.as_deref().unwrap_or_default()),
-                true,
-            )
-            .flex_1()
-            .min_w_0(),
-        )
-        .child(status_cell(row.status.as_deref()))
-        .child(mono_cell(model, false).flex_1().min_w_0())
-        .child(
-            mono_cell(
-                row.provider.clone().unwrap_or_else(|| "—".to_string()),
-                true,
-            )
-            .flex_1()
-            .min_w_0(),
-        )
-        .child(number_cell(
-            row.duration_ms
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "—".to_string()),
-        ))
-        .child(number_cell(
-            row.tokens_input
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "0".to_string()),
-        ))
-        .child(number_cell(
-            row.tokens_output
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "0".to_string()),
-        ))
-        .child(error_cell(row.error_summary.as_deref().unwrap_or_default()))
-        .into_any_element()
+    let cells: Vec<AnyElement> = vec![
+        mono_text(time, true).into_any_element(),
+        status_pill(row.status.as_deref()).into_any_element(),
+        mono_text(model, false).into_any_element(),
+        mono_text(provider, true).into_any_element(),
+        plain_text(duration).into_any_element(),
+        plain_text(input).into_any_element(),
+        plain_text(output).into_any_element(),
+        muted_text(error).into_any_element(),
+    ];
+    widgets::defined_row(columns, cells, ROW_HEIGHT)
 }
 
-/// A monospaced cell that takes the free space of the row.
-fn mono_cell(text: impl Into<SharedString>, muted: bool) -> gpui::Div {
+/// Monospaced cell text that truncates instead of forcing the column wider.
+fn mono_text(text: impl Into<SharedString>, muted: bool) -> gpui::Div {
     div()
-        .flex_1()
+        .w_full()
         .min_w_0()
         .font(gpui::font(theme::MONO_FAMILY))
         .text_size(px(12.0))
@@ -576,49 +480,52 @@ fn mono_cell(text: impl Into<SharedString>, muted: bool) -> gpui::Div {
         .child(text.into())
 }
 
-/// A right-aligned number in a fixed column.
-fn number_cell(text: impl Into<SharedString>) -> gpui::Div {
+/// Plain (non-mono) cell text for numeric columns.
+fn plain_text(text: impl Into<SharedString>) -> gpui::Div {
     div()
-        .w(px(NUMBER_WIDTH))
-        .flex_shrink_0()
+        .w_full()
+        .min_w_0()
         .text_size(px(13.0))
         .text_color(theme::text())
-        .text_align(gpui::TextAlign::Right)
+        .truncate()
         .child(text.into())
 }
 
-/// The status pill of a row.
-fn status_cell(status: Option<&str>) -> gpui::Div {
+/// Muted cell text for the error column.
+fn muted_text(text: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .w_full()
+        .min_w_0()
+        .text_size(px(13.0))
+        .text_color(theme::muted())
+        .truncate()
+        .child(text.into())
+}
+
+/// The status pill of a row — sized to its content, never stretched.
+fn status_pill(status: Option<&str>) -> impl IntoElement {
     let (label, tone) = match status {
         Some(status) => (status.to_string(), status_tone(status)),
         None => ("—".to_string(), Tone::Neutral),
     };
     div()
-        .w(px(STATUS_WIDTH))
-        .flex_shrink_0()
+        .flex()
+        .items_center()
         .child(widgets::badge(label, tone))
 }
 
-/// The error summary of a row.
-fn error_cell(text: &str) -> gpui::Div {
-    div()
-        .flex_grow()
-        .flex_basis(px(200.0))
-        .min_w_0()
-        .text_size(px(13.0))
-        .text_color(theme::muted())
-        .truncate()
-        .child(text.to_string())
-}
-
-/// One line of the application log.
+/// One line of the application log with ANSI escapes removed.
 fn application_line(line: &str) -> AnyElement {
     div()
+        .w_full()
+        .min_w_0()
+        .px(px(10.0))
+        .py(px(3.0))
         .font(gpui::font(theme::MONO_FAMILY))
         .text_size(px(12.0))
         .text_color(theme::text())
         .truncate()
-        .child(line.to_string())
+        .child(widgets::strip_ansi(line))
         .into_any_element()
 }
 
@@ -756,22 +663,71 @@ mod tests {
 
     #[test]
     fn a_numeric_status_decodes_into_the_contract() {
-        let payload: WireLogsResponse = serde_json::from_str(
+        // The gateway serializes `call_logs.status` as a number, so the typed
+        // contract has to take a number — and to show it as text.
+        let payload: LogsResponse = serde_json::from_str(
             r#"{"logs":[{"status":200,"model":"gpt-5.6-sol"},{"status":null}]}"#,
         )
         .expect("the payload decodes");
 
         assert_eq!(payload.logs.len(), 2);
-        let rows: Vec<CallLog> = payload.logs.into_iter().map(CallLog::from).collect();
-        assert_eq!(rows[0].status.as_deref(), Some("200"));
-        assert_eq!(rows[0].model.as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(rows[1].status, None);
+        assert_eq!(payload.logs[0].status.as_deref(), Some("200"));
+        assert_eq!(payload.logs[0].model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(payload.logs[1].status, None);
     }
 
     #[test]
-    fn the_typed_contract_alone_would_reject_a_numeric_status() {
-        // The reason the wire type exists: `api::CallLog` wants a string.
-        let payload = r#"{"logs":[{"status":200}]}"#;
-        assert!(serde_json::from_str::<LogsResponse>(payload).is_err());
+    fn the_typed_contract_also_takes_a_status_written_as_text() {
+        let payload = r#"{"logs":[{"status":"200"}]}"#;
+        let decoded: LogsResponse = serde_json::from_str(payload).expect("the payload decodes");
+        assert_eq!(decoded.logs[0].status.as_deref(), Some("200"));
+    }
+
+    #[test]
+    fn call_log_columns_are_a_single_shared_definition() {
+        let columns = call_log_columns();
+        let labels: Vec<&str> = columns.iter().map(|c| c.label).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "TIME", "STATUS", "MODEL", "PROVIDER", "MS", "IN", "OUT", "ERROR"
+            ]
+        );
+        assert_eq!(columns[0].sizing, ColumnSizing::Flex);
+        assert_eq!(columns[1].sizing, ColumnSizing::Fixed(72));
+        assert_eq!(columns[2].sizing, ColumnSizing::Flex);
+        assert_eq!(columns[3].sizing, ColumnSizing::Flex);
+        assert_eq!(
+            columns[4],
+            ColumnDef {
+                label: "MS",
+                sizing: ColumnSizing::Fixed(64),
+                align: ColumnAlign::Right
+            }
+        );
+        assert_eq!(
+            columns[5],
+            ColumnDef {
+                label: "IN",
+                sizing: ColumnSizing::Fixed(64),
+                align: ColumnAlign::Right
+            }
+        );
+        assert_eq!(
+            columns[6],
+            ColumnDef {
+                label: "OUT",
+                sizing: ColumnSizing::Fixed(64),
+                align: ColumnAlign::Right
+            }
+        );
+        assert_eq!(
+            columns[7],
+            ColumnDef {
+                label: "ERROR",
+                sizing: ColumnSizing::GrowBasis(200),
+                align: ColumnAlign::Left
+            }
+        );
     }
 }

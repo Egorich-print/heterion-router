@@ -21,6 +21,18 @@
 | [010](ADR-010-chathub-upstream-boundary.md)     | ChatHub не подключается как undocumented upstream            |
 | [011](ADR-011-mission-2026-10-scope.md)         | Границы MISSION-2026-10 и принцип «схема ≠ enforcement»      |
 | [012](ADR-012-rust-199-and-audit-hardening.md)| Rust 1.99 / edition 2024 и hardening по аудиту 2026-10     |
+| [013](ADR-013-combo-dead-fields-refactor.md)  | Мёртвые поля комбов вычищены                                  |
+| [014](ADR-014-reasoning-predefinition-opencode-integration.md) | Predefinition reasoning и интеграция с OpenCode  |
+| [015](ADR-015-combo-active-flag.md)           | Флаг `active` у комбов                                        |
+| [016](ADR-016-exa-search-integration.md)      | Exa Search как модель чат-поверхности                         |
+| [017](ADR-017-agentrouter-loop-fix.md)        | Починка петли запросов к agentrouter                           |
+| [018](ADR-018-claude-format-executor.md)      | Формат `claude` и его исполнитель                             |
+| [019](ADR-019-exa-search-executor.md)         | Исполнитель Exa Search                                        |
+| [020](ADR-020-claude-wire-tool-calling.md)    | Вызов инструментов по claude-wire протоколу                   |
+| [021](ADR-021-agentrouter-responses-and-client-identity.md) | agentrouter: Responses-протокол и идентификация клиента |
+| [022](ADR-022-truncated-answer-is-length.md)  | Обрезанный ответ — это `finish_reason: "length"`              |
+| [023](ADR-023-desktop-shell-gpui.md)          | Нативная оболочка десктопа на GPUI                             |
+| [024](ADR-024-gpl-license.md)                | Лицензия проекта — GPL-3.0-or-later                           |
 
 ## Отклонённые / отложенные
 

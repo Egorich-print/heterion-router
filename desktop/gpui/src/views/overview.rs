@@ -4,7 +4,7 @@
 //! same four metric cards, the same "Live backends" list and the same wording.
 
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, IntoElement, Render, Window, div, px};
+use gpui::{App, Context, Entity, IntoElement, Render, SharedString, Window, div, px};
 
 use crate::api::{self, Overview};
 use crate::theme;
@@ -86,6 +86,32 @@ pub(crate) fn refresh_action(entity: Entity<OverviewView>) -> impl Fn(&mut App) 
     }
 }
 
+/// Pick the singular or plural form for `count`.
+fn pluralize(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        singular.to_string()
+    } else {
+        plural.to_string()
+    }
+}
+
+/// A non-interactive chip sized like a secondary button, so it sits evenly
+/// next to action buttons in the same row.
+fn info_chip(label: impl Into<SharedString>) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .px(px(12.0))
+        .py(px(6.0))
+        .rounded(px(theme::RADIUS_SM))
+        .border_1()
+        .border_color(theme::border())
+        .bg(theme::panel())
+        .text_size(px(13.0))
+        .text_color(theme::text())
+        .child(label.into())
+}
+
 impl Render for OverviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let entity = cx.entity();
@@ -133,7 +159,7 @@ impl Render for OverviewView {
         if let Some(data) = self.data.as_ref() {
             actions = actions
                 .child(widgets::muted("gateway"))
-                .child(widgets::badge(data.backend.clone(), Tone::Neutral));
+                .child(info_chip(data.backend.clone()));
         }
         actions = actions.child(widgets::button(
             "overview-refresh",
@@ -169,17 +195,27 @@ impl Render for OverviewView {
         // The metric cards — the same four, in the same order, as the Svelte
         // view.
         let counts = &data.counts;
+        let live = data.backends.len();
         let cards = div()
             .flex()
             .flex_wrap()
             .gap(px(12.0))
-            .child(stat("live backends", data.backends.len().to_string()))
-            .child(stat("combos", counts.combos.to_string()))
+            .child(stat(
+                pluralize(live, "live backend", "live backends"),
+                live.to_string(),
+            ))
+            .child(stat(
+                pluralize(counts.combos, "combo", "combos"),
+                counts.combos.to_string(),
+            ))
             .child(stat(
                 "connections active",
                 format!("{}/{}", counts.connections_active, counts.connections_total),
             ))
-            .child(stat("API keys", counts.api_keys.to_string()));
+            .child(stat(
+                pluralize(counts.api_keys, "API key", "API keys"),
+                counts.api_keys.to_string(),
+            ));
         content = content.child(cards);
 
         content = content.child(widgets::section_title("Live backends"));
@@ -203,9 +239,31 @@ impl Render for OverviewView {
 
 /// One metric card that shares its row evenly, like the `minmax(150px, 1fr)`
 /// grid of the CSS bundle.
-fn stat(label: &str, value: String) -> impl IntoElement {
+fn stat(label: impl Into<SharedString>, value: String) -> impl IntoElement {
     div()
         .flex_1()
         .min_w(px(150.0))
-        .child(widgets::stat_card(label.to_string(), value))
+        .child(widgets::stat_card(label, value))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pluralize;
+
+    #[test]
+    fn counters_use_the_singular_form_for_one() {
+        assert_eq!(pluralize(1, "API key", "API keys"), "API key");
+        assert_eq!(pluralize(1, "combo", "combos"), "combo");
+        assert_eq!(
+            pluralize(1, "live backend", "live backends"),
+            "live backend"
+        );
+    }
+
+    #[test]
+    fn counters_use_the_plural_form_for_zero_and_many() {
+        assert_eq!(pluralize(0, "API key", "API keys"), "API keys");
+        assert_eq!(pluralize(2, "API key", "API keys"), "API keys");
+        assert_eq!(pluralize(15, "combo", "combos"), "combos");
+    }
 }

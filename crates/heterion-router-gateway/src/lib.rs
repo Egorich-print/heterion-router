@@ -345,8 +345,12 @@ pub fn build_router_with(state: AppState, cache_layer: cache::CacheLayer) -> Rou
         .route("/api/overview", get(admin::overview))
         .route("/api/combos", get(admin::combos))
         .route("/api/combos/{id}", patch(admin::update_combo))
-        .route("/api/connections", get(admin::connections))
+        .route(
+            "/api/connections",
+            get(admin::connections).post(admin::create_connection),
+        )
         .route("/api/connections/{id}", patch(admin::update_connection))
+        .route("/api/providers", get(admin::providers))
         .route("/api/usage", get(admin::usage))
         .route("/api/logs", get(admin::logs))
         .route("/api/logs/app", get(admin::logs_app))

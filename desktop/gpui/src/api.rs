@@ -400,6 +400,25 @@ where
     Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+/// Read an upstream status the gateway sends as a number, but that may also
+/// arrive as a string.
+///
+/// The `call_logs.status` column is an integer, so the real answer is a
+/// number. A decoder that only accepts a string would fail on the very
+/// response it documents — and the view would have to keep a private copy of
+/// the row type to work around it.
+fn status_text<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(text) => Some(text),
+        other => Some(other.to_string()),
+    })
+}
+
 /// One provider connection.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Connection {
@@ -570,6 +589,10 @@ pub struct LogsResponse {
     /// The call log rows.
     #[serde(default)]
     pub logs: Vec<CallLog>,
+    /// The failure the gateway reports in the payload itself: a read error
+    /// comes back with `200` and an empty list plus this field.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// One call log row.
@@ -588,7 +611,12 @@ pub struct CallLog {
     #[serde(default)]
     pub provider: Option<String>,
     /// Upstream status.
-    #[serde(default)]
+    ///
+    /// The gateway sends the HTTP status of the call as a **number** (the
+    /// column is an integer), so the decoder accepts a number as well as a
+    /// string: a contract type that only took a string would fail to decode
+    /// the real answer.
+    #[serde(default, deserialize_with = "status_text")]
     pub status: Option<String>,
     /// Duration in milliseconds.
     #[serde(default)]
@@ -697,6 +725,73 @@ pub struct RestartResponse {
     /// The launchd label that was restarted.
     #[serde(default)]
     pub label: String,
+}
+
+/// One provider the gateway can serve — an entry of the catalogue the
+/// operator picks from when adding a key.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ProviderInfo {
+    /// Provider id, as the registry knows it.
+    pub id: String,
+    /// Human-readable name.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub name: String,
+    /// How the credential is obtained (`apikey`, `none`, `oauth`, …).
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub auth_type: String,
+    /// Wire format the provider speaks (`openai`, `claude`, `gemini`, …).
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub format: String,
+    /// Whether the provider needs a credential from the operator.
+    #[serde(default)]
+    pub needs_key: bool,
+    /// Base URL the gateway calls.
+    #[serde(default)]
+    pub base_url: String,
+}
+
+/// `GET /api/providers` — the catalogue of providers a key can be added for.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ProviderCatalog {
+    /// The providers.
+    #[serde(default)]
+    pub providers: Vec<ProviderInfo>,
+}
+
+/// Body of `POST /api/connections` — add a provider key.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CreateConnectionBody {
+    /// Provider id, taken from the catalogue.
+    pub provider: String,
+    /// Display name of the connection.
+    pub name: String,
+    /// The credential; omitted when the provider needs none.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub api_key: String,
+    /// Dispatch priority; the gateway's default applies when omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+    /// Whether the connection starts active.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<bool>,
+}
+
+/// `POST /api/connections` — the connection that was created.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CreateConnectionResponse {
+    /// `ok`.
+    #[serde(default)]
+    pub status: String,
+    /// The new connection id.
+    #[serde(default)]
+    pub id: String,
+    /// The provider it belongs to.
+    #[serde(default)]
+    pub provider: String,
+    /// `true` when the gateway must be restarted for the connection to serve
+    /// requests: the backends are built at startup.
+    #[serde(default)]
+    pub restart_required: bool,
 }
 
 #[cfg(test)]

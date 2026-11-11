@@ -4,7 +4,7 @@
   "description": "MCP stdio server that exposes the Heterion Router admin API and the native GPUI shell to an agent",
   "type": "module",
   "private": true,
-  "license": "MIT",
+  "license": "GPL-3.0-or-later",
   "engines": {
     "node": ">=18"
   },
