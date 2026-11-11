@@ -36,3 +36,12 @@ from — see the notice in `LICENSE` and the frozen material under `docs/history
 
 The third-party native-transport notices (`wreq-js`) belonged to that frozen JS
 tree and stay with the reference implementation.
+
+Heterion Router grew out of that project, but the two are **not affiliated**: the
+upstream authors neither maintain nor endorse this repository. Almost all of the
+code here was written anew — the gateway is a new Rust implementation and the
+macOS desktop app was written from scratch on GPUI; only the small Svelte
+dashboard remains on JavaScript, and it was written during the port as well. What
+the two share is the idea, some data formats and a few compatibility constants;
+the upstream copyright above is preserved for the material that was derived from
+it. See the "Происхождение проекта" section in `README.md`.

@@ -156,6 +156,25 @@ Admin-API (`/api/*`) — обзор, комбо, подключения, клю�
 guardrails; требует ключ оператора со scope `manage`. Полный контракт — в
 [`docs/AGENT-ROUTER-GUIDE.md`](docs/AGENT-ROUTER-GUIDE.md).
 
+## Происхождение проекта
+
+Heterion Router вырос из **OmniRoute** — шлюза к LLM-провайдерам, который
+начинался как JavaScript-проект. Это самостоятельный проект: он **не аффилирован**
+с OmniRoute и его авторами, не поддерживается ими и не одобрен ими.
+
+Почти весь код написан заново. Ядро шлюза — новая реализация на Rust
+(axum, Tokio, rusqlite): роутинг, failover, кэш, бюджеты, guardrails, шифрование
+полей и учёт usage. Нативное приложение macOS написано с нуля на GPUI. На
+JavaScript остался только веб-дашборд `desktop/ui` — небольшой, и он тоже написан
+в ходе порта. Общими с OmniRoute остаются сама идея, часть форматов данных и
+несколько констант совместимости (например, соль шифрования
+`omniroute-field-encryption-v1` и поддержка legacy-строк в таблице ключей).
+
+Авторские права на выведенный материал сохранены: уведомление об исходном
+проекте и его авторе — в [`LICENSE`](LICENSE), подробности — в
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). Исходники OmniRoute:
+<https://github.com/diegosouzapw/OmniRoute>.
+
 ## Лицензия
 
 **GPL-3.0-or-later.** Полный текст — в [`LICENSE`](LICENSE).

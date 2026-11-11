@@ -1,6 +1,10 @@
 # AGENTS.md — Heterion Router
 
 > Rust-шлюз к LLM-провайдерам. Sibling of Heterion, successor of OmniRoute-Rust.
+> Вырос из OmniRoute: **не аффилирован** с ним и его авторами (они не ведут этот
+> репозиторий и не одобряют его), почти весь код переписан заново — Rust-шлюз и
+> приложение на GPUI; на JS остался только веб-дашборд. Авторские права на
+> выведенный материал сохранены в `LICENSE` и `THIRD_PARTY_NOTICES.md`.
 > JS здесь нет (только `desktop/ui` на Svelte) — JS-хуков, eslint и prettier
 > в репозитории нет осознанно (ADR-008 §8).
 
