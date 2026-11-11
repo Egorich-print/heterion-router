@@ -40,9 +40,19 @@ gpui компилирует Metal-шейдеры через `xcrun metal`) и `d
 (`cargo fmt --manifest-path desktop/gpui/Cargo.toml -- --check`; в CI это job
 `desktop-fmt`).
 
-Toolchain закреплён `1.99.0` в `rust-toolchain.toml`, `rust-version = "1.99"` в
+Toolchain закреплён `1.99.1` в `rust-toolchain.toml`, `rust-version = "1.99"` в
 обоих манифестах, CI использует тот же пин — не `@stable`. Новый крейт обязан
 собираться на 1.99 и на `edition = "2024"`.
+
+Релизные сборки в GitHub Actions: macOS-джобы — только на `macos-15` и
+обязаны **проверять архитектуру результата** (артефакты названы по ней, Intel-раннер
+должен ронять джоб, а не подписывать x86-64 сборку именем arm64). `macos-14` больше
+не работает: он указывает на снятую конфигурацию `macos-14-arm64-us-default`, и джоб
+падает за секунду до начала сборки. Отдельная ловушка того же класса: блок
+`env:`/значение отступа, внутри которого только комментарий, — это `null` в YAML,
+схема Actions отвергает такой файл целиком, и **все** прогоны падают за 0 с с
+«This run likely failed because of a workflow file issue». Проверять workflow
+настоящим YAML-парсером (nil-значения у `env`/`with`/`permissions`), а не глазами.
 
 ## Контракты, которые нельзя ломать молча
 
