@@ -77,8 +77,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.99.1
       - uses: Swatinem/rust-cache@v2
       - name: Build .app bundle
-        env:
-          # Build script may rely on repo layout; keep default behavior.
         run: |
           set -eu
           bash desktop/scripts/build-app.sh
