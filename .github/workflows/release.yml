@@ -23,7 +23,7 @@ jobs:
     name: gateway binary (${{ matrix.os }})
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-14]
+        os: [ubuntu-latest, macos-15]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,6 +33,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release -p heterion-router-gateway
+      - name: Assert the macOS build is arm64
+        # The release assets are named for the architecture they contain. A
+        # runner of the wrong architecture would ship an x86_64 binary under
+        # an arm64 name, so the job fails instead of mislabelling it.
+        if: runner.os == 'macOS'
+        run: |
+          set -eu
+          TRIPLE="$(rustc -vV | sed -n 's/^host: //p')"
+          echo "host triple: $TRIPLE"
+          [ "$TRIPLE" = "aarch64-apple-darwin" ] || {
+            echo "expected aarch64-apple-darwin, got $TRIPLE" >&2; exit 1; }
       - name: Package + publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -67,9 +78,9 @@ jobs:
           fi
 
   app-macos:
-    name: Heterion Router.app (macos-14, arm64)
+    name: Heterion Router.app (macos-15, arm64)
     needs: gateway
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -80,6 +91,12 @@ jobs:
         run: |
           set -eu
           bash desktop/scripts/build-app.sh
+      - name: Assert the bundle is arm64
+        run: |
+          set -eu
+          BIN="desktop/gpui/dist/Heterion Router.app/Contents/MacOS/heterion-router-desktop"
+          file "$BIN" | grep -q 'arm64' || {
+            echo "the bundle is not an arm64 build:" >&2; file "$BIN" >&2; exit 1; }
       - name: Package and publish app to release
         env:
           GH_TOKEN: ${{ github.token }}
