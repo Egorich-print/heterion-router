@@ -403,6 +403,7 @@ impl GeminiBackend {
             return Err(heterion_router_http::client::HttpError::Status {
                 status: 0,
                 body: "gemini: no credentials".to_string(),
+                retry_after: None,
             });
         }
         Ok(Self {

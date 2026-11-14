@@ -50,6 +50,7 @@ desktop/gpui/tools/*.pid
 .idea/
 .vscode/
 *.swp
+.agents/
 
 # Python (scripts/subagent/ helpers)
 __pycache__/

@@ -65,6 +65,8 @@ pub struct Attribution {
     pub connection_id: Option<String>,
     /// Combo the request was served through, when it was served through one.
     pub combo_name: Option<String>,
+    /// Tokens saved by prompt context pruning, if pruning was applied.
+    pub tokens_compressed: Option<u32>,
 }
 
 /// Stamp `request` with a fresh attribution token and hand it back.
@@ -123,6 +125,7 @@ pub trait ChatBackend: Send + Sync + 'static {
             provider: Some(self.name().to_string()),
             connection_id: None,
             combo_name: None,
+            tokens_compressed: None,
         }
     }
 

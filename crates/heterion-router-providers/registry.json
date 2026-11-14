@@ -619,6 +619,10 @@
       {
         "id": "deepseek/deepseek-v3",
         "target_format": null
+      },
+      {
+        "id": "gemma3-270m:free",
+        "target_format": null
       }
     ]
   },
@@ -9814,7 +9818,7 @@
     "format": "openai",
     "executor": "default",
     "auth_type": "apikey",
-    "base_url": "https://api.1min.ai/api/chat-with-ai",
+    "base_url": "https://api.1min.ai/openai/v1/chat/completions",
     "models": [
       {
         "id": "gpt-4o-mini",

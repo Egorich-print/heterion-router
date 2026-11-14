@@ -18,6 +18,7 @@ heterion-router-translate = { workspace = true }
 heterion-router-usage = { workspace = true }
 axum = { workspace = true }
 rusqlite = { workspace = true }
+memchr = "2"
 getrandom = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
@@ -31,6 +32,8 @@ tracing-subscriber = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+dashmap = "6"
+thiserror = { workspace = true }
 
 [[bin]]
 name = "heterion-router-gateway"

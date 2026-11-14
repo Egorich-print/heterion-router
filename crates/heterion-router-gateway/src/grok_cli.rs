@@ -197,6 +197,7 @@ impl GrokCliBackend {
             return Err(heterion_router_http::client::HttpError::Status {
                 status: 0,
                 body: "grok-cli: no credentials".to_string(),
+                retry_after: None,
             });
         }
         Ok(Self {
@@ -330,6 +331,7 @@ impl GrokCliBackend {
             Err(heterion_router_http::client::HttpError::Status {
                 status,
                 body: error_body,
+                ..
             }) if is_stale_oauth(status, &error_body) => {
                 let refreshed = self.refresh_after_unauthorized(index, credential).await?;
                 self.http
@@ -419,6 +421,7 @@ impl GrokCliBackend {
             Err(heterion_router_http::client::HttpError::Status {
                 status,
                 body: error_body,
+                ..
             }) if is_stale_oauth(status, &error_body) => {
                 let refreshed = self.refresh_after_unauthorized(index, credential).await?;
                 self.http

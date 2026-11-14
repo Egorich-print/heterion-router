@@ -38,6 +38,8 @@ pub enum HttpError {
         status: u16,
         /// Truncated response body for diagnostics.
         body: String,
+        /// Optional Retry-After duration.
+        retry_after: Option<Duration>,
     },
 }
 
@@ -125,6 +127,7 @@ impl HttpClient {
         let response = self.send(self.inner.post(url).form(fields)).await?;
         let status = response.status();
         if !status.is_success() {
+            let retry_after = Self::extract_retry_after(response.headers());
             let body = response
                 .text()
                 .await
@@ -135,6 +138,7 @@ impl HttpClient {
             return Err(HttpError::Status {
                 status: status.as_u16(),
                 body,
+                retry_after,
             });
         }
         Ok(response)
@@ -158,6 +162,7 @@ impl HttpClient {
         let response = self.send(request.json(body)).await?;
         let status = response.status();
         if !status.is_success() {
+            let retry_after = Self::extract_retry_after(response.headers());
             let body = response
                 .text()
                 .await
@@ -168,9 +173,27 @@ impl HttpClient {
             return Err(HttpError::Status {
                 status: status.as_u16(),
                 body,
+                retry_after,
             });
         }
         Ok(response)
+    }
+
+    fn extract_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+        headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| {
+                if let Ok(secs) = s.parse::<u64>() {
+                    return Some(Duration::from_secs(secs));
+                }
+                if let Ok(system_time) = httpdate::parse_http_date(s) {
+                    return system_time
+                        .duration_since(std::time::SystemTime::now())
+                        .ok();
+                }
+                None
+            })
     }
 }
 
@@ -445,9 +468,40 @@ mod tests {
             .await
             .unwrap_err();
         match error {
-            HttpError::Status { status, body } => {
+            HttpError::Status { status, body, .. } => {
                 assert_eq!(status, 429);
                 assert!(body.contains("slow down"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn status_error_extracts_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "30")
+                    .set_body_string("too many requests"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = HttpClient::new(10).unwrap();
+        let error = client
+            .post_json(&server.uri(), None, &serde_json::json!({}))
+            .await
+            .unwrap_err();
+
+        match error {
+            HttpError::Status {
+                status,
+                retry_after,
+                ..
+            } => {
+                assert_eq!(status, 429);
+                assert_eq!(retry_after, Some(Duration::from_secs(30)));
             }
             other => panic!("unexpected error: {other:?}"),
         }

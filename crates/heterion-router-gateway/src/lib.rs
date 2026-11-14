@@ -15,6 +15,7 @@ pub mod claude;
 pub mod claude_endpoint;
 pub mod client_profile;
 pub mod combos;
+pub mod context_pruner;
 pub mod continuation;
 pub mod cors;
 pub mod credentials;
@@ -24,9 +25,12 @@ pub mod gemini;
 pub mod grok_cli;
 pub mod guardrails;
 pub mod ids;
+pub mod inspector;
+pub mod model_spec;
 pub mod openai;
 pub mod reasoning;
 pub mod repetition_guard;
+pub mod resilience;
 pub mod responses;
 pub mod restart;
 pub mod routing;
@@ -697,7 +701,8 @@ fn record_completion_usage(state: &AppState, auth: &Authenticated, context: Comp
         //  * `has_request_body` / `has_response_body` / `has_pipeline_details`:
         //    honest zero, for the same reason — claiming a body would send a
         //    reader looking for a file that does not exist.
-        //  * `tokens_compressed`: prompt compression does not exist yet.
+        //  * `tokens_compressed`: populated from `attribution.tokens_compressed`
+        //    when algorithmic prompt pruning ran.
         //  * `combo_step_id` / `combo_execution_key`: only the combo executor
         //    in `routing.rs` knows which step ran and which run it belonged
         //    to; `Attribution` carries the combo *name* only.
@@ -727,8 +732,8 @@ fn record_completion_usage(state: &AppState, auth: &Authenticated, context: Comp
         model: Some(served.to_string()),
         requested_model: Some(model.to_string()),
         provider: attribution.provider.clone(),
-        // See the SHARED NOTE above: no account model, no artifact store, no
-        // compression, no per-step combo identity.
+        // See the SHARED NOTE above: no account model, no artifact store,
+        // no per-step combo identity.
         account: None,
         // The connection the answering backend names for itself, mirroring
         // `usage_history.connection_id`.
@@ -741,7 +746,7 @@ fn record_completion_usage(state: &AppState, auth: &Authenticated, context: Comp
         tokens_cache_read: Some(details.cache_read),
         tokens_cache_creation: Some(details.cache_creation),
         tokens_reasoning: Some(details.reasoning),
-        tokens_compressed: None,
+        tokens_compressed: attribution.tokens_compressed,
         cache_source: None,
         request_type: Some(request_type.to_string()),
         source_format: Some(source_format(request_type).to_string()),
@@ -2328,6 +2333,7 @@ mod tests {
                 provider: Some(self.provider.to_string()),
                 connection_id: Some(self.connection.to_string()),
                 combo_name: None,
+                tokens_compressed: None,
             }
         }
 
@@ -3334,6 +3340,7 @@ mod tests {
                 provider: Some("heterion-local".to_string()),
                 connection_id: Some("conn-heterion-local".to_string()),
                 combo_name: None,
+                tokens_compressed: None,
             }
         }
 
