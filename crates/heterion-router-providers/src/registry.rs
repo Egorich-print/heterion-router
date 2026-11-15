@@ -180,6 +180,10 @@ mod tests {
             ("ds", "deepseek"),
             ("pol", "pollinations"),
             ("kg", "kilo-gateway"),
+            // Clients address Google's models as `google/…` (probed live
+            // 2026-11-16: `google/gemini-3.6-flash` answered 404 while
+            // `gemini/gemini-3.6-flash` answered 200).
+            ("google", "gemini"),
         ] {
             let entry = registry
                 .get(alias)

@@ -108,6 +108,40 @@ pub const DEFAULT_AUTO_CANDIDATES: &[AutoCandidate] = &[
     },
 ];
 
+/// The combo name a Switchyard plan books its attempts under.
+pub const AUTO_COMBO_NAME: &str = "heterion-router/auto";
+
+/// Base priority of the unified pool's long tail: every live provider model
+/// that is not part of the curated ladder.
+///
+/// The tail sits below Tier 3 (90) on purpose: the curated ladder keeps its
+/// contract, and the tail is what makes the pool *unified* — a model the
+/// operator connected but nobody curated is still reachable through `auto`,
+/// ranked last and demoted by the quality tracker the moment it misbehaves.
+pub const AUTO_TAIL_BASE_PRIORITY: f64 = 50.0;
+
+/// How many upstream calls one `auto` request may make.
+///
+/// The pool is the whole live catalogue; the budget is what keeps a request
+/// from walking every dead model in it one by one. A model that fails decays
+/// in the quality tracker, so the next request starts further down the tail —
+/// the pool rotates instead of hammering the same head.
+pub const AUTO_MAX_ATTEMPTS: usize = 24;
+
+/// One entry of the unified Switchyard pool.
+#[derive(Debug, Clone, PartialEq)]
+struct PoolCandidate {
+    /// Backend name (provider id) the candidate dispatches to.
+    provider: String,
+    /// Bare model id passed upstream.
+    model: String,
+    /// Priority before quality and availability are applied.
+    base_priority: f64,
+    /// Served by the web executor: a browser session that answers with page
+    /// text and has no tool head at all.
+    web_executor: bool,
+}
+
 /// Backend router with failover.
 #[derive(Clone)]
 pub struct RoutingBackend {
@@ -184,6 +218,11 @@ fn attempt(request: &ChatCompletionRequest, model: &str) -> ChatCompletionReques
     if crate::reasoning::rejects_reasoning_effort(model) {
         attempt.reasoning_effort = None;
     }
+    // Reasoning models with fixed sampling knobs 400 on `temperature`
+    // (probed live 2026-11-15) — the field cannot ride along.
+    if crate::reasoning::rejects_temperature(model) {
+        attempt.temperature = None;
+    }
     attempt
 }
 
@@ -234,6 +273,23 @@ mod attempt_tests {
         request.reasoning_effort = Some("medium".into());
         let codestral = attempt(&request, "mistral/codestral-latest");
         assert_eq!(codestral.reasoning_effort, None);
+    }
+
+    /// A reasoning model that rejects `temperature` must not see it: the
+    /// platform answers 400 for the whole request (probed live 2026-11-15).
+    #[test]
+    fn attempt_drops_temperature_for_models_that_reject_it() {
+        let request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages: vec![ChatMessage::plain("user", "hi")],
+            temperature: Some(0.2),
+            ..Default::default()
+        };
+        let sol = attempt(&request, "agentrouter/gpt-5.6-sol");
+        assert_eq!(sol.temperature, None);
+        // A family that accepts sampling parameters keeps the client's value.
+        let codestral = attempt(&request, "mistral/codestral-latest");
+        assert_eq!(codestral.temperature, Some(0.2));
     }
 }
 
@@ -468,19 +524,87 @@ impl RoutingBackend {
         self.auto_plan_at(request, Instant::now())
     }
 
+    /// The unified Switchyard pool: the curated ladder plus every live model
+    /// of every provider that currently has a backend.
+    ///
+    /// The curated tier keeps its contract (seven entries, fixed order and
+    /// priorities). The tail is the whole live catalogue — a model the
+    /// operator connected but nobody curated is still reachable through `auto`.
+    fn auto_pool(&self) -> Vec<PoolCandidate> {
+        let curated: HashSet<(String, String)> = DEFAULT_AUTO_CANDIDATES
+            .iter()
+            .map(|candidate| (candidate.provider.to_string(), candidate.model.to_string()))
+            .collect();
+
+        let mut pool: Vec<PoolCandidate> = DEFAULT_AUTO_CANDIDATES
+            .iter()
+            .map(|candidate| PoolCandidate {
+                provider: candidate.provider.to_string(),
+                model: candidate.model.to_string(),
+                base_priority: candidate.base_priority,
+                web_executor: self.is_web_executor(candidate.provider),
+            })
+            .collect();
+
+        let Some(registry) = self.registry.as_ref() else {
+            return pool;
+        };
+
+        let mut tail: Vec<PoolCandidate> = Vec::new();
+        for entry in registry.iter() {
+            // Only providers with a live backend can serve anything.
+            if !self.backends.contains_key(&entry.id) {
+                continue;
+            }
+            let web_executor = entry.executor.as_deref() == Some("web");
+            for model in &entry.models {
+                // The curated ladder already carries these ids.
+                if curated.contains(&(entry.id.clone(), model.id.clone())) {
+                    continue;
+                }
+                tail.push(PoolCandidate {
+                    provider: entry.id.clone(),
+                    model: model.id.clone(),
+                    base_priority: AUTO_TAIL_BASE_PRIORITY,
+                    web_executor,
+                });
+            }
+        }
+        // Deterministic order: provider id, then model id. The quality
+        // tracker moves a candidate up or down from there.
+        tail.sort_by(|a, b| {
+            a.provider
+                .cmp(&b.provider)
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        pool.extend(tail);
+        pool
+    }
+
+    /// Whether a provider is served by the web executor (a browser session
+    /// instead of an API): such a backend answers with plain text and never
+    /// emits tool calls.
+    fn is_web_executor(&self, provider: &str) -> bool {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.get(provider))
+            .and_then(|entry| entry.executor.as_deref())
+            .is_some_and(|executor| executor == "web")
+    }
+
     /// Build a dynamic Switchyard candidate plan with deterministic time injection.
     pub fn auto_plan_at(&self, request: &ChatCompletionRequest, now: Instant) -> Plan {
         let inspection = crate::inspector::inspect_request(request);
         let mut scored_candidates: Vec<((String, String), f64)> = Vec::new();
 
-        for candidate in DEFAULT_AUTO_CANDIDATES {
+        for candidate in self.auto_pool() {
             // 1. Check if backend exists
-            if !self.backends.contains_key(candidate.provider) {
+            if !self.backends.contains_key(&candidate.provider) {
                 continue;
             }
 
             // 2. Load model spec
-            let spec = crate::model_spec::model_spec(candidate.model);
+            let spec = crate::model_spec::model_spec(&candidate.model);
 
             // 3. Vision constraint
             if inspection.has_images && !spec.supports_vision {
@@ -492,7 +616,13 @@ impl RoutingBackend {
                 if spec.tool_support == ToolSupport::None {
                     continue;
                 }
-                if crate::model_spec::is_pseudo_tool_model(candidate.provider, candidate.model) {
+                if candidate.web_executor {
+                    // The web executor has no tool head at all: its adapter
+                    // answers with page text and the backend hardcodes
+                    // `tool_calls: None`.
+                    continue;
+                }
+                if crate::model_spec::is_pseudo_tool_model(&candidate.provider, &candidate.model) {
                     continue; // Exclude pseudo-tool models when tools are requested
                 }
             }
@@ -532,13 +662,13 @@ impl RoutingBackend {
             // Effective Priority = Base Priority * Quality Score * Availability State
             let quality_score = self
                 .quality_tracker
-                .effective_score_at(candidate.model, now);
+                .effective_score_at(&candidate.model, now);
 
             // Availability State: 0.0 if in active cooldown or breaker is tripped; 1.0 if healthy.
             let in_cooldown =
                 self.cooldowns
-                    .is_in_cooldown_at(candidate.provider, Some(candidate.model), now);
-            let breaker_open = !self.lock_breakers().allow(candidate.provider, now);
+                    .is_in_cooldown_at(&candidate.provider, Some(&candidate.model), now);
+            let breaker_open = !self.lock_breakers().allow(&candidate.provider, now);
             let availability_state = if in_cooldown || breaker_open {
                 0.0
             } else {
@@ -549,7 +679,7 @@ impl RoutingBackend {
 
             if effective > 0.0 {
                 scored_candidates.push((
-                    (candidate.provider.to_string(), candidate.model.to_string()),
+                    (candidate.provider.clone(), candidate.model.clone()),
                     effective,
                 ));
             }
@@ -567,7 +697,7 @@ impl RoutingBackend {
         Plan {
             config: ComboConfig::default(),
             steps,
-            combo_name: Some("heterion-router/auto".to_string()),
+            combo_name: Some(AUTO_COMBO_NAME.to_string()),
         }
     }
 }
@@ -611,8 +741,16 @@ impl ChatBackend for RoutingBackend {
 
         let is_failover_plan = combo_name.is_some() || plan.len() > 1;
         let mut cooled = false;
+        // The unified pool holds the whole live catalogue; the budget keeps a
+        // request from walking every dead model in it one by one.
+        let attempt_budget = if combo_name.as_deref() == Some(AUTO_COMBO_NAME) {
+            AUTO_MAX_ATTEMPTS
+        } else {
+            usize::MAX
+        };
+        let mut attempts = 0usize;
 
-        for (name, target_model) in &plan {
+        'candidates: for (name, target_model) in &plan {
             // The cooldown and the probation steer the *ladder*: they decide
             // which candidate to try next. The direct `provider/model` path is
             // left alone on purpose — a client that asked for one model by id
@@ -678,6 +816,7 @@ impl ChatBackend for RoutingBackend {
                 let Some(backend) = self.backends.get(name) else {
                     break;
                 };
+                attempts += 1;
                 match backend
                     .complete(attempt(&candidate_req, target_model))
                     .await
@@ -698,6 +837,9 @@ impl ChatBackend for RoutingBackend {
                             last_error = Some(GatewayError::Upstream(format!(
                                 "upstream status 200: tool validation failed ({e})"
                             )));
+                            if attempts >= attempt_budget {
+                                break 'candidates;
+                            }
                             break;
                         }
                         self.quality_tracker.record_success(target_model);
@@ -760,6 +902,9 @@ impl ChatBackend for RoutingBackend {
                         );
                         let transient = Self::is_transient(&error);
                         last_error = Some(error);
+                        if attempts >= attempt_budget {
+                            break 'candidates;
+                        }
                         if retry_count < config.max_retries && transient {
                             retry_count += 1;
                             if config.failover_before_retry {
@@ -814,8 +959,16 @@ impl ChatBackend for RoutingBackend {
             let mut tripped = false;
             let is_failover_plan = combo_name.is_some() || plan.len() > 1;
             let mut cooled = false;
+            // Same budget as in `complete`: the pool is the whole catalogue,
+            // the request may not walk all of it.
+            let attempt_budget = if combo_name.as_deref() == Some(AUTO_COMBO_NAME) {
+                AUTO_MAX_ATTEMPTS
+            } else {
+                usize::MAX
+            };
+            let mut attempts = 0usize;
 
-            for (name, target_model) in &plan {
+            'candidates: for (name, target_model) in &plan {
                 // Same rule as in `complete`: the cooldown and the probation
                 // steer the ladder, not the direct `provider/model` path.
                 if is_failover_plan {
@@ -877,6 +1030,7 @@ impl ChatBackend for RoutingBackend {
                     let Some(backend) = this.backends.get(name).cloned() else {
                         break;
                     };
+                    attempts += 1;
                     let mut stream = backend.stream(attempt(&candidate_req, target_model));
 
                     match stream.next().await {
@@ -942,6 +1096,9 @@ impl ChatBackend for RoutingBackend {
                             );
                             let transient = Self::is_transient(&error);
                             last_error = Some(error);
+                            if attempts >= attempt_budget {
+                                break 'candidates;
+                            }
                             if retry_count < config.max_retries && transient {
                                 retry_count += 1;
                                 if config.failover_before_retry {

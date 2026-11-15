@@ -69,11 +69,50 @@ pub fn rejects_reasoning_effort(model: &str) -> bool {
         || bare.starts_with("open-mistral")
 }
 
+/// Models whose upstream API rejects `temperature` outright.
+///
+/// The agentrouter reasoning models answer `400 Unsupported parameter:
+/// 'temperature' is not supported with this model` (probed live 2026-11-15)
+/// — the sampling knobs of a reasoning model are fixed by the platform, and
+/// the request dies as a whole. A client that sends the field (MCode exposes a
+/// temperature control for these models) would lose every turn, so the router
+/// drops the field for these families before dispatch.
+///
+/// `provider/model` ids are matched on the bare model part.
+pub fn rejects_temperature(model: &str) -> bool {
+    let bare = model.rsplit('/').next().unwrap_or(model);
+    let bare = bare.to_ascii_lowercase();
+    bare.starts_with("gpt-5.6-sol")
+        || bare.starts_with("gpt-6.1-sol")
+        || bare.starts_with("gpt-6-astra")
+}
+
 #[cfg(test)]
 mod tests {
     use super::default_effort;
     use super::needs_explicit_tool_choice;
     use super::rejects_reasoning_effort;
+    use super::rejects_temperature;
+
+    /// The agentrouter reasoning models reject `temperature` outright: the
+    /// platform answers `400 Unsupported parameter: 'temperature' is not
+    /// supported with this model` (probed live 2026-11-15), so a client that
+    /// sends the field loses the whole request.
+    #[test]
+    fn reasoning_families_reject_temperature() {
+        assert!(rejects_temperature("gpt-5.6-sol"));
+        assert!(rejects_temperature("agentrouter/gpt-5.6-sol"));
+        assert!(rejects_temperature("agentrouter/gpt-6.1-sol"));
+        assert!(rejects_temperature("agentrouter/gpt-6-astra"));
+    }
+
+    /// A family that accepts sampling parameters keeps them.
+    #[test]
+    fn other_families_keep_temperature() {
+        assert!(!rejects_temperature("mistral/codestral-latest"));
+        assert!(!rejects_temperature("gemini/gemini-3-flash-preview"));
+        assert!(!rejects_temperature("groq/openai/gpt-oss-120b"));
+    }
 
     #[test]
     fn evidenced_families_get_their_predefined_level() {
