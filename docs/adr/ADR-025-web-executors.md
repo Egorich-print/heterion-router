@@ -192,7 +192,7 @@ POST /chat       → {"provider": "...", "model": "...", "messages": [...]}
 | `grok-web` | есть | да |
 | `zai-web` | есть | да |
 | `kimi-web` | есть | да (после входа через Google) |
-| `deepseek-web` | нет | сессии нет (вход через Google не завершается) |
+| `deepseek-web` | нет | вход упирается в hCaptcha (drag-головоломка) — шаг оператора; headless OAuth не запускает |
 | `blackbox-web` | нет | сайт сменился на корпоративный, чата нет |
 | `chatgpt-web-codex` | нет | для аккаунта Free раздел Codex недоступен |
 
