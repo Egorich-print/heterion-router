@@ -162,14 +162,19 @@ API (SerpApi, Scrappey, Cloro) и один набор «веб-данных» (T
 | вместо | чем | команда |
 |---|---|---|
 | Scrappey (scraping API) | `scripts/scrape.py` — рендер Camoufox, извлечение текста/markdown/ссылок/скриншота | `./venv/bin/python scripts/scrape.py URL --format markdown` |
-| SerpApi (SERP) | `scripts/search.py --engine ddg` (DuckDuckGo через Camoufox) или `--engine bing` | `./venv/bin/python scripts/search.py "запрос"` |
+| SerpApi (SERP) | `scripts/search.py` — движки `ddg` (DuckDuckGo через Camoufox), `bing`, `searxng` (публичные инстансы, тоже через браузер: на обычный запрос отдают JS-челлендж), `exa` | `./venv/bin/python scripts/search.py "запрос"` |
 | Cloro (SERP + поиск по ИИ) | `scripts/search.py --engine exa` — ключ оператора уже в роутере (`exa/exa-search`); плюс веб-исполнители `chatgpt-web`/`gemini-web`/`grok-web` отвечают из той же сессии | `./venv/bin/python scripts/search.py "запрос" --engine exa` |
 | Thordata (SERP API, Web Scraper API) | те же `search.py` и `scrape.py` | то же |
 | Layer3 Intel (репутация IP) | `scripts/proxycheck.py` — ip-api.com (флаги `proxy`/`hosting`), ipwho.is (страна, ASN, провайдер), ipinfo.io (сеть) | `./venv/bin/python scripts/proxycheck.py --me` |
 
-Проверено живьём 2026-11-15: выдача DuckDuckGo/Bing/Exa приходит, `scrape.py`
-рендерит страницу, `proxycheck.py` верно определяет адрес машины (AS50436
-Tele Columbus AG, флагов прокси/хостинга нет — «чисто»).
+Проверено живьём 2026-11-15: выдача DuckDuckGo, Bing, SearXNG и Exa приходит,
+`scrape.py` рендерит страницу, `proxycheck.py` верно определяет адрес машины
+(AS50436 Tele Columbus AG, флагов прокси/хостинга нет — «чисто»).
+
+SearXNG публичные инстансы отвечают только через браузер: на обычный запрос
+`searx.be` отдаёт страницу «Verifying your browser…». Свой SearXNG в podman не
+поднимался — на машине podman без Linux-VM, а разворачивать VM без решения
+владельца не следует.
 
 Чего бесплатные источники **не** дают: базы «кто и где продаёт этот IP»
 (Layer3 Intel) и residential-пула. Списки бесплатных прокси ненадёжны и часто
