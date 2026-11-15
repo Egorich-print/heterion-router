@@ -8,7 +8,7 @@
 //! reactions: a dead session is fixed by signing in again, a human step is
 //! fixed by the operator, and a broken selector is fixed by code.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::time::Duration;
 
@@ -109,6 +109,61 @@ pub fn driver_reachable(base: &str) -> bool {
     let _ = stream.read_to_end(&mut response);
     let text = String::from_utf8_lossy(&response);
     text.contains("200") && text.contains("\"ok\"")
+}
+
+/// The providers the driver has an adapter for.
+///
+/// The driver answers `GET /providers` with the ids it can actually serve.
+/// The gateway registers only those: a web provider without an adapter would
+/// sit in the catalog and fail on every call.
+///
+/// The call is synchronous on purpose — the router is built before the async
+/// runtime starts serving, and the answer is one small JSON document.
+pub fn driver_providers(base: &str) -> BTreeSet<String> {
+    let rest = base
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().unwrap_or(20131)),
+        None => (rest, 80),
+    };
+    let address = format!("{host}:{port}");
+    let mut stream = match std::net::TcpStream::connect(&address) {
+        Ok(stream) => stream,
+        Err(_) => return BTreeSet::new(),
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(2000)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(2000)));
+    let request =
+        format!("GET /providers HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return BTreeSet::new();
+    }
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    parse_provider_list(&String::from_utf8_lossy(&response))
+}
+
+/// Read the provider ids out of a driver's `/providers` answer.
+fn parse_provider_list(response: &str) -> BTreeSet<String> {
+    let Some((_headers, body)) = response.split_once("\r\n\r\n") else {
+        return BTreeSet::new();
+    };
+    let Ok(payload) = serde_json::from_str::<Value>(body.trim()) else {
+        return BTreeSet::new();
+    };
+    payload
+        .get("providers")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|id| id.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// An answer scraped from a web chat.
@@ -314,5 +369,26 @@ mod tests {
     fn a_driver_that_is_not_there_is_not_reachable() {
         // Nothing listens on port 1 of loopback.
         assert!(!driver_reachable("http://127.0.0.1:1"));
+    }
+
+    #[test]
+    fn the_provider_list_of_the_driver_is_read_from_its_answer() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
+            {\"providers\": [\"chatgpt-web\", \"claude-web\"]}";
+        let providers = parse_provider_list(response);
+        assert!(providers.contains("chatgpt-web"));
+        assert!(providers.contains("claude-web"));
+        assert_eq!(providers.len(), 2);
+    }
+
+    #[test]
+    fn a_driver_that_says_nothing_registers_nothing() {
+        assert!(parse_provider_list("HTTP/1.1 500 Internal Server Error\r\n\r\n").is_empty());
+        assert!(parse_provider_list("not http at all").is_empty());
+    }
+
+    #[test]
+    fn a_driver_that_is_not_there_has_no_providers() {
+        assert!(driver_providers("http://127.0.0.1:1").is_empty());
     }
 }

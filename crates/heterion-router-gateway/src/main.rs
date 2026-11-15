@@ -476,12 +476,27 @@ fn select_backend(
         .unwrap_or_else(|_| web_driver::DEFAULT_DRIVER_URL.to_string());
     if web_driver::driver_reachable(&driver_url) {
         let web_driver = web_driver::WebDriverClient::new(&driver_url);
-        for entry in registry.iter() {
-            if entry.executor.as_deref() != Some("web") {
-                continue;
-            }
-            let provider = entry.id.clone();
-            if backends.contains_key(&provider) {
+        // Only the providers the driver has an adapter for: without one the
+        // backend could not answer, and a catalog entry that always fails is
+        // worse than an absent provider.
+        let supported = web_driver::driver_providers(&driver_url);
+        if supported.is_empty() {
+            tracing::warn!(
+                "web executors skipped: the driver at {driver_url} reports no adapter \
+                 (start scripts/webdriver/server.py with the adapters beside it)"
+            );
+        }
+        let registry_web: Vec<&str> = registry
+            .iter()
+            .filter(|entry| entry.executor.as_deref() == Some("web"))
+            .map(|entry| entry.id.as_str())
+            .collect();
+        let registrable = heterion_router_gateway::web::registrable_providers(
+            registry_web.iter().copied(),
+            &supported,
+        );
+        for provider in &registrable {
+            if backends.contains_key(provider) {
                 continue;
             }
             backends.insert(
@@ -492,6 +507,14 @@ fn select_backend(
                 ))),
             );
             tracing::info!("backend available: {provider} (web, {driver_url})");
+        }
+        for provider in registry_web {
+            if !registrable.iter().any(|id| id == provider) {
+                tracing::warn!(
+                    "backend {provider} skipped: the driver has no adapter for it \
+                     (the adapter lives beside the driver, outside the gateway)"
+                );
+            }
         }
     } else {
         tracing::warn!(

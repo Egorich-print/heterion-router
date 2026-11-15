@@ -16,6 +16,8 @@
 //!   different repairs: a dead session is fixed by signing in, a broken
 //!   selector by code, a human step by the operator.
 
+use std::collections::BTreeSet;
+
 use async_trait::async_trait;
 use heterion_router_core::{
     ChatChoice, ChatCompletionRequest, ChatCompletionResponse, ChatMessage, GatewayError,
@@ -161,12 +163,58 @@ impl ChatBackend for WebBackend {
     }
 }
 
+/// The web providers that may be registered as backends.
+///
+/// The registry lists every web provider of the catalog, but only the ones the
+/// driver actually has an adapter for can answer: an adapter is the code that
+/// knows the page's composer and the place where the answer is rendered. A
+/// provider without one would sit in the catalog and fail on every call, which
+/// is worse than being absent.
+///
+/// `supported` is what the driver reports; when it is empty the driver could
+/// not be asked at all, and nothing is registered.
+pub fn registrable_providers<'a>(
+    registry_ids: impl IntoIterator<Item = &'a str>,
+    supported: &BTreeSet<String>,
+) -> Vec<String> {
+    if supported.is_empty() {
+        return Vec::new();
+    }
+    registry_ids
+        .into_iter()
+        .filter(|id| supported.contains(*id))
+        .map(|id| id.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn a_web_provider_without_an_adapter_is_not_registrable() {
+        let supported: BTreeSet<String> = ["chatgpt-web".to_string(), "claude-web".to_string()]
+            .into_iter()
+            .collect();
+        let registrable = registrable_providers(
+            ["chatgpt-web", "claude-web", "deepseek-web", "blackbox-web"],
+            &supported,
+        );
+        assert_eq!(
+            registrable,
+            vec!["chatgpt-web".to_string(), "claude-web".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_driver_that_knows_nothing_registers_nothing() {
+        let supported: BTreeSet<String> = BTreeSet::new();
+        let registrable = registrable_providers(["chatgpt-web", "claude-web"], &supported);
+        assert!(registrable.is_empty());
+    }
 
     fn request(model: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {
