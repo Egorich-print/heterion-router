@@ -104,16 +104,29 @@ pub fn parse_combo_rich(data: &Value) -> Option<(String, Vec<RichEntry>)> {
         if model_ref.is_empty() {
             continue;
         }
-        let (split_provider, bare) = split_model_ref(model_ref);
-        let provider = item
+        let provider_id = item
             .get("providerId")
             .and_then(Value::as_str)
             .unwrap_or("")
             .trim();
-        let provider = if provider.is_empty() {
-            split_provider
+        let (provider, bare) = if provider_id.is_empty() {
+            // Without `providerId` the ref itself names the provider.
+            split_model_ref(model_ref)
         } else {
-            provider.to_string()
+            // The stored model is either a bare id (`openai/gpt-oss-20b` for
+            // groq) or a full ref (`groq/openai/gpt-oss-20b`). Only a leading
+            // segment that *names the provider* is a prefix to strip: a bare
+            // id whose own path contains a slash must survive intact, and a
+            // provider pasted twice (`kilocode/kilocode/…`) is unrolled down
+            // to the id the platform knows.
+            let mut bare = model_ref.to_string();
+            while let Some((head, rest)) = bare.split_once('/') {
+                if head != provider_id {
+                    break;
+                }
+                bare = rest.to_string();
+            }
+            (provider_id.to_string(), bare)
         };
         if provider.is_empty() || bare.is_empty() {
             continue;
@@ -315,6 +328,81 @@ mod tests {
                 ("kilo-gateway".to_string(), "kilo-auto/balanced".to_string()),
             ],
             "aliases must map onto canonical backend keys; `ds` has no executor yet"
+        );
+    }
+
+    #[test]
+    fn a_bare_model_id_keeps_every_segment() {
+        // The dashboard stores the bare id (`openai/gpt-oss-20b` for groq),
+        // the older rows carry the full ref (`groq/openai/gpt-oss-20b`). The
+        // router must send the id the platform knows in both cases — a bare
+        // id whose own path contains a slash is not a prefixed ref.
+        let combo = parse_combo(
+            "c",
+            &json!({
+                "strategy": "priority",
+                "models": [
+                    {"kind": "model", "model": "openai/gpt-oss-20b", "providerId": "groq"},
+                    {"kind": "model", "model": "stealth/glyph-cluster", "providerId": "kilocode"},
+                    {"kind": "model", "model": "groq/openai/gpt-oss-20b", "providerId": "groq"},
+                    {"kind": "model", "model": "codestral-latest", "providerId": "mistral"},
+                ],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            combo.entries[0],
+            ComboEntry {
+                provider: "groq".to_string(),
+                model: "openai/gpt-oss-20b".to_string(),
+            }
+        );
+        assert_eq!(
+            combo.entries[1],
+            ComboEntry {
+                provider: "kilocode".to_string(),
+                model: "stealth/glyph-cluster".to_string(),
+            }
+        );
+        assert_eq!(
+            combo.entries[2],
+            ComboEntry {
+                provider: "groq".to_string(),
+                model: "openai/gpt-oss-20b".to_string(),
+            }
+        );
+        assert_eq!(
+            combo.entries[3],
+            ComboEntry {
+                provider: "mistral".to_string(),
+                model: "codestral-latest".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_repeated_provider_prefix_is_stripped() {
+        // A row written as `kilocode/kilocode/stealth/glyph-cluster` (the
+        // provider pasted twice) must still reach the platform with the id
+        // the platform knows.
+        let combo = parse_combo(
+            "c",
+            &json!({
+                "strategy": "priority",
+                "models": [
+                    {"kind": "model", "model": "kilocode/kilocode/stealth/glyph-cluster", "providerId": "kilocode"},
+                ],
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(
+            combo.entries[0],
+            ComboEntry {
+                provider: "kilocode".to_string(),
+                model: "stealth/glyph-cluster".to_string(),
+            }
         );
     }
 

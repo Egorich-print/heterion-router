@@ -885,6 +885,10 @@ pub struct UpdateComboBody {
 
 /// One model entry in a combo rewrite: provider plus bare model id.
 ///
+/// The model may be the bare id (`openai/gpt-oss-20b` for groq) or the full
+/// ref (`groq/openai/gpt-oss-20b`): a leading segment that names the
+/// provider is stripped, everything else is the id the platform knows.
+///
 /// `weight` defaults to 50 when absent. Entry `id` is kept when sent back
 /// (the dashboard round-trips it); otherwise the server derives one.
 #[derive(Debug, Deserialize)]
