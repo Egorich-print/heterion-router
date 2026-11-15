@@ -9,6 +9,7 @@
 //! fixed by the operator, and a broken selector is fixed by code.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -77,6 +78,37 @@ impl DriverError {
             Self::NoAdapter => "web provider has no adapter in the driver".to_string(),
         }
     }
+}
+
+/// Whether a driver process is listening and answers its health check.
+///
+/// The gateway registers the web backends only when the driver is there:
+/// advertising a provider that can never answer would fill the catalog with
+/// models that always fail.
+pub fn driver_reachable(base: &str) -> bool {
+    let rest = base
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/');
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().unwrap_or(20131)),
+        None => (rest, 80),
+    };
+    let address = format!("{host}:{port}");
+    let mut stream = match std::net::TcpStream::connect(&address) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(800)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(800)));
+    let request = format!("GET /health HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    text.contains("200") && text.contains("\"ok\"")
 }
 
 /// An answer scraped from a web chat.
@@ -276,5 +308,11 @@ mod tests {
             .await
             .expect_err("an empty answer is not an answer");
         assert_eq!(error, DriverError::SelectorMiss);
+    }
+
+    #[test]
+    fn a_driver_that_is_not_there_is_not_reachable() {
+        // Nothing listens on port 1 of loopback.
+        assert!(!driver_reachable("http://127.0.0.1:1"));
     }
 }

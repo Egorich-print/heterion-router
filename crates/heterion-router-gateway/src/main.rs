@@ -469,25 +469,35 @@ fn select_backend(
     // (ADR-025). They have no credential row — the session *is* the
     // credential — so they are picked up from the registry, not from the
     // connection table.
+    //
+    // Only when the driver is there: a web provider in the catalog that
+    // cannot answer is worse than an absent one.
     let driver_url = std::env::var("HETERION_WEB_DRIVER_URL")
         .unwrap_or_else(|_| web_driver::DEFAULT_DRIVER_URL.to_string());
-    let web_driver = web_driver::WebDriverClient::new(&driver_url);
-    for entry in registry.iter() {
-        if entry.executor.as_deref() != Some("web") {
-            continue;
-        }
-        let provider = entry.id.clone();
-        if backends.contains_key(&provider) {
-            continue;
-        }
-        backends.insert(
-            provider.clone(),
-            status_aware(Arc::new(WebBackend::new(
+    if web_driver::driver_reachable(&driver_url) {
+        let web_driver = web_driver::WebDriverClient::new(&driver_url);
+        for entry in registry.iter() {
+            if entry.executor.as_deref() != Some("web") {
+                continue;
+            }
+            let provider = entry.id.clone();
+            if backends.contains_key(&provider) {
+                continue;
+            }
+            backends.insert(
                 provider.clone(),
-                web_driver.clone(),
-            ))),
+                status_aware(Arc::new(WebBackend::new(
+                    provider.clone(),
+                    web_driver.clone(),
+                ))),
+            );
+            tracing::info!("backend available: {provider} (web, {driver_url})");
+        }
+    } else {
+        tracing::warn!(
+            "web executors skipped: the Camoufox driver does not answer at {driver_url} \
+             (start scripts/webdriver/server.py, or point HETERION_WEB_DRIVER_URL at it)"
         );
-        tracing::info!("backend available: {provider} (web, {driver_url})");
     }
 
     report_unserved(&unserved);
