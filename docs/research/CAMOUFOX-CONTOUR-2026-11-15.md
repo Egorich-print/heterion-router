@@ -146,3 +146,56 @@ launchctl kickstart -k gui/$(id -u)/com.heterion.router
 
 Диагностика селекторов адаптера — через `GET /probe?provider=<id>` драйвера,
 а не на глаз: селекторы меняются вместе с вёрсткой провайдера.
+
+---
+
+## Раздел 2. Бесплатные замены платных сервисов Camoufox (2026-11-15)
+
+Промо-список Camoufox предлагает десять сервисов: три поисковых/скрапинговых
+API (SerpApi, Scrappey, Cloro) и один набор «веб-данных» (Thordata), пять
+провайдеров прокси (NodeMaven, OkkProxy, NiuProxy, Node Proxy, Byteful) и
+сервис репутации IP (Layer3 Intel). Что из этого можно поставить бесплатно,
+а что остаётся платным по существу.
+
+### Бесплатно и уже работает
+
+| вместо | чем | команда |
+|---|---|---|
+| Scrappey (scraping API) | `scripts/scrape.py` — рендер Camoufox, извлечение текста/markdown/ссылок/скриншота | `./venv/bin/python scripts/scrape.py URL --format markdown` |
+| SerpApi (SERP) | `scripts/search.py --engine ddg` (DuckDuckGo через Camoufox) или `--engine bing` | `./venv/bin/python scripts/search.py "запрос"` |
+| Cloro (SERP + поиск по ИИ) | `scripts/search.py --engine exa` — ключ оператора уже в роутере (`exa/exa-search`); плюс веб-исполнители `chatgpt-web`/`gemini-web`/`grok-web` отвечают из той же сессии | `./venv/bin/python scripts/search.py "запрос" --engine exa` |
+| Thordata (SERP API, Web Scraper API) | те же `search.py` и `scrape.py` | то же |
+| Layer3 Intel (репутация IP) | `scripts/proxycheck.py` — ip-api.com (флаги `proxy`/`hosting`), ipwho.is (страна, ASN, провайдер), ipinfo.io (сеть) | `./venv/bin/python scripts/proxycheck.py --me` |
+
+Проверено живьём 2026-11-15: выдача DuckDuckGo/Bing/Exa приходит, `scrape.py`
+рендерит страницу, `proxycheck.py` верно определяет адрес машины (AS50436
+Tele Columbus AG, флагов прокси/хостинга нет — «чисто»).
+
+Чего бесплатные источники **не** дают: базы «кто и где продаёт этот IP»
+(Layer3 Intel) и residential-пула. Списки бесплатных прокси ненадёжны и часто
+вредоносны — подменять ими платный пул нельзя.
+
+### Платное, но установленное как проводка
+
+Прокси-профили ведутся в `~/.local/share/camoufox/state/proxy.json` (0600):
+
+```sh
+./venv/bin/python scripts/proxy_config.py set --name nodemaven \
+    --server http://host:port --user U --pass P
+./venv/bin/python scripts/proxy_config.py test --name nodemaven   # адрес, который видит сайт
+./venv/bin/python scripts/proxy_config.py show                      # пароли скрыты
+```
+
+Профиль подхватывают `scrape.py --proxy <имя>`, `search.py --proxy <имя>`,
+`proxycheck.py --proxy <имя>` и веб-драйвер (`HETERION_WEB_DRIVER_PROXY=<имя>`
+при запуске `scripts/webdriver/server.py`). Проверено на локальном
+CONNECT-прокси: браузер действительно идёт через него (`CONNECT
+example.com:443` в логе прокси).
+
+Прокси **не применяется по умолчанию**: смена адреса меняет геолокацию,
+которую видит сайт, и ломает сессию оператора. Включается явно.
+
+Промо-коды для платных провайдеров (CAMOUFOX35, CAMOUFOX40, PAY2,
+camoufox80, CAMOUFOX10, CAMOUFOX) лежат в `state/services.json` — там же
+реестр: что бесплатно, чем заменено, что платное и куда вписать учётные
+данные.
