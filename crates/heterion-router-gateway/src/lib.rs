@@ -37,6 +37,8 @@ pub mod restart;
 pub mod routing;
 pub mod ui;
 pub mod usage_estimate;
+pub mod web;
+pub mod web_driver;
 
 use std::convert::Infallible;
 use std::sync::Arc;

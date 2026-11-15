@@ -20,6 +20,8 @@ use heterion_router_gateway::{
     openai::{OpenAiBackend, ProviderOpenAiBackend, resolve_chat_url, resolve_responses_url},
     responses::ResponsesBackend,
     routing::RoutingBackend,
+    web::WebBackend,
+    web_driver,
 };
 use heterion_router_providers::ProviderRegistry;
 use heterion_router_routing::{RouteRule, Router};
@@ -460,6 +462,32 @@ fn select_backend(
             }
             Err(error) => tracing::warn!("backend {provider} skipped: {error}"),
         }
+    }
+
+    // Web-application providers (`executor: "web"`): the answer comes from
+    // the operator's browser session, driven by the Camoufox driver process
+    // (ADR-025). They have no credential row — the session *is* the
+    // credential — so they are picked up from the registry, not from the
+    // connection table.
+    let driver_url = std::env::var("HETERION_WEB_DRIVER_URL")
+        .unwrap_or_else(|_| web_driver::DEFAULT_DRIVER_URL.to_string());
+    let web_driver = web_driver::WebDriverClient::new(&driver_url);
+    for entry in registry.iter() {
+        if entry.executor.as_deref() != Some("web") {
+            continue;
+        }
+        let provider = entry.id.clone();
+        if backends.contains_key(&provider) {
+            continue;
+        }
+        backends.insert(
+            provider.clone(),
+            status_aware(Arc::new(WebBackend::new(
+                provider.clone(),
+                web_driver.clone(),
+            ))),
+        );
+        tracing::info!("backend available: {provider} (web, {driver_url})");
     }
 
     report_unserved(&unserved);

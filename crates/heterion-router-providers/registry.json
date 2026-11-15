@@ -1185,8 +1185,8 @@
     "id": "blackbox-web",
     "alias": "bb-web",
     "format": "openai",
-    "executor": "blackbox-web",
-    "auth_type": "apikey",
+    "executor": "web",
+    "auth_type": "none",
     "base_url": "https://app.blackbox.ai/api/chat",
     "models": [
       {
@@ -1419,8 +1419,8 @@
     "id": "chatgpt-web",
     "alias": null,
     "format": "openai",
-    "executor": "chatgpt-web",
-    "auth_type": "apikey",
+    "executor": "web",
+    "auth_type": "none",
     "base_url": "https://chatgpt.com",
     "models": [
       {
@@ -1461,8 +1461,8 @@
     "id": "chatgpt-web-codex",
     "alias": "cgpt-codex",
     "format": "openai-responses",
-    "executor": "chatgpt-web-codex",
-    "auth_type": "apikey",
+    "executor": "web",
+    "auth_type": "none",
     "base_url": "https://chatgpt.com",
     "models": [
       {
@@ -1756,8 +1756,8 @@
     "id": "claude-web",
     "alias": "cw",
     "format": "openai",
-    "executor": "claude-web",
-    "auth_type": "apikey",
+    "executor": "web",
+    "auth_type": "none",
     "base_url": "https://claude.ai/api/organizations",
     "models": [
       {
@@ -4618,8 +4618,8 @@
     "id": "deepseek-web",
     "alias": "ds-web",
     "format": "openai",
-    "executor": "deepseek-web",
-    "auth_type": "apikey",
+    "executor": "web",
+    "auth_type": "none",
     "base_url": "https://chat.deepseek.com/api/v0/chat/completion",
     "models": [
       {
@@ -6713,8 +6713,8 @@
     "id": "gemini-web",
     "alias": "gweb",
     "format": "openai",
-    "executor": "gemini-web",
-    "auth_type": "apikey",
+    "executor": "web",
+    "auth_type": "none",
     "base_url": "https://gemini.google.com/app",
     "models": [
       {
@@ -7548,8 +7548,8 @@
     "id": "grok-web",
     "alias": "gw",
     "format": "openai",
-    "executor": "grok-web",
-    "auth_type": "apikey",
+    "executor": "web",
+    "auth_type": "none",
     "base_url": "https://grok.com/rest/app-chat/conversations/new",
     "models": [
       {
@@ -8402,8 +8402,8 @@
     "id": "kimi-web",
     "alias": "kimi-web",
     "format": "openai",
-    "executor": "kimi-web",
-    "auth_type": "apikey",
+    "executor": "web",
+    "auth_type": "none",
     "base_url": "https://www.kimi.ai",
     "models": [
       {
@@ -13499,8 +13499,8 @@
     "id": "zai-web",
     "alias": "zw",
     "format": "openai",
-    "executor": "zai-web",
-    "auth_type": "apikey",
+    "executor": "web",
+    "auth_type": "none",
     "base_url": "https://chat.z.ai",
     "models": [
       {
