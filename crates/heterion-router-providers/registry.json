@@ -956,506 +956,6 @@
     "base_url": "https://bazaarlink.ai/api/v1/chat/completions",
     "models": [
       {
-        "id": "deepseek-v4.1-flash-1017",
-        "target_format": null
-      },
-      {
-        "id": "glm-5.3-flash-abliterated",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-v4.1-flash-1017-abliterated",
-        "target_format": null
-      },
-      {
-        "id": "glm-5.3-abliterated",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.8-max",
-        "target_format": null
-      },
-      {
-        "id": "minimax-m3",
-        "target_format": null
-      },
-      {
-        "id": "glm-5v-turbo",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-v4-pro",
-        "target_format": null
-      },
-      {
-        "id": "kimi-k3",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-v4-flash",
-        "target_format": null
-      },
-      {
-        "id": "gemini-4-hydrogen",
-        "target_format": null
-      },
-      {
-        "id": "gemini-4-argon",
-        "target_format": null
-      },
-      {
-        "id": "gemini-4-carbon",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.7-plus",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.1-flash-lite-preview",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.7-max",
-        "target_format": null
-      },
-      {
-        "id": "gpt-5.3-codex",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.1-pro-preview",
-        "target_format": null
-      },
-      {
-        "id": "claude-sonnet-4.6",
-        "target_format": null
-      },
-      {
-        "id": "claude-opus-4.6",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.7-flash",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.5-35b-a3b",
-        "target_format": null
-      },
-      {
-        "id": "gpt-oss-120b",
-        "target_format": null
-      },
-      {
-        "id": "gemma-3-4b-it",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.5-27b",
-        "target_format": null
-      },
-      {
-        "id": "glm-4.7-flash",
-        "target_format": null
-      },
-      {
-        "id": "gpt-oss-safeguard-20b",
-        "target_format": null
-      },
-      {
-        "id": "gpt-6-luna",
-        "target_format": null
-      },
-      {
-        "id": "glm-5.3-flash",
-        "target_format": null
-      },
-      {
-        "id": "qwen3-next-80b-a3b-instruct",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.6-35b-a3b",
-        "target_format": null
-      },
-      {
-        "id": "claude-haiku-5.5",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.5-397b-a17b",
-        "target_format": null
-      },
-      {
-        "id": "mimo-v2.6-flash",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-v4.1-flash",
-        "target_format": null
-      },
-      {
-        "id": "gpt-5.6-luna",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.6-plus",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-v4-flash-0731",
-        "target_format": null
-      },
-      {
-        "id": "qwen3-coder-flash",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.1-flash-lite",
-        "target_format": null
-      },
-      {
-        "id": "qwen3-vl-235b-a22b-instruct",
-        "target_format": null
-      },
-      {
-        "id": "glm-4.5-air",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-chat-v3.1",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.5-flash-lite",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.5-122b-a10b",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-chat",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.6-27b",
-        "target_format": null
-      },
-      {
-        "id": "glm-4.6v",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.8-27b",
-        "target_format": null
-      },
-      {
-        "id": "glm-5.3-flashx",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3-flash-preview",
-        "target_format": null
-      },
-      {
-        "id": "mimo-v2.6-pro",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-r1-0528",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-r1",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.7-flash",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.8-flash",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.6-flash",
-        "target_format": null
-      },
-      {
-        "id": "gpt-5.4-mini",
-        "target_format": null
-      },
-      {
-        "id": "glm-4.5v",
-        "target_format": null
-      },
-      {
-        "id": "kimi-k2-0905",
-        "target_format": null
-      },
-      {
-        "id": "glm-4.5",
-        "target_format": null
-      },
-      {
-        "id": "glm-4.6",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-v4-pro-0813",
-        "target_format": null
-      },
-      {
-        "id": "glm-5.3",
-        "target_format": null
-      },
-      {
-        "id": "grok-build-0.1",
-        "target_format": null
-      },
-      {
-        "id": "claude-haiku-4.5",
-        "target_format": null
-      },
-      {
-        "id": "grok-4.3",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.5-flash",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.8-2.4t-a95b",
-        "target_format": null
-      },
-      {
-        "id": "gpt-5.6-terra",
-        "target_format": null
-      },
-      {
-        "id": "gpt-6-sol",
-        "target_format": null
-      },
-      {
-        "id": "gpt-6.1-sol",
-        "target_format": null
-      },
-      {
-        "id": "grok-4.5",
-        "target_format": null
-      },
-      {
-        "id": "grok-4.6",
-        "target_format": null
-      },
-      {
-        "id": "claude-sonnet-5",
-        "target_format": null
-      },
-      {
-        "id": "claude-sonnet-5.5",
-        "target_format": null
-      },
-      {
-        "id": "gpt-4o",
-        "target_format": null
-      },
-      {
-        "id": "gpt-5.4",
-        "target_format": null
-      },
-      {
-        "id": "kimi-k3.1-pro",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.8-27b-abliterated",
-        "target_format": null
-      },
-      {
-        "id": "claude-sonnet-4.5",
-        "target_format": null
-      },
-      {
-        "id": "claude-opus-5.5",
-        "target_format": null
-      },
-      {
-        "id": "gpt-5.6-sol",
-        "target_format": null
-      },
-      {
-        "id": "claude-opus-4.5",
-        "target_format": null
-      },
-      {
-        "id": "claude-opus-4.7",
-        "target_format": null
-      },
-      {
-        "id": "claude-opus-4.8",
-        "target_format": null
-      },
-      {
-        "id": "claude-opus-5",
-        "target_format": null
-      },
-      {
-        "id": "gpt-5.5",
-        "target_format": null
-      },
-      {
-        "id": "gpt-6-astra",
-        "target_format": null
-      },
-      {
-        "id": "claude-fable-5",
-        "target_format": null
-      },
-      {
-        "id": "claude-fable-5.1",
-        "target_format": null
-      },
-      {
-        "id": "nemotron-3.5-lightning-free",
-        "target_format": null
-      },
-      {
-        "id": "glyph-cluster",
-        "target_format": null
-      },
-      {
-        "id": "beam",
-        "target_format": null
-      },
-      {
-        "id": "ling-3.1-flash-1019",
-        "target_format": null
-      },
-      {
-        "id": "grok-4.7",
-        "target_format": null
-      },
-      {
-        "id": "muse-wonder",
-        "target_format": null
-      },
-      {
-        "id": "gpt-oss-20b",
-        "target_format": null
-      },
-      {
-        "id": "gemma-4-31b-it",
-        "target_format": null
-      },
-      {
-        "id": "gemma-4-26b-a4b-it",
-        "target_format": null
-      },
-      {
-        "id": "qwen3-coder",
-        "target_format": null
-      },
-      {
-        "id": "claude-fable-5.2",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.5-flash-02-23",
-        "target_format": null
-      },
-      {
-        "id": "seed-2.0-mini",
-        "target_format": null
-      },
-      {
-        "id": "qwen3-coder-next",
-        "target_format": null
-      },
-      {
-        "id": "qwen3-coder-30b-a3b-instruct",
-        "target_format": null
-      },
-      {
-        "id": "qwen3-vl-30b-a3b-instruct",
-        "target_format": null
-      },
-      {
-        "id": "seed-2.0-lite",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.5-plus-02-15",
-        "target_format": null
-      },
-      {
-        "id": "gemini-2.5-flash-image",
-        "target_format": null
-      },
-      {
-        "id": "qwen3.5-plus-20260420",
-        "target_format": null
-      },
-      {
-        "id": "qwen-2.5-72b-instruct",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.1-flash-image",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.1-flash-image-preview",
-        "target_format": null
-      },
-      {
-        "id": "grok-4.20",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3-pro-image",
-        "target_format": null
-      },
-      {
-        "id": "claude-opus-4.1",
-        "target_format": null
-      },
-      {
-        "id": "gemini-nano-banana-2.1",
-        "target_format": null
-      },
-      {
-        "id": "gpt-5.4-image-2",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-v4-flash-0731free",
-        "target_format": null
-      },
-      {
-        "id": "qwen/qwen3.7-flash:free",
-        "target_format": null
-      },
-      {
-        "id": "nvidia/nemotron-3.5-lightning-free:free",
-        "target_format": null
-      },
-      {
-        "id": "stealth/glyph-cluster:free",
-        "target_format": null
-      },
-      {
-        "id": "deepseek/deepseek-v4-flash-0731free:free",
-        "target_format": null
-      },
-      {
-        "id": "auto",
-        "target_format": null
-      },
-      {
         "id": "auto:free",
         "target_format": null
       }
@@ -2314,14 +1814,14 @@
     "format": "openai",
     "executor": "cloudflare-ai",
     "auth_type": "apikey",
-    "base_url": "https://api.cloudflare.com/client/v4/accounts",
+    "base_url": "https://api.cloudflare.com/client/v4/accounts/{env:HETERION_ROUTER_CLOUDFLARE_ACCOUNT_ID}/ai/v1",
     "models": [
       {
-        "id": "@cf/mistral/mistral-7b-instruct-v0.2-lora",
+        "id": "@cf/aisingapore/gemma-sea-lion-v4-27b-it",
         "target_format": null
       },
       {
-        "id": "@cf/qwen/qwen2.5-coder-32b-instruct",
+        "id": "@cf/daily-co/phonellm-mini-alpha-2",
         "target_format": null
       },
       {
@@ -2329,11 +1829,79 @@
         "target_format": null
       },
       {
-        "id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "id": "@cf/google/gemma-2b-it-lora",
+        "target_format": null
+      },
+      {
+        "id": "@cf/google/gemma-4-26b-a4b-it",
+        "target_format": null
+      },
+      {
+        "id": "@cf/google/gemma-7b-it-lora",
+        "target_format": null
+      },
+      {
+        "id": "@cf/ibm-granite/granite-4.0-h-micro",
+        "target_format": null
+      },
+      {
+        "id": "@cf/meta-llama/llama-2-7b-chat-hf-lora",
+        "target_format": null
+      },
+      {
+        "id": "@cf/meta/llama-3.1-8b-instruct-fp8",
+        "target_format": null
+      },
+      {
+        "id": "@cf/meta/llama-3.2-1b-instruct",
         "target_format": null
       },
       {
         "id": "@cf/meta/llama-3.2-3b-instruct",
+        "target_format": null
+      },
+      {
+        "id": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        "target_format": null
+      },
+      {
+        "id": "@cf/meta/llama-4-scout-17b-16e-instruct",
+        "target_format": null
+      },
+      {
+        "id": "@cf/meta/llama-guard-3-8b",
+        "target_format": null
+      },
+      {
+        "id": "@cf/mistral/mistral-7b-instruct-v0.2-lora",
+        "target_format": null
+      },
+      {
+        "id": "@cf/mistralai/mistral-small-3.1-24b-instruct",
+        "target_format": null
+      },
+      {
+        "id": "@cf/nvidia/nemotron-3-120b-a12b",
+        "target_format": null
+      },
+      {
+        "id": "@cf/openai/gpt-oss-120b",
+        "target_format": null
+      },
+      {
+        "id": "@cf/openai/gpt-oss-20b",
+        "target_format": null
+      },
+      {
+        "id": "@cf/qwen/qwen2.5-coder-32b-instruct",
+        "target_format": null
+      },
+      {
+        "id": "@cf/qwen/qwen3-30b-a3b-fp8",
+        "target_format": null
+      },
+      {
+        "id": "@cf/qwen/qwen3.8-27b",
         "target_format": null
       },
       {
@@ -2342,14 +1910,6 @@
       },
       {
         "id": "@cf/zai-org/glm-4.7-flash",
-        "target_format": null
-      },
-      {
-        "id": "@cf/moonshotai/kimi-k2.6",
-        "target_format": null
-      },
-      {
-        "id": "@cf/google/gemma-4-26b-a4b-it",
         "target_format": null
       }
     ]
@@ -9392,10 +8952,6 @@
     "auth_type": "apikey",
     "base_url": "https://api.mistral.ai/v1/chat/completions",
     "models": [
-      {
-        "id": "mistral-large-latest",
-        "target_format": null
-      },
       {
         "id": "mistral-medium-3-5",
         "target_format": null

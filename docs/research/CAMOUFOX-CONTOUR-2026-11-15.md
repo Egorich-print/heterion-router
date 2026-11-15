@@ -108,33 +108,31 @@ Camoufox по локальному HTTP.
 
 ## 5. Что требует ручного шага
 
-1. **Вход в DeepSeek.** Google-OAuth не завершается: страница рисует ссылку
-   поверх «измерителя» текста, клик уходит не туда. Нужен один вход в
-   браузере Camoufox (`https://chat.deepseek.com/sign_in`).
+1. **Вход в DeepSeek — нужен один hCaptcha.** Google-OAuth больше не проходит
+   без проверки: по клику на «Mit Google anmelden» площадка показывает
+   drag-головоломку hCaptcha («перетащите букву»). Это шаг оператора — обход
+   CAPTCHA в контуре не заводится. В headless-браузере OAuth не запускается
+   вовсе, поэтому шаг — в видимом окне Camoufox (`scripts/login_deepseek.py
+   --headed`). После капчи OAuth доходит до экрана согласия Google
+   («Продолжить»), и сессия сохраняется в профиле.
 2. **Вход в Hugging Face** — требует «Confirm your identity» (пароль).
 3. **GitLab Duo** — регистрация через OAuth, API-ключа не существует.
-4. **Кредиты**: upstage, cline, xai, novita — ключи выпущены и валидны, но
-   баланс нулевой (403/402). У bazaarlink бесплатна только `auto:free`,
-   остальные модели дают 402. Пополнение — решение владельца; в этой сессии
-   покупок не делалось.
+4. **Кредиты** — решение владельца, покупок не делалось. Техническая часть
+   закрыта: провайдеры без баланса отключены (см. ADR-026), бесплатные пути
+   оставлены в каталоге.
 5. **Mistral / codestral** — план Free запрещает выпуск API-ключей вовсе
-   («Upgrade, um deine API Keys zu aktivieren»). Нужен апгрейд плана.
-6. **Cloudflare AI** — мастер выпуска токена упирается в модальный выбор
-   зоны, а сам `cloudflare-ai` в реестре указывает на
-   `https://api.cloudflare.com/client/v4/accounts` без `account_id`; для
-   Workers AI нужен другой `base_url` и токен с правами AI.
-7. **Ключи без страницы выпуска**: routeway, nara, qoder, opencode-zen
+   («Upgrade, um deine API Keys zu aktivieren»), апгрейд невозможен. Рабочий
+   бесплатный путь найден: `mistral/codestral-latest` отвечает 200 через
+   уже имеющиеся ключи провайдера `mistral`.
+6. **Ключи без страницы выпуска**: routeway, nara, qoder, opencode-zen
    (оплата WeChat Pay), cohere и cheaperinference (застряли на онбординге),
    routeway/nara — страница ключа не найдена.
 
 ## 6. Как запускать
 
 ```sh
-# драйвер веб-исполнителей (держать живым; шлюз без него не поднимает веб-бэкенды)
-cd ~/.local/share/camoufox
-./venv/bin/python scripts/webdriver/server.py --port 20131
-
-# проверить, что драйвер видит
+# драйвер веб-исполнителей — под launchd, поднимается сам
+launchctl list | grep com.heterion.webdriver
 curl -s http://127.0.0.1:20131/health
 curl -s http://127.0.0.1:20131/providers
 
@@ -204,3 +202,82 @@ example.com:443` в логе прокси).
 camoufox80, CAMOUFOX10, CAMOUFOX) лежат в `state/services.json` — там же
 реестр: что бесплатно, чем заменено, что платное и куда вписать учётные
 данные.
+
+---
+
+## Раздел 3. Режим «только бесплатно» и Cloudflare Workers AI (2026-11-15, вечер)
+
+Решение владельца: платить нельзя, денег нет. Техническая часть закрыта
+полностью; решения, которые остаются за владельцем, — только пополнение
+счетов, если он когда-нибудь захочет.
+
+### Что отключено и почему
+
+| провайдер | ответ площадки | действие |
+|---|---|---|
+| `upstage` | 403 `API key suspended due to insufficient credit` | подключение выключено |
+| `cline` | 402 `Insufficient balance … $0.00` | подключение выключено |
+| `xai` | 403 `team doesn't have any credits or licenses` | подключение выключено |
+| `novita` | 403 `NOT_ENOUGH_BALANCE` | подключение выключено |
+| `dahl` | 401 `invalid_api_key` | подключение выключено |
+| `ai21` | 410 — endpoint выведен из обслуживания | подключение выключено |
+
+Ключи сохранены: вернуть провайдера — одна правка
+(`PATCH /api/connections/{id} {"is_active": true}` + рестарт шлюза). После
+рестарта каталог сжался с 565 до 519 моделей.
+
+Из реестра убраны модели, за которые аккаунт заплатить не может: у
+`bazaarlink` 125 id из 126 (баланс 0 → `402 … you can only afford 0`, остался
+`auto:free`), у `mistral` — `mistral-large-latest` (403
+`tier_not_allowed`, модель не в тарифе Free). `agentrouter/gpt-6-astra`
+оставлен: модель есть на площадке, исчерпан её бюджетный пул — это не наш
+счёт, и контрактный тест требует список площадки.
+
+Бесплатные пути, которые остались рабочими: `mistral/codestral-latest`,
+`bazaarlink/auto:free`, `agentrouter/gpt-5.6-sol` и `gpt-6.1-sol`, шесть
+веб-исполнителей, свободные тиры gemini/groq/typhoon/sealion/kilocode и
+теперь **Cloudflare Workers AI**.
+
+### Cloudflare AI: в чём была проблема и как исправлено
+
+1. **Адрес.** В реестре стоял `https://api.cloudflare.com/client/v4/accounts` —
+   это листинг аккаунтов (GET), а не инференс. Инференс Workers AI лежит по
+   адресу `…/accounts/{account_id}/ai/v1/chat/completions`.
+2. **`account_id` принадлежит аккаунту оператора**, а не провайдеру, поэтому в
+   реестре он не зашит: там плейсхолдер `{env:HETERION_ROUTER_CLOUDFLARE_ACCOUNT_ID}`,
+   значение — в окружении сервиса. Незакрытый плейсхолдер означает, что
+   провайдер не зарегистрирован вовсе (а не сломанный адрес).
+3. **Токен.** Нужен **аккаунтный** (`cfat_…`, разрешение `Account.Workers AI`).
+   User-токен (`cfut_…`), выпущенный в профиле, площадка на account-эндпоинтах
+   не принимает — `Authentication error`. У оператора два аккаунта Cloudflare;
+   `account_id` из истории URL дашборда принадлежал второму, рабочий —
+   `7cee0416ccd6a0257ceb58e72b22cb06`.
+4. **Модели — из площадки и проверены живым вызовом.** В выдаче
+   `GET /accounts/{id}/ai/models/search` 75 моделей, из них 40 текстовые; на
+   Free-плане (10 000 нейронов в сутки) отвечают **24**, остальные требуют
+   платёжный метод (`not available on the Workers Free plan`). В реестр записаны
+   24 проверенные.
+
+Живой ответ Workers AI (напрямую): `{"choices":[{"message":{"content":"OK"}}],
+"usage":{"neurons":1.396…}}` — нейроны видно в usage, то есть бесплатный
+тариф активен.
+
+### Автозапуск драйвера
+
+`scripts/webdriver/server.py` завёрнут в launchd-агент
+`com.heterion.webdriver` (порт 20131, `KeepAlive`, `RunAtLoad`), логи —
+`~/Library/Logs/heterion-webdriver.{out,err}.log`. Драйвер работает headless
+(фоновая служба); разовые шаги входа — в видимом браузере. Проверено:
+после `launchctl bootstrap` агент поднялся, `chatgpt-web/gpt-5` ответил через
+роутер «Работает.».
+
+### DeepSeek: что выяснилось
+
+Кнопка «Mit Google anmelden» — это `div[role=button].ds-sign-in-form__social-link`,
+и её перекрывает «измеритель» текста (`ds-sign-in-form__social-links-measurer`).
+Клик по ней **в headless не запускает OAuth вовсе**, а в видимом браузере
+запускает — но площадка показывает hCaptcha-перетаскивание. Это шаг оператора;
+после него остаётся экран согласия Google с кнопкой «Продолжить» (в
+`login_web.py` клик по плитке аккаунта сбрасывал поток, потому что флаг
+«аккаунт выбран» был привязан к `id()` страницы — Python переиспользует эти
+адреса; теперь флаг один на весь поток).
