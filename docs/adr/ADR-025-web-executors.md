@@ -191,7 +191,7 @@ POST /chat       → {"provider": "...", "model": "...", "messages": [...]}
 | `gemini-web` | есть | да |
 | `grok-web` | есть | да |
 | `zai-web` | есть | да |
-| `kimi-web` | есть | под вопросом: вход не завершается |
+| `kimi-web` | есть | да (после входа через Google) |
 | `deepseek-web` | нет | сессии нет (вход через Google не завершается) |
 | `blackbox-web` | нет | сайт сменился на корпоративный, чата нет |
 | `chatgpt-web-codex` | нет | для аккаунта Free раздел Codex недоступен |
