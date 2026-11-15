@@ -44,7 +44,7 @@ The project is structured into 5 milestones tracked under `.agents/teamwork/`:
 | **M2** | Zero-Quota Algorithmic Context Pruning | **DONE & GATED** | `crates/heterion-router-gateway/src/context_pruner.rs`, `tests/context_pruner.rs`, `tests/empirical_challenge_m2_*.rs` |
 | **M3** | Resilience, Dynamic Priority Ladder & Quality Guard | **DONE & GATED** | `crates/heterion-router-gateway/src/resilience.rs`, `crates/heterion-router-routing/src/breaker.rs`, `crates/heterion-router-http/src/client.rs` |
 | **M4** | Switchyard Dynamic Router (`heterion-router/auto`) | **DONE & GATED** | `crates/heterion-router-gateway/src/routing.rs` (candidate plan, cooldowns, failover), `src/lib.rs` (`/v1/models` listing) |
-| **M5** | End-to-End Verification, CI Gates & Deployment | **IN PROGRESS** | `scripts/ci/check.sh`, `crates/heterion-router-gateway/tests/empirical_challenge_m5_*.rs` |
+| **M5** | End-to-End Verification, CI Gates & Deployment | **DONE & GATED** | `scripts/ci/check.sh`, `crates/heterion-router-gateway/tests/empirical_challenge_m5_*.rs` |
 
 > **Note on M4:** the milestone was *not* defect-free when it was first gated. A 429 on one model
 > put the whole **provider** into cooldown, which made the Tier-3 "high-quota protectors"
@@ -88,6 +88,7 @@ If this session disconnects or another agent takes over, follow these exact step
      launchd instance on port `20128` — the service keeps serving the previously deployed build
      until a deliberate deploy, and a deploy is a separate, explicit step
      (`scripts/deploy-service.sh`, then `launchctl kickstart -k gui/$(id -u)/com.heterion.router`).
+     M5 is closed: the gate is green and the build has been deployed (`c4136aa`, 2026-11-15).
 
 ---
 
