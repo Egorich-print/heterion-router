@@ -17,6 +17,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{ChatBackend, ChunkStream, next_token, openai_request_body};
 use crate::continuation;
+use crate::developer_role;
 use crate::ids;
 use crate::responses::{MissingTerminal, ResponsesBackend, pump_sse_stream};
 
@@ -732,6 +733,7 @@ impl ProviderOpenAiBackend {
         mut request: ChatCompletionRequest,
         tx: mpsc::Sender<Result<StreamChunk, GatewayError>>,
     ) -> Result<(), GatewayError> {
+        self.adapt_developer_role(&mut request);
         self.adapt_trailing_assistant(&mut request);
         drive_openai_sse(
             &self.http,
@@ -758,6 +760,23 @@ impl ProviderOpenAiBackend {
             );
         }
     }
+
+    /// Rename `developer` turns to `system` turns for the providers that
+    /// refuse that role (see [`crate::developer_role`]).
+    fn adapt_developer_role(&self, request: &mut ChatCompletionRequest) {
+        if !developer_role::provider_rejects_developer_role(&self.provider) {
+            return;
+        }
+        let renamed = developer_role::adapt(&mut request.messages);
+        if renamed > 0 {
+            tracing::info!(
+                "renamed developer turns to system turns: provider={} model={} turns={}",
+                self.provider,
+                request.model,
+                renamed
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -779,6 +798,7 @@ impl ChatBackend for ProviderOpenAiBackend {
         {
             return responses.complete(request).await;
         }
+        self.adapt_developer_role(&mut request);
         self.adapt_trailing_assistant(&mut request);
         let mut body = openai_request_body(&request);
         body["stream"] = Value::from(false);

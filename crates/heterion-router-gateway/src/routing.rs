@@ -31,6 +31,16 @@ use crate::upstream_status_or_recovered;
 /// that is never booked (a `no_log` key) cannot grow the ring without limit.
 const ATTRIBUTION_SLOTS: usize = 256;
 
+/// The model ids the Switchyard router serves itself: the canonical
+/// `heterion-router/auto` and its `auto` alias.
+///
+/// Both are virtual: the router picks a real candidate per request, so the
+/// model that answered is reported in the `x-router-model-used` header and in
+/// `call_logs`, while the body carries the name the client asked for.
+pub fn is_auto_model(model: &str) -> bool {
+    model == "heterion-router/auto" || model == "auto"
+}
+
 /// Everything one request needs before the first attempt.
 #[derive(Debug, Clone)]
 pub struct Plan {
@@ -146,6 +156,13 @@ fn all_candidates_tripped(model: &str) -> GatewayError {
 fn no_candidate(model: &str) -> GatewayError {
     GatewayError::UnknownModel(format!(
         "{model} (no backend can serve it; check the combo entries or provider credentials)"
+    ))
+}
+
+/// Error for a plan whose every candidate is in rate-limit cooldown.
+fn all_candidates_cooling(model: &str) -> GatewayError {
+    GatewayError::Upstream(format!(
+        "{model}: every candidate model is in rate-limit cooldown; retry shortly"
     ))
 }
 
@@ -377,7 +394,7 @@ impl RoutingBackend {
     /// read is reported as such: clients must not be sent hunting for a model
     /// typo that does not exist.
     fn resolve(&self, model: &str, request: &ChatCompletionRequest) -> Result<Plan, GatewayError> {
-        if model == "heterion-router/auto" || model == "auto" {
+        if is_auto_model(model) {
             return Ok(self.auto_plan(request));
         }
 
@@ -593,8 +610,14 @@ impl ChatBackend for RoutingBackend {
         let mut tripped = false;
 
         let is_failover_plan = combo_name.is_some() || plan.len() > 1;
+        let mut cooled = false;
 
         for (name, target_model) in &plan {
+            // The cooldown and the probation steer the *ladder*: they decide
+            // which candidate to try next. The direct `provider/model` path is
+            // left alone on purpose — a client that asked for one model by id
+            // gets that model asked for, and a provider 4xx must not disable
+            // the provider (frozen contract, AGENTS.md).
             if is_failover_plan {
                 if !self.cooldowns.is_available(name, Some(target_model)) {
                     tracing::debug!(
@@ -602,8 +625,11 @@ impl ChatBackend for RoutingBackend {
                         model = target_model,
                         "skipping candidate: candidate is in active cooldown"
                     );
+                    cooled = true;
                     continue;
                 }
+                // The probation is a quality signal, not a quota signal, so it
+                // only demotes a candidate inside a failover plan.
                 if self.quality_tracker.is_in_probation(target_model) {
                     tracing::debug!(
                         model = target_model,
@@ -697,8 +723,22 @@ impl ChatBackend for RoutingBackend {
                                         crate::resilience::extract_retry_after_from_error_message(
                                             msg,
                                         );
-                                    self.cooldowns.record_429(name, None, retry_after);
-                                    self.quality_tracker.record_failure(target_model);
+                                    // Scoped to the model, not the provider: a rate
+                                    // limit on one model must not disable its
+                                    // siblings — least of all the Tier-3 high-quota
+                                    // protector that exists to absorb exactly this.
+                                    self.cooldowns.record_429(
+                                        name,
+                                        Some(target_model),
+                                        retry_after,
+                                    );
+                                    // A rate limit is a quota event, not a
+                                    // defective response: the quality penalty
+                                    // (and with it the 15-minute probation) is
+                                    // reserved for defective answers. Charging
+                                    // it here would keep the model out of the
+                                    // ladder 7.5x longer than its own cooldown
+                                    // (30s -> 60s -> 120s).
                                 }
                                 Some(402) | Some(403) => {
                                     self.cooldowns.record_quota_error(name);
@@ -742,6 +782,8 @@ impl ChatBackend for RoutingBackend {
         Err(last_error.unwrap_or_else(|| {
             if tripped {
                 all_candidates_tripped(&model)
+            } else if cooled {
+                all_candidates_cooling(&model)
             } else {
                 no_candidate(&model)
             }
@@ -771,8 +813,11 @@ impl ChatBackend for RoutingBackend {
             let mut last_error: Option<GatewayError> = None;
             let mut tripped = false;
             let is_failover_plan = combo_name.is_some() || plan.len() > 1;
+            let mut cooled = false;
 
             for (name, target_model) in &plan {
+                // Same rule as in `complete`: the cooldown and the probation
+                // steer the ladder, not the direct `provider/model` path.
                 if is_failover_plan {
                     if !this.cooldowns.is_available(name, Some(target_model)) {
                         tracing::debug!(
@@ -780,6 +825,7 @@ impl ChatBackend for RoutingBackend {
                             model = target_model,
                             "skipping candidate: candidate is in active cooldown"
                         );
+                        cooled = true;
                         continue;
                     }
                     if this.quality_tracker.is_in_probation(target_model) {
@@ -865,8 +911,16 @@ impl ChatBackend for RoutingBackend {
                                     Some(429) => {
                                         let retry_after =
                                             crate::resilience::extract_retry_after_from_error_message(msg);
-                                        this.cooldowns.record_429(name, None, retry_after);
-                                        this.quality_tracker.record_failure(target_model);
+                                        // Model-scoped, as in the non-streaming path:
+                                        // one rate-limited model must not take its
+                                        // provider siblings down with it. A rate limit
+                                        // is a quota event, not a model defect, so the
+                                        // quality penalty stays out of it.
+                                        this.cooldowns.record_429(
+                                            name,
+                                            Some(target_model),
+                                            retry_after,
+                                        );
                                     }
                                     Some(402) | Some(403) => {
                                         this.cooldowns.record_quota_error(name);
@@ -923,6 +977,8 @@ impl ChatBackend for RoutingBackend {
             let error = last_error.unwrap_or_else(|| {
                 if tripped {
                     all_candidates_tripped(&model)
+                } else if cooled {
+                    all_candidates_cooling(&model)
                 } else {
                     no_candidate(&model)
                 }

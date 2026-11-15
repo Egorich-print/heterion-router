@@ -14,6 +14,10 @@
 //! 5. Model probation enforcement: 2 consecutive failures activate 15-minute probation -> model
 //!    skipped during candidate loop.
 //! 6. Streaming failover on initial 429 error.
+//! 7. Rate-limit cooldown on the direct `provider/model` path: a model that is
+//!    known to be rate limited must not be called again.
+//! 8. A rate limit is a quota event, not a defective response: it must not cost
+//!    the model its quality score (and with it the 15-minute probation).
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -289,9 +293,23 @@ async fn test_integration_cascade_on_429() {
     assert_eq!(gemini.calls(), 1);
     assert_eq!(agentrouter.calls(), 1);
 
-    // ProviderCooldownSet has gemini in active cooldown
-    assert!(routing.cooldowns().is_in_cooldown("gemini", None));
-    assert_eq!(routing.cooldowns().availability("gemini", None), 0.0);
+    // The rate-limited model is in active cooldown. The cooldown is scoped to
+    // that model, so its siblings on the same provider stay usable.
+    assert!(
+        routing
+            .cooldowns()
+            .is_in_cooldown("gemini", Some("gemini-3-flash-preview"))
+    );
+    assert_eq!(
+        routing
+            .cooldowns()
+            .availability("gemini", Some("gemini-3-flash-preview")),
+        0.0
+    );
+    assert!(
+        !routing.cooldowns().is_in_cooldown("gemini", None),
+        "a per-model 429 must not put the whole provider in cooldown"
+    );
 
     // Second request: auto_plan calculates effective priority for gemini as 0.0,
     // so it routes directly to agentrouter without calling gemini!
@@ -498,6 +516,14 @@ async fn test_integration_cascade_with_jit_context_pruner() {
         "upstream status 429: rate limit".into(),
     )));
 
+    // Candidate 1b (the other agentrouter model) is rate-limited as well. The
+    // cooldown is scoped to the model that was rate-limited, so the sibling is
+    // still tried and needs its own failure — otherwise the mock answers with
+    // its default echo and the request never reaches the pruned candidate.
+    agentrouter.push_response(Err(GatewayError::Upstream(
+        "upstream status 429: rate limit".into(),
+    )));
+
     // Candidate 2 (mistral, codestral-latest, 256k limit) receives pruned request and succeeds
     mistral.push_response(Ok(ChatCompletionResponse {
         id: "resp-mistral".into(),
@@ -661,8 +687,12 @@ async fn test_integration_stream_cascade_on_429() {
         Some("agentrouter")
     );
 
-    // gemini is now in cooldown
-    assert!(routing.cooldowns().is_in_cooldown("gemini", None));
+    // The rate-limited model is now in cooldown
+    assert!(
+        routing
+            .cooldowns()
+            .is_in_cooldown("gemini", Some("gemini-3-flash-preview"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -708,10 +738,10 @@ async fn test_challenge_429_exponential_backoff_and_recovery() {
     assert_eq!(gemini.calls(), 1);
     assert_eq!(agentrouter.calls(), 1);
 
-    // Cooldown is active on gemini: ~30s
+    // Cooldown is active on the rate-limited model: ~30s
     let rem1 = routing
         .cooldowns()
-        .get_cooldown_remaining("gemini", None)
+        .get_cooldown_remaining("gemini", Some("gemini-3-flash-preview"))
         .unwrap();
     assert!(rem1.as_secs() >= 29 && rem1.as_secs() <= 30);
 
@@ -743,32 +773,40 @@ async fn test_challenge_429_exponential_backoff_and_recovery() {
     assert_eq!(agentrouter.calls(), 4);
 
     // 3. Test backoff progression in ProviderCooldownSet directly:
-    // Streak 2 at t0 + 1s -> 60s
+    // Streak 2 at t0 + 1s -> 60s. Model-scoped, the same scope the router
+    // uses when it records a 429.
     let t1 = t0 + std::time::Duration::from_secs(1);
-    routing.cooldowns().record_429_at("gemini", None, None, t1);
+    routing
+        .cooldowns()
+        .record_429_at("gemini", Some("gemini-3-flash-preview"), None, t1);
     let rem2 = routing
         .cooldowns()
-        .get_cooldown_remaining_at("gemini", None, t1)
+        .get_cooldown_remaining_at("gemini", Some("gemini-3-flash-preview"), t1)
         .unwrap();
     assert_eq!(rem2, std::time::Duration::from_secs(60));
 
     // Streak 3 at t1 + 1s -> 120s capped
     let t2 = t1 + std::time::Duration::from_secs(1);
-    routing.cooldowns().record_429_at("gemini", None, None, t2);
+    routing
+        .cooldowns()
+        .record_429_at("gemini", Some("gemini-3-flash-preview"), None, t2);
     let rem3 = routing
         .cooldowns()
-        .get_cooldown_remaining_at("gemini", None, t2)
+        .get_cooldown_remaining_at("gemini", Some("gemini-3-flash-preview"), t2)
         .unwrap();
     assert_eq!(rem3, std::time::Duration::from_secs(120));
 
     // 4. Retry-After explicit header override (e.g. 75s)
     let t3 = t2 + std::time::Duration::from_secs(1);
-    routing
-        .cooldowns()
-        .record_429_at("gemini", None, Some(std::time::Duration::from_secs(75)), t3);
+    routing.cooldowns().record_429_at(
+        "gemini",
+        Some("gemini-3-flash-preview"),
+        Some(std::time::Duration::from_secs(75)),
+        t3,
+    );
     let rem_override = routing
         .cooldowns()
-        .get_cooldown_remaining_at("gemini", None, t3)
+        .get_cooldown_remaining_at("gemini", Some("gemini-3-flash-preview"), t3)
         .unwrap();
     assert_eq!(rem_override, std::time::Duration::from_secs(75));
 
@@ -780,7 +818,11 @@ async fn test_challenge_429_exponential_backoff_and_recovery() {
             .quality_tracker()
             .record_success("gemini-3-flash-preview"); // restore score to top
     }
-    assert!(routing.cooldowns().is_available("gemini", None));
+    assert!(
+        routing
+            .cooldowns()
+            .is_available("gemini", Some("gemini-3-flash-preview"))
+    );
 
     gemini.push_response(Ok(ChatCompletionResponse {
         id: "resp-gemini-restored".into(),
@@ -917,6 +959,12 @@ async fn test_challenge_jit_context_pruner_multi_tier_failover() {
     let mistral = Arc::new(MockBackend::new("mistral"));
 
     // Candidate 1 (agentrouter, 870k context limit) returns 429
+    agentrouter.push_response(Err(GatewayError::Upstream(
+        "upstream status 429: rate limit".into(),
+    )));
+
+    // Candidate 1b (the other agentrouter model) is rate-limited as well — see
+    // the sibling-model note in test_integration_cascade_with_jit_context_pruner.
     agentrouter.push_response(Err(GatewayError::Upstream(
         "upstream status 429: rate limit".into(),
     )));
@@ -1166,4 +1214,94 @@ fn test_challenge_post_flight_tool_validation_edge_cases() {
         raw: None,
     };
     assert!(verify_tool_response(&req_with_tools, &res_polite).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Suite: the direct `provider/model` path and the rate-limit penalty
+// ---------------------------------------------------------------------------
+
+/// The direct `provider/model` path is deliberately **not** gated by the
+/// rate-limit cooldown: the client asked for one model by id, and the frozen
+/// contract (AGENTS.md) says a provider 4xx must not disable the provider.
+/// The cooldown steers the *ladder* — which candidate to try next — not the
+/// client's explicit choice.
+///
+/// The M5 challenger called this gap a defect (D-1). It is kept as a
+/// deliberate deviation, and this test pins it so the choice stays visible
+/// instead of quietly changing.
+#[tokio::test]
+async fn a_direct_model_request_is_not_disabled_by_a_rate_limit() {
+    let gemini = Arc::new(MockBackend::new("gemini"));
+    let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
+    backends.insert("gemini".into(), gemini.clone());
+    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+
+    for _ in 0..2 {
+        gemini.push_response(Err(GatewayError::Upstream(
+            "upstream status 429: rate limit exceeded".into(),
+        )));
+    }
+
+    let request = ChatCompletionRequest {
+        model: "gemini/gemini-3-flash-preview".into(),
+        messages: vec![ChatMessage::plain("user", "hi")],
+        ..Default::default()
+    };
+
+    // Both requests are dispatched: the provider is asked again.
+    let first = routing.complete(request.clone()).await.unwrap_err();
+    assert!(matches!(first, GatewayError::Upstream(_)), "{first:?}");
+    let second = routing.complete(request).await.unwrap_err();
+    assert!(matches!(second, GatewayError::Upstream(_)), "{second:?}");
+    assert_eq!(
+        gemini.calls(),
+        2,
+        "a provider 4xx must not disable the provider on the direct path"
+    );
+
+    // The cooldown is still recorded — it is the ladder that consults it.
+    assert!(
+        routing
+            .cooldowns()
+            .is_in_cooldown("gemini", Some("gemini-3-flash-preview")),
+        "the rate-limited model must carry a cooldown"
+    );
+}
+
+/// A rate limit is a quota event, not a defective response. The directive
+/// reserves the quality penalty (`QualityScore -= 0.3`, 15-minute probation)
+/// for defective answers — empty content, repetition loops, pseudo-XML tool
+/// tags. Charging it for a 429 keeps the model out of the ladder for 15
+/// minutes while its own rate-limit cooldown is 30s -> 60s -> 120s.
+#[tokio::test]
+async fn a_rate_limit_does_not_punish_the_model_quality() {
+    let gemini = Arc::new(MockBackend::new("gemini"));
+    let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
+    backends.insert("gemini".into(), gemini.clone());
+    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+
+    gemini.push_response(Err(GatewayError::Upstream(
+        "upstream status 429: rate limit exceeded".into(),
+    )));
+
+    let request = ChatCompletionRequest {
+        model: "gemini/gemini-3-flash-preview".into(),
+        messages: vec![ChatMessage::plain("user", "hi")],
+        ..Default::default()
+    };
+    let _ = routing.complete(request).await.unwrap_err();
+
+    assert_eq!(
+        routing
+            .quality_tracker()
+            .get_score("gemini-3-flash-preview"),
+        1.0,
+        "a rate limit must not cost the model its quality score"
+    );
+    assert!(
+        !routing
+            .quality_tracker()
+            .is_in_probation("gemini-3-flash-preview"),
+        "a rate limit must not put the model into the 15-minute probation"
+    );
 }

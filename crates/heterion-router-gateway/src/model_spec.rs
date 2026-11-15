@@ -121,7 +121,19 @@ pub fn model_spec(model: &str) -> ModelSpec {
         };
     }
 
-    // 8. DeepSeek models (128k context)
+    // 8. Claude models (200k context). The window is what the router plans
+    // and prunes against, so it lives here with the other windows rather than
+    // in a second table.
+    if bare.starts_with("claude") {
+        return ModelSpec {
+            context_window: 200_000,
+            supports_vision: false,
+            tool_support: ToolSupport::Native,
+            tier: ModelTier::Fallback,
+        };
+    }
+
+    // 9. DeepSeek models (128k context)
     if bare.starts_with("deepseek") {
         let tier = if bare.contains("reasoner") || bare.contains("r1") {
             ModelTier::FrontierReasoning
@@ -161,8 +173,15 @@ pub fn is_pseudo_tool_model(provider: &str, model: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Classifier-level check: which providers/models emit unstructured XML
+    /// pseudo-tools instead of native `tool_calls`.
+    ///
+    /// The routing-level proof of the same criterion (a request with `tools`
+    /// is never directed to `syn-pro` or `morph`) lives in
+    /// `tests/auto_routing.rs::test_native_tool_filtering`, which registers
+    /// those backends and asserts they receive no call.
     #[test]
-    fn test_native_tool_filtering() {
+    fn pseudo_tool_models_are_classified() {
         // Assert pseudo-tool models return true
         assert!(is_pseudo_tool_model("", "morph-v3-large"));
         assert!(is_pseudo_tool_model("morph", "morph-v3-large"));

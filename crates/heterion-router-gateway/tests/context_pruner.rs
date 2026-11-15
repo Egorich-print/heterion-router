@@ -687,19 +687,49 @@ fn test_edge_case_pruning_idempotency() {
 
 #[test]
 fn test_model_context_limits_catalog() {
+    // The pruner plans and prunes against the capability catalog's window, so
+    // the two tables cannot drift apart.
+    for model in [
+        "gemini-2.5-pro",
+        "google/gemini-2.5-flash",
+        "gemini-3-flash-preview",
+        "agentrouter/gpt-5.6-sol",
+        "gpt-6.1-sol",
+        "gpt-6-astra",
+        "mistral/codestral-latest",
+        "codestral-2501",
+        "claude-3-5-sonnet-latest",
+        "deepseek-chat",
+        "deepseek/deepseek-reasoner",
+        "gemini/gemma-4-26b-a4b-it",
+        "gemma-4-26b-a4b-it",
+        "mistral/mistral-large-latest",
+        "unknown-model",
+    ] {
+        assert_eq!(
+            model_context_limit(model),
+            heterion_router_gateway::model_spec::model_spec(model).context_window,
+            "the pruner and the capability catalog disagree about {model}"
+        );
+    }
+
     // 1M models
     assert_eq!(model_context_limit("gemini-2.5-pro"), 1_000_000);
     assert_eq!(model_context_limit("google/gemini-2.5-flash"), 1_000_000);
     assert_eq!(model_context_limit("gemini-3-flash-preview"), 1_000_000);
 
-    // 870k models
-    assert_eq!(model_context_limit("agentrouter/gpt-5.6-sol"), 870_000);
-    assert_eq!(model_context_limit("gpt-6.1-sol"), 870_000);
-    assert_eq!(model_context_limit("gpt-6-astra"), 870_000);
+    // 512k models — the operational window, deliberately below the ~870k the
+    // agentrouter platform measured, so a request never runs into its
+    // balancer timeout.
+    assert_eq!(model_context_limit("agentrouter/gpt-5.6-sol"), 512_000);
+    assert_eq!(model_context_limit("gpt-6.1-sol"), 512_000);
+    assert_eq!(model_context_limit("gpt-6-astra"), 512_000);
 
     // 256k models
     assert_eq!(model_context_limit("mistral/codestral-latest"), 256_000);
     assert_eq!(model_context_limit("codestral-2501"), 256_000);
+    assert_eq!(model_context_limit("gemma-4-26b-a4b-it"), 256_000);
+    assert_eq!(model_context_limit("gemini/gemma-4-26b-a4b-it"), 256_000);
 
     // 200k models
     assert_eq!(model_context_limit("claude-3-5-sonnet-latest"), 200_000);
@@ -707,7 +737,6 @@ fn test_model_context_limits_catalog() {
     // 128k models
     assert_eq!(model_context_limit("deepseek-chat"), 128_000);
     assert_eq!(model_context_limit("deepseek/deepseek-reasoner"), 128_000);
-    assert_eq!(model_context_limit("gemini/gemma-4-26b-a4b-it"), 128_000);
     assert_eq!(model_context_limit("mistral/mistral-large-latest"), 128_000);
     assert_eq!(model_context_limit("unknown-model"), 128_000);
 }

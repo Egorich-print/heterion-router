@@ -1160,8 +1160,14 @@ mod tests {
         assert!(inspection.estimated_tokens >= 1124);
     }
 
+    /// Capability-table level check: only Gemini models are vision-capable.
+    ///
+    /// The routing-level proof of the same criterion (a request with an image
+    /// is served by a multimodal model and never by a text-only one) lives in
+    /// `tests/auto_routing.rs::test_multimodal_vision_routing`, which builds a
+    /// real request and runs it through the router.
     #[test]
-    fn test_multimodal_vision_routing() {
+    fn vision_capability_table_selects_only_gemini_models() {
         let req = ChatCompletionRequest {
             messages: vec![ChatMessage {
                 role: "user".to_string(),

@@ -687,7 +687,6 @@ dependencies = [
  "httpdate",
  "reqwest",
  "serde_json",
- "thiserror",
  "tokio",
  "wiremock",
 ]

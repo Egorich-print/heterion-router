@@ -17,22 +17,31 @@
 //! so `response` only ever bites when it is *shorter* than `idle`.
 
 use serde_json::Value;
+use std::fmt;
 use std::time::Duration;
-use thiserror::Error;
 
 /// HTTP failures.
-#[derive(Debug, Error)]
+///
+/// The `Display` is written by hand instead of derived, because the
+/// `Retry-After` header has to survive the trip: the executors turn this
+/// error into a message (`error.to_string()`), and the router reads the
+/// cooldown length out of that message. A derived `Display` dropped the
+/// header on the floor, so a provider that asked for `Retry-After: 300` got
+/// the 30 s first backoff step instead — ten times too short.
+///
+/// The header rides **before** the body, so the body stays the last thing in
+/// the message: the JSON payload parsers (`error_payload` in the gateway,
+/// `extract_retry_after_from_error_message`) look for the first `{` and parse
+/// from there to the end, and trailing text would break them.
+#[derive(Debug)]
 pub enum HttpError {
     /// Transport / protocol failure.
-    #[error("http transport error: {0}")]
-    Transport(#[from] reqwest::Error),
+    Transport(reqwest::Error),
 
     /// The upstream never started responding inside its budget.
-    #[error("upstream did not start responding within {0:?}")]
     NoResponse(Duration),
 
     /// Upstream answered with a non-success status.
-    #[error("upstream status {status}: {body}")]
     Status {
         /// HTTP status code.
         status: u16,
@@ -41,6 +50,43 @@ pub enum HttpError {
         /// Optional Retry-After duration.
         retry_after: Option<Duration>,
     },
+}
+
+impl fmt::Display for HttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Transport(error) => write!(f, "http transport error: {error}"),
+            Self::NoResponse(budget) => {
+                write!(f, "upstream did not start responding within {budget:?}")
+            }
+            Self::Status {
+                status,
+                body,
+                retry_after,
+            } => {
+                write!(f, "upstream status {status}: ")?;
+                if let Some(duration) = retry_after {
+                    write!(f, "retry-after: {}s ", duration.as_secs())?;
+                }
+                write!(f, "{body}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HttpError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Transport(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<reqwest::Error> for HttpError {
+    fn from(error: reqwest::Error) -> Self {
+        Self::Transport(error)
+    }
 }
 
 /// Convenience result alias.

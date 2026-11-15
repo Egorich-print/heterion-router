@@ -19,6 +19,7 @@ pub mod context_pruner;
 pub mod continuation;
 pub mod cors;
 pub mod credentials;
+pub mod developer_role;
 pub mod embeddings;
 pub mod exa;
 pub mod gemini;
@@ -411,8 +412,31 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
     }))
 }
 
+/// Append a catalog entry unless its id was already advertised.
+///
+/// A client that maps the catalog by id must not see the same id twice: the
+/// first entry wins, and a later duplicate would silently replace a rich entry
+/// (the auto models carry their capabilities) with a bare one (a combo stub).
+fn push_catalog_entry(
+    data: &mut Vec<Value>,
+    advertised: &mut std::collections::HashSet<String>,
+    entry: Value,
+) {
+    let id = entry
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if !advertised.insert(id) {
+        return;
+    }
+    data.push(entry);
+}
+
 async fn list_models(State(state): State<AppState>, _auth: Authenticated) -> impl IntoResponse {
     let mut data: Vec<Value> = Vec::new();
+    // Ids already advertised.
+    let mut advertised: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Advertise dynamic Switchyard auto-routing models at the top of the catalog
     let auto_capabilities = json!({
@@ -424,37 +448,68 @@ async fn list_models(State(state): State<AppState>, _auth: Authenticated) -> imp
         "dynamic_ladder": true,
     });
 
-    data.push(json!({
-        "id": "heterion-router/auto",
-        "object": "model",
-        "created": state.started_unix,
-        "owned_by": "heterion-router",
-        "capabilities": auto_capabilities.clone(),
-        "heterion-router": {
-            "kind": "auto",
-            "strategy": "switchyard",
-            "is_canonical": true,
-            "alias": "auto",
+    push_catalog_entry(
+        &mut data,
+        &mut advertised,
+        json!({
+            "id": "heterion-router/auto",
+            "object": "model",
+            "created": state.started_unix,
+            "owned_by": "heterion-router",
             "capabilities": auto_capabilities.clone(),
-        },
-    }));
+            "heterion-router": {
+                "kind": "auto",
+                "strategy": "switchyard",
+                "is_canonical": true,
+                "alias": "auto",
+                "capabilities": auto_capabilities.clone(),
+            },
+        }),
+    );
 
-    data.push(json!({
-        "id": "auto",
-        "object": "model",
-        "created": state.started_unix,
-        "owned_by": "heterion-router",
-        "capabilities": auto_capabilities.clone(),
-        "heterion-router": {
-            "kind": "auto",
-            "strategy": "switchyard",
-            "is_alias": true,
-            "canonical_id": "heterion-router/auto",
-            "capabilities": auto_capabilities,
-        },
-    }));
+    push_catalog_entry(
+        &mut data,
+        &mut advertised,
+        json!({
+            "id": "auto",
+            "object": "model",
+            "created": state.started_unix,
+            "owned_by": "heterion-router",
+            "capabilities": auto_capabilities.clone(),
+            "heterion-router": {
+                "kind": "auto",
+                "strategy": "switchyard",
+                "is_alias": true,
+                "canonical_id": "heterion-router/auto",
+                "capabilities": auto_capabilities,
+            },
+        }),
+    );
 
-    // Combo names are first-class models for clients.
+    // Ids served by a live provider backend (`provider/model`). A combo must
+    // not shadow them: the client would read "kind": "combo" for a model the
+    // router actually serves through the provider.
+    let provider_ids: std::collections::HashSet<String> = state
+        .registry
+        .as_ref()
+        .map(|registry| {
+            registry
+                .iter()
+                .filter(|entry| state.backend_names.iter().any(|name| name == &entry.id))
+                .flat_map(|entry| {
+                    entry
+                        .models
+                        .iter()
+                        .map(|model| format!("{}/{}", entry.id, model.id))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // Combo names are first-class models for clients. A combo that carries a
+    // name the router already advertises (`auto`, `heterion-router/auto`)
+    // is the legacy static ladder, superseded by the dynamic router — it must
+    // not overwrite the richer auto entry above with a bare combo stub.
     if let Some(db) = state.db.as_ref() {
         let guard = db.connection();
         if let Ok(combos) = heterion_router_db::repos::list_active_combos(&guard) {
@@ -466,12 +521,23 @@ async fn list_models(State(state): State<AppState>, _auth: Authenticated) -> imp
                 if hidden {
                     continue;
                 }
-                data.push(json!({
-                    "id": combo.name,
-                    "object": "model",
-                    "owned_by": "heterion-router",
-                    "heterion-router": { "kind": "combo" },
-                }));
+                if provider_ids.contains(&combo.name) {
+                    tracing::debug!(
+                        combo = %combo.name,
+                        "skipping combo in the catalog: the id belongs to a live provider model"
+                    );
+                    continue;
+                }
+                push_catalog_entry(
+                    &mut data,
+                    &mut advertised,
+                    json!({
+                        "id": combo.name,
+                        "object": "model",
+                        "owned_by": "heterion-router",
+                        "heterion-router": { "kind": "combo" },
+                    }),
+                );
             }
         }
     }
@@ -483,12 +549,16 @@ async fn list_models(State(state): State<AppState>, _auth: Authenticated) -> imp
                 continue;
             }
             for model in &entry.models {
-                data.push(json!({
-                    "id": format!("{}/{}", entry.id, model.id),
-                    "object": "model",
-                    "owned_by": entry.id,
-                    "heterion-router": { "kind": "provider", "provider": entry.id },
-                }));
+                push_catalog_entry(
+                    &mut data,
+                    &mut advertised,
+                    json!({
+                        "id": format!("{}/{}", entry.id, model.id),
+                        "object": "model",
+                        "owned_by": entry.id,
+                        "heterion-router": { "kind": "provider", "provider": entry.id },
+                    }),
+                );
             }
         }
     }
@@ -534,6 +604,15 @@ async fn chat_completions(
                 response.usage.completion_tokens,
             );
             let served = response.model.clone();
+            // The `auto` alias is a virtual model: the body must name the
+            // model the client asked for, exactly as the streaming path does
+            // (its chunks carry the requested name too). The model that
+            // actually answered stays in the `x-router-model-used` header and
+            // in `call_logs` — the body is the client's view of its own
+            // request, not the router's internal routing table.
+            if routing::is_auto_model(&model) {
+                response.model = model.clone();
+            }
             let mut usage = response.usage;
             // A provider that reports no usage must not look free.
             let output_bytes = usage_estimate::value_text_bytes(
@@ -2860,6 +2939,63 @@ mod tests {
             .collect();
         assert!(ids.contains(&"visible"));
         assert!(!ids.contains(&"hidden"));
+    }
+
+    /// A combo may carry the name of a model the router already advertises —
+    /// the legacy static ladder is literally named `auto` and
+    /// `heterion-router/auto`. The catalog must still list every id once: a
+    /// client that maps by id would otherwise lose the auto capabilities,
+    /// because the bare combo stub comes last.
+    #[tokio::test]
+    async fn model_list_never_repeats_an_id() {
+        let (router, db) = open_state();
+        {
+            let guard = db.connection();
+            for name in ["auto", "heterion-router/auto"] {
+                heterion_router_db::repos::upsert_combo(
+                    &guard,
+                    &heterion_router_db::repos::ComboRow {
+                        id: name.to_string(),
+                        name: name.to_string(),
+                        data: json!({"isHidden": false, "models": []}).to_string(),
+                        sort_order: 0,
+                        active: true,
+                    },
+                )
+                .unwrap();
+            }
+        }
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        let entries = value["data"].as_array().unwrap().clone();
+
+        let mut seen = std::collections::HashSet::new();
+        for entry in &entries {
+            let id = entry["id"].as_str().unwrap_or_default();
+            assert!(seen.insert(id.to_string()), "id `{id}` is listed twice");
+        }
+
+        // The surviving entry must be the rich auto one, not a combo stub.
+        let auto = entries
+            .iter()
+            .find(|entry| entry["id"] == "auto")
+            .expect("the auto alias must stay in the catalog");
+        assert_eq!(auto["heterion-router"]["kind"], "auto");
+        assert!(
+            auto["capabilities"]["dynamic_ladder"].as_bool() == Some(true),
+            "the auto entry lost its capabilities to a combo stub: {auto}"
+        );
     }
 
     #[tokio::test]

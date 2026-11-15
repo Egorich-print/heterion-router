@@ -2,7 +2,7 @@
 
 > **Document Type:** Project Handover & Architecture Continuity Guide  
 > **Target:** Any LLM model / engineer / subagent picking up work on `heterion-router`.  
-> **Last Updated:** 2026-11-14 20:12 UTC+3  
+> **Last Updated:** 2026-11-15 18:10 UTC+3  
 > **Working Directory:** `/Volumes/Netac_SSD/ai-workstation/Projects/heterion-router`  
 
 ---
@@ -25,9 +25,9 @@ Replace static manual combos (`main-1m`, `main-262k`, etc.) in `heterion-router`
    - **Tier 2 (Workhorses / 262k / Code Specialists):** `mistral/codestral-latest`, `gemini/gemma-4-26b-a4b-it`.
    - **Tier 3 (High-Speed / Quota Protectors):** `gemini/gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`.
 3. **Resilience & Fault Isolation:**
-   - **HTTP 429:** Exponential backoff (30s $\rightarrow$ 60s $\rightarrow$ 120s) or `Retry-After`; cascades immediately to next tier; auto-restores to top of ladder upon cooldown expiration.
-   - **HTTP 403 / 402:** Frozen for 1-6h (or until DB key updated) to avoid burning futile roundtrips.
-   - **HTTP 502 / 504 / Transport Drops:** Managed by existing `BreakerSet`.
+   - **HTTP 429:** Exponential backoff (30s $\rightarrow$ 60s $\rightarrow$ 120s) or `Retry-After`; the cooldown is **model-scoped** — only the rate-limited model leaves the ladder, the sibling models of the same provider stay usable; the request cascades immediately to the next tier; the model is restored to the ladder when the cooldown expires.
+   - **HTTP 403 / 402:** **Provider-scoped** balance freeze for 1 hour (`DEFAULT_BALANCE_FREEZE`) — the balance belongs to the account, not to one model; no futile roundtrips.
+   - **HTTP 502 / 504 / Transport Drops:** Managed by the existing `BreakerSet`; a repeated 5xx additionally puts the *model* into a 15-minute probation, so a single dead model never takes its whole provider down.
    - **Defective Responses (Pseudo-XML, empty output, repetition loops):** Penalized `QualityScore -= 0.3`, demoted 1-2 tiers; 15-minute probation on repeated failures; gradual recovery back to 1.0 on clean streaks.
 4. **Strict Tool-Calling Isolation:**
    - Models emitting raw XML `<tool_call>` (`morph`, `syn-pro`) are classified as `ToolSupport::PseudoXml` and **strictly excluded** from any request containing `request.tools`.
@@ -41,10 +41,16 @@ The project is structured into 5 milestones tracked under `.agents/teamwork/`:
 | Milestone | Description | Status | Key Files |
 |---|---|---|---|
 | **M1** | Request Inspector & Model Capability Catalog | **DONE & AUDITED (CLEAN)** | `crates/heterion-router-gateway/src/inspector.rs`, `model_spec.rs`, `tests/adversarial_inspector.rs`, `tests/agent_stage_stress.rs`, `tests/empirical_challenge_m1_it3.rs` |
-| **M2** | Zero-Quota Algorithmic Context Pruning | **IMPLEMENTED (In Audit It2)** | `crates/heterion-router-gateway/src/context_pruner.rs`, `tests/context_pruner.rs`, `tests/empirical_challenge_m2_*.rs` |
-| **M3** | Resilience, Dynamic Priority Ladder & Quality Guard | **QUEUED / NEXT** | To be implemented in `crates/heterion-router-gateway/src/resilience.rs` or `quality_matrix.rs` |
-| **M4** | Switchyard Dynamic Router (`heterion-router/auto`) | **QUEUED** | Wire up `auto_router.rs` in `crates/heterion-router-gateway/src/routing.rs` |
-| **M5** | End-to-End Verification, CI Gates & Deployment | **QUEUED** | `scripts/ci/check.sh`, `scripts/deploy-service.sh` |
+| **M2** | Zero-Quota Algorithmic Context Pruning | **DONE & GATED** | `crates/heterion-router-gateway/src/context_pruner.rs`, `tests/context_pruner.rs`, `tests/empirical_challenge_m2_*.rs` |
+| **M3** | Resilience, Dynamic Priority Ladder & Quality Guard | **DONE & GATED** | `crates/heterion-router-gateway/src/resilience.rs`, `crates/heterion-router-routing/src/breaker.rs`, `crates/heterion-router-http/src/client.rs` |
+| **M4** | Switchyard Dynamic Router (`heterion-router/auto`) | **DONE & GATED** | `crates/heterion-router-gateway/src/routing.rs` (candidate plan, cooldowns, failover), `src/lib.rs` (`/v1/models` listing) |
+| **M5** | End-to-End Verification, CI Gates & Deployment | **IN PROGRESS** | `scripts/ci/check.sh`, `crates/heterion-router-gateway/tests/empirical_challenge_m5_*.rs` |
+
+> **Note on M4:** the milestone was *not* defect-free when it was first gated. A 429 on one model
+> put the whole **provider** into cooldown, which made the Tier-3 "high-quota protectors"
+> unreachable and turned a rate limit into a hard failure. The fix (model-scoped 429 cooldown)
+> and the tests that pin it are part of the M5 change set — see
+> `.agents/teamwork/challenger_m4_1/handoff.md:59-85`.
 
 ---
 
@@ -67,20 +73,21 @@ If this session disconnects or another agent takes over, follow these exact step
    cargo clippy --workspace --all-targets -- -D warnings
    cargo test --workspace
    ```
-4. **Next Tasks to complete:**
-   - **For Milestone 3:** Implement dynamic ladder scoring:
-     - `DynamicPriorityLadder` tracking `quality_score: f32` (1.0 default) and `cooldown_until: Option<Instant>`.
-     - 429 backoff tracking and 403 freeze.
-     - Post-flight response check: if `tools` were passed but response has empty `tool_calls` and contains `<tool_call>`, penalize model quality score.
-   - **For Milestone 4:** Wire `heterion-router/auto` in `crates/heterion-router-gateway/src/routing.rs`:
-     - Intercept `model == "heterion-router/auto" || model == "auto"`.
-     - Run `inspector.rs` $\rightarrow$ evaluate dynamic priority ladder $\rightarrow$ select top candidate.
-     - On failure (429/403/502/bad response), transparently cascade to next candidate with JIT context pruning if needed.
-   - **For Milestone 5:** Deploy to launchd service:
+4. **Where the work actually stands:**
+   - **M1–M4 are implemented and gated.** The dynamic ladder, the model-scoped cooldowns, the
+     quality tracker and the `auto` candidate plan live in
+     `crates/heterion-router-gateway/src/{routing,resilience,inspector,model_spec,context_pruner}.rs`.
+   - **M5 is the verification milestone** — adversarial suites, the CI gate and the deployment.
+   - **For Milestone 5:** verify with the repository gate, **not** against the live service:
      ```bash
-     scripts/deploy-service.sh
-     curl -s http://127.0.0.1:20128/healthz
+     cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+     # or, the same thing CI runs:
+     ./scripts/ci/check.sh
      ```
+     Per the project rule (`AGENTS.md`), mission changes are **not** verified against the live
+     launchd instance on port `20128` — the service keeps serving the previously deployed build
+     until a deliberate deploy, and a deploy is a separate, explicit step
+     (`scripts/deploy-service.sh`, then `launchctl kickstart -k gui/$(id -u)/com.heterion.router`).
 
 ---
 

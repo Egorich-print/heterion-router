@@ -21,25 +21,20 @@ pub const DIGEST_TAIL_BYTES: usize = 160;
 /// Target context budget safety factor (90% of model window).
 pub const TOKEN_BUDGET_SAFETY_FACTOR: f64 = 0.90;
 
-/// Returns the family context window limit for a given model identifier.
+/// Returns the context window the router plans and prunes against.
+///
+/// The window is the one the capability catalog holds ([`crate::model_spec`]),
+/// so the two can never drift apart: a candidate that the dynamic plan
+/// admitted against this number is pruned against the same number, and a
+/// request never leaves the router larger than the limit the plan promised.
+///
+/// The windows here are the *operational* ones — the margin the router
+/// deliberately keeps below the platform's physical window (the agentrouter
+/// models are planned against 512k, not against the ~870k their platform
+/// measured), because a request that only fits the physical window is the one
+/// that runs into the platform's balancer timeout.
 pub fn model_context_limit(model: &str) -> u32 {
-    let lower = model.to_lowercase();
-    let bare = lower.rsplit('/').next().unwrap_or(&lower);
-
-    if bare.starts_with("gemini") {
-        1_000_000
-    } else if bare.starts_with("gpt-5.6") || bare.starts_with("gpt-6") {
-        870_000
-    } else if bare.starts_with("codestral")
-        || bare == "gemma"
-        || (bare.starts_with("gemma") && !lower.starts_with("gemini/"))
-    {
-        256_000
-    } else if bare.starts_with("claude") {
-        200_000
-    } else {
-        128_000
-    }
+    crate::model_spec::model_spec(model).context_window
 }
 
 /// Partition result indicating initial user goal index and active tail cutoff boundary.

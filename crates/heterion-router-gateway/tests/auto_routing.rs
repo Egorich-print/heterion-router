@@ -7,7 +7,7 @@
 //! 2. `test_alias_resolution_equivalence`: `heterion-router/auto` and `auto` resolve symmetrically,
 //!    preserve requested model on the wire, and book attribution under `heterion-router/auto`.
 //! 3. `test_multi_tier_cascading_failover`: Cascading across Tier 1 -> Tier 2 -> Tier 3.
-//! 4. `test_tool_call_preflight_exclusion`: Requests with tools exclude pseudo-tool and search-only models.
+//! 4. `test_native_tool_filtering`: Requests with tools exclude pseudo-tool and search-only models.
 //! 5. `test_multimodal_vision_routing`: Requests with images only select vision-capable models (Gemini).
 //! 6. `test_high_context_jit_pruning_failover`: Prompts >280k fold intermediate tools to fit 256k Tier 2 candidate.
 //! 7. `test_streaming_prestream_failover_and_attribution`: Streaming SSE failover on initial error; books candidate model.
@@ -68,6 +68,13 @@ impl MockBackend {
 
     fn push_response(&self, res: Result<ChatCompletionResponse, GatewayError>) {
         self.responses.lock().unwrap().push(res);
+    }
+
+    /// Drop every queued response, so the next call sees the one that is
+    /// pushed after this — without leftovers from an earlier scenario being
+    /// consumed instead.
+    fn clear_responses(&self) {
+        self.responses.lock().unwrap().clear();
     }
 
     fn push_stream_chunk(&self, chunk: Result<StreamChunk, GatewayError>) {
@@ -310,6 +317,68 @@ async fn test_catalog_listing_auto_models() {
     assert_eq!(combo["heterion-router"]["kind"], "combo");
 }
 
+/// A combo may be named exactly like a live `provider/model` id. The provider
+/// entry must win: the client has to see that the router serves that id
+/// through the provider, not through a bare combo stub.
+#[tokio::test]
+async fn a_combo_never_shadows_a_live_provider_model() {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    db.migrate().unwrap();
+    {
+        let guard = db.connection();
+        repos::upsert_combo(
+            &guard,
+            &ComboRow {
+                id: "combo-shadow".into(),
+                name: "gemini/gemini-3-flash-preview".into(),
+                data: json!({"isHidden": false}).to_string(),
+                sort_order: 10,
+                active: true,
+            },
+        )
+        .unwrap();
+    }
+
+    let state = AppState::with_db(Arc::new(MockBackend::new("mock")), db).with_catalog(
+        Arc::new(heterion_router_providers::ProviderRegistry::load()),
+        vec!["gemini".into()],
+    );
+    let router = build_router_with_state(state);
+
+    let res = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let catalog: Value = serde_json::from_slice(&bytes).unwrap();
+    let data = catalog["data"].as_array().expect("data must be an array");
+
+    let entry = data
+        .iter()
+        .find(|m| m["id"] == "gemini/gemini-3-flash-preview")
+        .expect("the live provider model must be listed");
+    assert_eq!(
+        entry["heterion-router"]["kind"], "provider",
+        "the provider entry must win over a combo of the same name"
+    );
+    assert_eq!(entry["heterion-router"]["provider"], "gemini");
+
+    // The id appears exactly once.
+    let occurrences = data
+        .iter()
+        .filter(|m| m["id"] == "gemini/gemini-3-flash-preview")
+        .count();
+    assert_eq!(occurrences, 1, "an id must be advertised only once");
+}
+
 // ---------------------------------------------------------------------------
 // Suite 2: Route Alias Equivalence (`heterion-router/auto` vs `auto`)
 // ---------------------------------------------------------------------------
@@ -493,17 +562,25 @@ async fn test_multi_tier_cascading_failover() {
 // Suite 4: Tool-Call Pre-Flight Exclusion
 // ---------------------------------------------------------------------------
 
+/// AC4 — a request with `tools` is never directed to a pseudo-tool model.
+///
+/// The pseudo-tool providers (`morph`, `upstage/syn-pro`) are registered as
+/// live backends here, so the assertion is about the *router*: if a future
+/// change put one of them into the candidate ladder, the plan would contain
+/// it and the backend would receive the call — and this test would fail.
 #[tokio::test]
-async fn test_tool_call_preflight_exclusion() {
+async fn test_native_tool_filtering() {
     let gemini = Arc::new(MockBackend::new("gemini"));
     let agentrouter = Arc::new(MockBackend::new("agentrouter"));
     let morph = Arc::new(MockBackend::new("morph"));
+    let upstage = Arc::new(MockBackend::new("upstage"));
     let exa = Arc::new(MockBackend::new("exa"));
 
     let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
     backends.insert("gemini".into(), gemini.clone());
     backends.insert("agentrouter".into(), agentrouter.clone());
     backends.insert("morph".into(), morph.clone());
+    backends.insert("upstage".into(), upstage.clone());
     backends.insert("exa".into(), exa.clone());
 
     let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
@@ -517,6 +594,10 @@ async fn test_tool_call_preflight_exclusion() {
         assert_ne!(
             provider, "morph",
             "morph is pseudo-tool and must be excluded"
+        );
+        assert_ne!(
+            provider, "upstage",
+            "upstage/syn-pro is pseudo-tool and must be excluded"
         );
         assert_ne!(
             provider, "exa",
@@ -570,7 +651,16 @@ async fn test_tool_call_preflight_exclusion() {
     let res = routing.complete(req).await.unwrap();
     assert_eq!(res.choices[0].finish_reason, "tool_calls");
     assert!(res.choices[0].message.has_tool_calls());
-    assert_eq!(morph.calls(), 0);
+    assert_eq!(
+        morph.calls(),
+        0,
+        "the pseudo-tool backend must never be called"
+    );
+    assert_eq!(
+        upstage.calls(),
+        0,
+        "the pseudo-tool backend must never be called"
+    );
     assert_eq!(exa.calls(), 0);
     assert_eq!(
         routing.attribution(&token).model.as_deref(),
@@ -691,6 +781,15 @@ async fn test_high_context_jit_pruning_failover() {
     let mistral = Arc::new(MockBackend::new("mistral"));
 
     // Candidate 1 (agentrouter / gpt-5.6-sol, 512k context limit) returns 429
+    agentrouter.push_response(Err(GatewayError::Upstream(
+        "upstream status 429: rate limit".into(),
+    )));
+
+    // Candidate 1b (agentrouter / gpt-6.1-sol, the other 512k candidate) is
+    // rate-limited as well. The 429 cooldown is scoped to the model that was
+    // rate-limited, so the sibling model is still tried and needs its own
+    // failure — otherwise the mock would answer with its default echo and the
+    // request would never reach the compressed candidate below.
     agentrouter.push_response(Err(GatewayError::Upstream(
         "upstream status 429: rate limit".into(),
     )));
@@ -849,8 +948,18 @@ async fn test_strict_breaker_isolation_on_4xx() {
         let _ = routing.complete(req).await.unwrap();
     }
 
-    // Gemini is in cooldown, but its Breaker is STILL OPEN/ALLOWED (never tripped by 429)
-    assert!(routing.cooldowns().is_in_cooldown("gemini", None));
+    // Gemini's rate-limited model is in cooldown, but its Breaker is STILL
+    // OPEN/ALLOWED (never tripped by 429)
+    assert!(
+        routing
+            .cooldowns()
+            .is_in_cooldown("gemini", Some("gemini-3-flash-preview")),
+        "the rate-limited model must be in cooldown"
+    );
+    assert!(
+        !routing.cooldowns().is_in_cooldown("gemini", None),
+        "a per-model 429 must not put the whole provider in cooldown"
+    );
     assert!(
         routing
             .breakers()
@@ -869,6 +978,10 @@ async fn test_strict_breaker_isolation_on_4xx() {
     }
 
     // Let gemini fail with 403
+    // Drop the 429s the loop above left queued on gemini: the rate-limited
+    // model was skipped in iterations 2 and 3, so those responses were never
+    // consumed and would otherwise be served instead of the 403.
+    gemini.clear_responses();
     gemini.push_response(Err(GatewayError::Upstream(
         "upstream status 403: quota exceeded".into(),
     )));
@@ -899,4 +1012,211 @@ async fn test_strict_breaker_isolation_on_4xx() {
             .allow("gemini", Instant::now()),
         "Invariant violation: 403 must NEVER trip circuit breaker!"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Suite 9: The auto alias is presented the same way in both modes
+// ---------------------------------------------------------------------------
+
+/// The `auto` alias is a virtual model: the router picks a real candidate per
+/// request. The client asked for `auto`, so the body must say `auto` — the
+/// streaming path already carries the requested name in every chunk, and the
+/// non-streaming body must not suddenly name the model the router happened to
+/// pick. The model that answered is reported in the `x-router-model-used`
+/// header and in `call_logs`, not in the client's own request echo.
+#[tokio::test]
+async fn the_non_streaming_body_names_the_requested_model() {
+    let gemini = Arc::new(MockBackend::new("gemini"));
+    let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
+    backends.insert("gemini".into(), gemini.clone());
+
+    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    db.migrate().unwrap();
+    let state = AppState::with_db(Arc::new(routing), db);
+    let router = build_router_with_state(state);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "auto",
+                        "messages": [{"role": "user", "content": "hi"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let served = response
+        .headers()
+        .get("x-router-model-used")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(
+        body["model"], "auto",
+        "the body must name the model the client asked for: {body}"
+    );
+    assert_eq!(
+        served.as_deref(),
+        Some("gemini-3-flash-preview"),
+        "the header must name the model that actually answered"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Suite 10: AC6 — `heterion-router/auto` answers over HTTP in both modes
+// ---------------------------------------------------------------------------
+
+/// The canonical id must resolve at the HTTP boundary in **both** modes —
+/// ordinary (JSON body) and streaming (SSE) — and the call log must book the
+/// request under the model that actually served it while the client still sees
+/// the id it asked for.
+#[tokio::test]
+async fn test_auto_answers_over_http_in_both_modes() {
+    let db = Arc::new(Db::open_in_memory().unwrap());
+    db.migrate().unwrap();
+
+    let gemini = Arc::new(MockBackend::new("gemini"));
+    let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
+    backends.insert("gemini".into(), gemini.clone());
+    let routing = Arc::new(RoutingBackend::new(backends, Router::new(vec![], vec![])));
+    let router = build_router_with_state(AppState::with_db(routing, db.clone()));
+
+    // --- ordinary mode --------------------------------------------------
+    gemini.push_response(Ok(ChatCompletionResponse {
+        id: "resp-http".into(),
+        object: "chat.completion",
+        created: 777,
+        model: "gemini-3-flash-preview".into(),
+        usage: Usage::default(),
+        choices: vec![ChatChoice {
+            index: 0,
+            message: ChatMessage::assistant_text("HTTP non-streaming answer"),
+            finish_reason: "stop".into(),
+        }],
+        raw: None,
+    }));
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "heterion-router/auto",
+                        "messages": [{"role": "user", "content": "hello over http"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let served = response
+        .headers()
+        .get("x-router-model-used")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+
+    assert_eq!(body["object"], "chat.completion");
+    assert_eq!(
+        body["choices"][0]["message"]["content"], "HTTP non-streaming answer",
+        "non-streaming auto response body is wrong: {body}"
+    );
+    assert_eq!(
+        body["model"], "heterion-router/auto",
+        "the body must name the requested model: {body}"
+    );
+    assert_eq!(
+        served.as_deref(),
+        Some("gemini-3-flash-preview"),
+        "the header must name the model that actually answered"
+    );
+
+    // The call log books the served model under the requested one.
+    {
+        let guard = db.connection();
+        let logs = repos::recent_calls(&guard, 5).unwrap();
+        assert!(
+            !logs.is_empty(),
+            "the call log must record the auto request"
+        );
+        assert_eq!(logs[0].provider.as_deref(), Some("gemini"));
+        assert_eq!(logs[0].model.as_deref(), Some("gemini-3-flash-preview"));
+        assert_eq!(
+            logs[0].requested_model.as_deref(),
+            Some("heterion-router/auto"),
+            "the call log must keep the requested model id"
+        );
+    }
+
+    // --- streaming mode --------------------------------------------------
+    gemini.push_stream_chunk(Ok(StreamChunk {
+        content: Some("SSE answer".into()),
+        finish_reason: Some("stop".into()),
+        ..Default::default()
+    }));
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "heterion-router/auto",
+                        "stream": true,
+                        "messages": [{"role": "user", "content": "hello over sse"}]
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let mut stream = response.into_body().into_data_stream();
+    let mut raw = String::new();
+    while let Some(chunk) = stream.next().await {
+        raw.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(
+        raw.contains("data: "),
+        "the response must be SSE framed: {raw}"
+    );
+    assert!(
+        raw.contains("[DONE]"),
+        "the SSE stream must end with [DONE]: {raw}"
+    );
+    let payload: Value = serde_json::from_str(
+        raw.lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .expect("an SSE data frame"),
+    )
+    .unwrap();
+    assert_eq!(
+        payload["model"], "heterion-router/auto",
+        "the SSE chunk must name the requested model: {payload}"
+    );
+    assert_eq!(payload["choices"][0]["delta"]["content"], "SSE answer");
 }
