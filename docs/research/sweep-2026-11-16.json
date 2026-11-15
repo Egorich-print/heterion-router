@@ -1,0 +1,1040 @@
+{
+  "stamp": "2026-11-15 23:04:13",
+  "direct": [
+    {
+      "id": "agentrouter/gpt-6.1-sol",
+      "name": "Agentrouter GPT-6.1 Sol",
+      "status": 200,
+      "ms": 3807,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "agentrouter/gpt-5.6-sol",
+      "name": "Agentrouter GPT-5.6 Sol",
+      "status": 200,
+      "ms": 1905,
+      "text": "Работает.",
+      "finish": "stop"
+    },
+    {
+      "id": "google/gemini-3.6-flash",
+      "name": "Gemini 3.6 Flash",
+      "status": 200,
+      "ms": 6345,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "morph/morph-glm52-744b",
+      "name": "Morph GLM 52 744B",
+      "status": 502,
+      "ms": 2052,
+      "text": "upstream request failed"
+    },
+    {
+      "id": "google/gemini-3.5-flash",
+      "name": "Gemini 3.5 Flash",
+      "status": 200,
+      "ms": 5784,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "morph/morph-dsv4flash",
+      "name": "Morph DSV4 Flash",
+      "status": 502,
+      "ms": 1332,
+      "text": "upstream request failed"
+    },
+    {
+      "id": "google/gemini-3.1-flash-lite",
+      "name": "Gemini 3.1 Flash Lite",
+      "status": 200,
+      "ms": 932,
+      "text": "Да.",
+      "finish": "stop"
+    },
+    {
+      "id": "google/gemini-3.5-flash-lite",
+      "name": "Gemini 3.5 Flash Lite",
+      "status": 200,
+      "ms": 747,
+      "text": "Да.",
+      "finish": "stop"
+    },
+    {
+      "id": "openrouter/auto",
+      "name": "OpenRouter Auto",
+      "status": 200,
+      "ms": 1224,
+      "text": "Да",
+      "finish": "stop"
+    },
+    {
+      "id": "upstage/syn-pro",
+      "name": "Upstage Syn Pro",
+      "status": 404,
+      "ms": 2,
+      "text": "unknown model: upstage/syn-pro (no backend can serve it; check the combo entries or provider credentials)"
+    },
+    {
+      "id": "morph/morph-v3-large",
+      "name": "Morph V3 Large",
+      "status": 502,
+      "ms": 1015,
+      "text": "upstream request failed"
+    },
+    {
+      "id": "mistral/codestral-latest",
+      "name": "Mistral Codestral",
+      "status": 200,
+      "ms": 521,
+      "text": "Работает.",
+      "finish": "stop"
+    },
+    {
+      "id": "google/gemma-4-26b-a4b-it",
+      "name": "Gemma 4 26B (Gemini API)",
+      "status": 200,
+      "ms": 1815,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "kilocode/stealth/glyph-cluster",
+      "name": "Kilocode Glyph Cluster",
+      "status": 200,
+      "ms": 1724,
+      "text": "Да.",
+      "finish": "stop"
+    },
+    {
+      "id": "morph/morph-v3-fast",
+      "name": "Morph V3 Fast",
+      "status": 502,
+      "ms": 1037,
+      "text": "upstream request failed"
+    },
+    {
+      "id": "groq/openai/gpt-oss-120b",
+      "name": "Groq GPT-OSS 120B",
+      "status": 200,
+      "ms": 566,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "groq/qwen/qwen3.8-27b",
+      "name": "Groq Qwen 3.8 27B",
+      "status": 200,
+      "ms": 134,
+      "text": "Да",
+      "finish": "stop"
+    },
+    {
+      "id": "sealion/aisingapore/Llama-SEA-LION-v3-70B-IT",
+      "name": "SEA-LION Llama 70B",
+      "status": 200,
+      "ms": 1524,
+      "text": "Да",
+      "finish": "stop"
+    },
+    {
+      "id": "aion/aion-labs/aion-3.0",
+      "name": "Aion 3.0",
+      "status": 200,
+      "ms": 2030,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "groq/openai/gpt-oss-20b",
+      "name": "Groq GPT-OSS 20B",
+      "status": 200,
+      "ms": 191,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "sealion/aisingapore/Gemma-SEA-LION-v4-27B-IT",
+      "name": "SEA-LION Gemma 27B",
+      "status": 200,
+      "ms": 620,
+      "text": "Работает.",
+      "finish": "stop"
+    },
+    {
+      "id": "typhoon/typhoon-v2.5-30b-a3b-instruct",
+      "name": "Typhoon 2.5 30B",
+      "status": 200,
+      "ms": 21284,
+      "text": "Да",
+      "finish": "stop"
+    },
+    {
+      "id": "aion/aion-labs/aion-3.0-mini",
+      "name": "Aion 3.0 Mini",
+      "status": 200,
+      "ms": 1674,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "oneminai/gpt-4o-mini",
+      "name": "OneMinAI GPT-4o Mini",
+      "status": 200,
+      "ms": 1230,
+      "text": "Да.",
+      "finish": "stop"
+    },
+    {
+      "id": "groq/allam-2-7b",
+      "name": "Groq Allam 2 7B",
+      "status": 200,
+      "ms": 205,
+      "text": "Да, работает.",
+      "finish": "stop"
+    },
+    {
+      "id": "pollinations/openai",
+      "name": "Pollinations OpenAI",
+      "status": 200,
+      "ms": 8690,
+      "text": "да",
+      "finish": "stop"
+    },
+    {
+      "id": "sealion/aisingapore/Qwen-SEA-LION-v4.5-27B-IT",
+      "name": "SEA-LION Qwen 27B v4.5",
+      "status": 200,
+      "ms": 1500,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "sealion/aisingapore/Qwen-SEA-LION-v4-32B-IT",
+      "name": "SEA-LION Qwen 32B v4",
+      "status": 200,
+      "ms": 840,
+      "text": "Работает.",
+      "finish": "stop"
+    },
+    {
+      "id": "heterion-router/auto",
+      "name": "⚡ Heterion Auto (Switchyard Dynamic Ladder)",
+      "status": 200,
+      "ms": 774,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "auto",
+      "name": "⚡ Auto (Heterion Switchyard)",
+      "status": 200,
+      "ms": 1071,
+      "text": "Работа",
+      "finish": "length"
+    },
+    {
+      "id": "main-1m",
+      "name": "🔀 Main 1M (morph-744B → dsv4flash → openrouter)",
+      "status": 200,
+      "ms": 679,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "main-262k",
+      "name": "🔀 Main 262K (syn-pro → morph-v3 → codestral)",
+      "status": 200,
+      "ms": 294,
+      "text": "Работает.",
+      "finish": "stop"
+    },
+    {
+      "id": "main-128k",
+      "name": "🔀 Main 128K (groq-120B → qwen → sealion)",
+      "status": 200,
+      "ms": 489,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "auto-subagent",
+      "name": "🔀 Auto Subagent (codestral → glyph → groq-120B)",
+      "status": 200,
+      "ms": 298,
+      "text": "Работает.",
+      "finish": "stop"
+    },
+    {
+      "id": "auto-fast",
+      "name": "🔀 Auto Fast (groq-120B → codestral → qwen)",
+      "status": 200,
+      "ms": 290,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "auto-free",
+      "name": "🔀 Auto Free (glyph → groq-20B → pollinations)",
+      "status": 200,
+      "ms": 2370,
+      "text": "Работает.",
+      "finish": "stop"
+    },
+    {
+      "id": "fallback-free",
+      "name": "🔀 Fallback Free (groq → sealion → typhoon)",
+      "status": 200,
+      "ms": 755,
+      "text": "да",
+      "finish": "stop"
+    }
+  ],
+  "auto": [
+    {
+      "id": "agentrouter/gpt-6.1-sol",
+      "name": "Agentrouter GPT-6.1 Sol",
+      "status": 200,
+      "ms": 921,
+      "text": "Да",
+      "finish": "length"
+    },
+    {
+      "id": "agentrouter/gpt-5.6-sol",
+      "name": "Agentrouter GPT-5.6 Sol",
+      "status": 200,
+      "ms": 846,
+      "text": "Работа",
+      "finish": "length"
+    },
+    {
+      "id": "google/gemini-3.6-flash",
+      "name": "Gemini 3.6 Flash",
+      "status": 200,
+      "ms": 1089,
+      "text": "Да.",
+      "finish": "length"
+    },
+    {
+      "id": "morph/morph-glm52-744b",
+      "name": "Morph GLM 52 744B",
+      "status": 200,
+      "ms": 909,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "google/gemini-3.5-flash",
+      "name": "Gemini 3.5 Flash",
+      "status": 200,
+      "ms": 693,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "morph/morph-dsv4flash",
+      "name": "Morph DSV4 Flash",
+      "status": 200,
+      "ms": 957,
+      "text": "Да",
+      "finish": "length"
+    },
+    {
+      "id": "google/gemini-3.1-flash-lite",
+      "name": "Gemini 3.1 Flash Lite",
+      "status": 200,
+      "ms": 891,
+      "text": "Да",
+      "finish": "length"
+    },
+    {
+      "id": "google/gemini-3.5-flash-lite",
+      "name": "Gemini 3.5 Flash Lite",
+      "status": 200,
+      "ms": 913,
+      "text": "Да",
+      "finish": "length"
+    },
+    {
+      "id": "openrouter/auto",
+      "name": "OpenRouter Auto",
+      "status": 200,
+      "ms": 923,
+      "text": "Да.",
+      "finish": "length"
+    },
+    {
+      "id": "upstage/syn-pro",
+      "name": "Upstage Syn Pro",
+      "status": 200,
+      "ms": 855,
+      "text": "Да",
+      "finish": "length"
+    },
+    {
+      "id": "morph/morph-v3-large",
+      "name": "Morph V3 Large",
+      "status": 200,
+      "ms": 1006,
+      "text": "Работа",
+      "finish": "length"
+    },
+    {
+      "id": "mistral/codestral-latest",
+      "name": "Mistral Codestral",
+      "status": 200,
+      "ms": 861,
+      "text": "Работа",
+      "finish": "length"
+    },
+    {
+      "id": "google/gemma-4-26b-a4b-it",
+      "name": "Gemma 4 26B (Gemini API)",
+      "status": 200,
+      "ms": 875,
+      "text": "Работа",
+      "finish": "length"
+    },
+    {
+      "id": "kilocode/stealth/glyph-cluster",
+      "name": "Kilocode Glyph Cluster",
+      "status": 200,
+      "ms": 902,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "morph/morph-v3-fast",
+      "name": "Morph V3 Fast",
+      "status": 200,
+      "ms": 861,
+      "text": "Да",
+      "finish": "length"
+    },
+    {
+      "id": "groq/openai/gpt-oss-120b",
+      "name": "Groq GPT-OSS 120B",
+      "status": 200,
+      "ms": 893,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "groq/qwen/qwen3.8-27b",
+      "name": "Groq Qwen 3.8 27B",
+      "status": 200,
+      "ms": 1117,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "sealion/aisingapore/Llama-SEA-LION-v3-70B-IT",
+      "name": "SEA-LION Llama 70B",
+      "status": 200,
+      "ms": 902,
+      "text": "Работает.",
+      "finish": "length"
+    },
+    {
+      "id": "aion/aion-labs/aion-3.0",
+      "name": "Aion 3.0",
+      "status": 200,
+      "ms": 894,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "groq/openai/gpt-oss-20b",
+      "name": "Groq GPT-OSS 20B",
+      "status": 200,
+      "ms": 896,
+      "text": "Да",
+      "finish": "length"
+    },
+    {
+      "id": "sealion/aisingapore/Gemma-SEA-LION-v4-27B-IT",
+      "name": "SEA-LION Gemma 27B",
+      "status": 200,
+      "ms": 1422,
+      "text": "Работа",
+      "finish": "length"
+    },
+    {
+      "id": "typhoon/typhoon-v2.5-30b-a3b-instruct",
+      "name": "Typhoon 2.5 30B",
+      "status": 200,
+      "ms": 1242,
+      "text": "Работа",
+      "finish": "length"
+    },
+    {
+      "id": "aion/aion-labs/aion-3.0-mini",
+      "name": "Aion 3.0 Mini",
+      "status": 200,
+      "ms": 896,
+      "text": "Работа",
+      "finish": "length"
+    },
+    {
+      "id": "oneminai/gpt-4o-mini",
+      "name": "OneMinAI GPT-4o Mini",
+      "status": 200,
+      "ms": 1402,
+      "text": "Работа",
+      "finish": "length"
+    },
+    {
+      "id": "groq/allam-2-7b",
+      "name": "Groq Allam 2 7B",
+      "status": 200,
+      "ms": 1619,
+      "text": "Да.",
+      "finish": "stop"
+    },
+    {
+      "id": "pollinations/openai",
+      "name": "Pollinations OpenAI",
+      "status": 200,
+      "ms": 789,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "sealion/aisingapore/Qwen-SEA-LION-v4.5-27B-IT",
+      "name": "SEA-LION Qwen 27B v4.5",
+      "status": 200,
+      "ms": 909,
+      "text": "Да",
+      "finish": "length"
+    },
+    {
+      "id": "sealion/aisingapore/Qwen-SEA-LION-v4-32B-IT",
+      "name": "SEA-LION Qwen 32B v4",
+      "status": 200,
+      "ms": 803,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "heterion-router/auto",
+      "name": "⚡ Heterion Auto (Switchyard Dynamic Ladder)",
+      "status": 200,
+      "ms": 881,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "auto",
+      "name": "⚡ Auto (Heterion Switchyard)",
+      "status": 200,
+      "ms": 865,
+      "text": "Да",
+      "finish": "length"
+    },
+    {
+      "id": "main-1m",
+      "name": "🔀 Main 1M (morph-744B → dsv4flash → openrouter)",
+      "status": 200,
+      "ms": 1392,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "main-262k",
+      "name": "🔀 Main 262K (syn-pro → morph-v3 → codestral)",
+      "status": 200,
+      "ms": 1148,
+      "text": "Работает.",
+      "finish": "length"
+    },
+    {
+      "id": "main-128k",
+      "name": "🔀 Main 128K (groq-120B → qwen → sealion)",
+      "status": 200,
+      "ms": 982,
+      "text": "Работает.",
+      "finish": "length"
+    },
+    {
+      "id": "auto-subagent",
+      "name": "🔀 Auto Subagent (codestral → glyph → groq-120B)",
+      "status": 200,
+      "ms": 1268,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "auto-fast",
+      "name": "🔀 Auto Fast (groq-120B → codestral → qwen)",
+      "status": 200,
+      "ms": 1505,
+      "text": "",
+      "finish": "length"
+    },
+    {
+      "id": "auto-free",
+      "name": "🔀 Auto Free (glyph → groq-20B → pollinations)",
+      "status": 200,
+      "ms": 1173,
+      "text": "Да",
+      "finish": "length"
+    },
+    {
+      "id": "fallback-free",
+      "name": "🔀 Fallback Free (groq → sealion → typhoon)",
+      "status": 200,
+      "ms": 1180,
+      "text": "",
+      "finish": "length"
+    }
+  ],
+  "call_log": [
+    [
+      "agentrouter/gpt-6.1-sol",
+      "agentrouter",
+      "gpt-6.1-sol",
+      200
+    ],
+    [
+      "agentrouter/gpt-5.6-sol",
+      "agentrouter",
+      "gpt-5.6-sol",
+      200
+    ],
+    [
+      "google/gemini-3.6-flash",
+      "gemini",
+      "gemini-3.6-flash",
+      200
+    ],
+    [
+      "morph/morph-glm52-744b",
+      "morph",
+      "morph-glm52-744b",
+      502
+    ],
+    [
+      "google/gemini-3.5-flash",
+      "gemini",
+      "gemini-3.5-flash",
+      200
+    ],
+    [
+      "morph/morph-dsv4flash",
+      "morph",
+      "morph-dsv4flash",
+      502
+    ],
+    [
+      "google/gemini-3.1-flash-lite",
+      "gemini",
+      "gemini-3.1-flash-lite",
+      200
+    ],
+    [
+      "google/gemini-3.5-flash-lite",
+      "gemini",
+      "gemini-3.5-flash-lite",
+      200
+    ],
+    [
+      "openrouter/auto",
+      "openrouter",
+      "auto",
+      200
+    ],
+    [
+      "upstage/syn-pro",
+      null,
+      "upstage/syn-pro",
+      404
+    ],
+    [
+      "morph/morph-v3-large",
+      "morph",
+      "morph-v3-large",
+      502
+    ],
+    [
+      "mistral/codestral-latest",
+      "mistral",
+      "codestral-latest",
+      200
+    ],
+    [
+      "google/gemma-4-26b-a4b-it",
+      "gemini",
+      "gemma-4-26b-a4b-it",
+      200
+    ],
+    [
+      "kilocode/stealth/glyph-cluster",
+      "kilocode",
+      "stealth/glyph-cluster",
+      200
+    ],
+    [
+      "morph/morph-v3-fast",
+      "morph",
+      "morph-v3-fast",
+      502
+    ],
+    [
+      "groq/openai/gpt-oss-120b",
+      "groq",
+      "openai/gpt-oss-120b",
+      200
+    ],
+    [
+      "groq/qwen/qwen3.8-27b",
+      "groq",
+      "qwen/qwen3.8-27b",
+      200
+    ],
+    [
+      "sealion/aisingapore/Llama-SEA-LION-v3-70B-IT",
+      "sealion",
+      "aisingapore/Llama-SEA-LION-v3-70B-IT",
+      200
+    ],
+    [
+      "aion/aion-labs/aion-3.0",
+      "aion",
+      "aion-labs/aion-3.0",
+      200
+    ],
+    [
+      "groq/openai/gpt-oss-20b",
+      "groq",
+      "openai/gpt-oss-20b",
+      200
+    ],
+    [
+      "sealion/aisingapore/Gemma-SEA-LION-v4-27B-IT",
+      "sealion",
+      "aisingapore/Gemma-SEA-LION-v4-27B-IT",
+      200
+    ],
+    [
+      "typhoon/typhoon-v2.5-30b-a3b-instruct",
+      "typhoon",
+      "typhoon-v2.5-30b-a3b-instruct",
+      200
+    ],
+    [
+      "aion/aion-labs/aion-3.0-mini",
+      "aion",
+      "aion-labs/aion-3.0-mini",
+      200
+    ],
+    [
+      "oneminai/gpt-4o-mini",
+      "oneminai",
+      "gpt-4o-mini",
+      200
+    ],
+    [
+      "groq/allam-2-7b",
+      "groq",
+      "allam-2-7b",
+      200
+    ],
+    [
+      "pollinations/openai",
+      "pollinations",
+      "openai",
+      200
+    ],
+    [
+      "sealion/aisingapore/Qwen-SEA-LION-v4.5-27B-IT",
+      "sealion",
+      "aisingapore/Qwen-SEA-LION-v4.5-27B-IT",
+      200
+    ],
+    [
+      "sealion/aisingapore/Qwen-SEA-LION-v4-32B-IT",
+      "sealion",
+      "aisingapore/Qwen-SEA-LION-v4-32B-IT",
+      200
+    ],
+    [
+      "heterion-router/auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "main-1m",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "main-262k",
+      "mistral",
+      "codestral-latest",
+      200
+    ],
+    [
+      "main-128k",
+      "groq",
+      "openai/gpt-oss-120b",
+      200
+    ],
+    [
+      "auto-subagent",
+      "mistral",
+      "codestral-latest",
+      200
+    ],
+    [
+      "auto-fast",
+      "groq",
+      "openai/gpt-oss-120b",
+      200
+    ],
+    [
+      "auto-free",
+      "kilocode",
+      "stealth/glyph-cluster",
+      200
+    ],
+    [
+      "fallback-free",
+      "typhoon",
+      "typhoon-v2.5-30b-a3b-instruct",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ],
+    [
+      "auto",
+      "gemini",
+      "gemini-3-flash-preview",
+      200
+    ]
+  ]
+}
