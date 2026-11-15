@@ -30,7 +30,10 @@ pub fn model_context_limit(model: &str) -> u32 {
         1_000_000
     } else if bare.starts_with("gpt-5.6") || bare.starts_with("gpt-6") {
         870_000
-    } else if bare.starts_with("codestral") {
+    } else if bare.starts_with("codestral")
+        || bare == "gemma"
+        || (bare.starts_with("gemma") && !lower.starts_with("gemini/"))
+    {
         256_000
     } else if bare.starts_with("claude") {
         200_000
@@ -405,6 +408,20 @@ pub fn prune_request(request: &mut ChatCompletionRequest, target_token_limit: u3
     (current_tokens, original_tokens)
 }
 
+/// Checks whether zero-quota algorithmic context pruning can compress the prompt
+/// to fit within `target_token_limit`. Returns true if already within budget or
+/// if pruning successfully brings the token count within budget.
+pub fn can_prune_to_fit(request: &ChatCompletionRequest, target_token_limit: u32) -> bool {
+    let original_tokens = fast_estimate_tokens(request);
+    let budget = (target_token_limit as f64 * TOKEN_BUDGET_SAFETY_FACTOR) as u32;
+    if original_tokens <= budget {
+        return true;
+    }
+    let mut cloned = request.clone();
+    let (pruned_tokens, _) = prune_request(&mut cloned, target_token_limit);
+    pruned_tokens <= target_token_limit
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,5 +724,19 @@ mod tests {
         // Because long_id makes envelope_len > omitted_bytes, non-expansion guard must preserve verbatim
         assert_eq!(new_len, raw.len());
         assert_eq!(s, raw);
+    }
+
+    #[test]
+    fn test_gemma_context_limit_and_can_prune_to_fit() {
+        assert_eq!(model_context_limit("gemma"), 256_000);
+        assert_eq!(model_context_limit("gemma-4-26b-a4b-it"), 256_000);
+
+        let small_req = ChatCompletionRequest {
+            model: "auto".into(),
+            messages: vec![ChatMessage::plain("user", "Hello")],
+            ..Default::default()
+        };
+        assert!(can_prune_to_fit(&small_req, 128_000));
+        assert!(can_prune_to_fit(&small_req, 256_000));
     }
 }

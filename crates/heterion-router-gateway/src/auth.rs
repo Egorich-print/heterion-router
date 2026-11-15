@@ -58,14 +58,19 @@ impl Authenticated {
     }
 }
 
-fn matches_pattern(pattern: &str, value: &str) -> bool {
+pub fn matches_pattern(pattern: &str, value: &str) -> bool {
     if pattern == "*" {
         return true;
     }
     if let Some(prefix) = pattern.strip_suffix("/*") {
         return value == prefix || value.starts_with(&format!("{prefix}/"));
     }
-    pattern == value
+    if pattern == value {
+        return true;
+    }
+    // Allow symmetric equivalence between canonical "heterion-router/auto" and alias "auto"
+    (pattern == "heterion-router/auto" && value == "auto")
+        || (pattern == "auto" && value == "heterion-router/auto")
 }
 
 pub struct ManageAuthenticated;
@@ -514,5 +519,18 @@ mod tests {
                 .await
                 .unwrap();
         assert!(authenticated.key.is_none(), "auth must stay open");
+    }
+
+    #[test]
+    fn test_auto_alias_symmetric_pattern_matching() {
+        assert!(matches_pattern("heterion-router/auto", "auto"));
+        assert!(matches_pattern("auto", "heterion-router/auto"));
+        assert!(matches_pattern(
+            "heterion-router/auto",
+            "heterion-router/auto"
+        ));
+        assert!(matches_pattern("auto", "auto"));
+        assert!(!matches_pattern("heterion-router/auto", "other-model"));
+        assert!(!matches_pattern("auto", "other-model"));
     }
 }

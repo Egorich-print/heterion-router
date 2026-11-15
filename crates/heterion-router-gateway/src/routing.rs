@@ -32,14 +32,71 @@ use crate::upstream_status_or_recovered;
 const ATTRIBUTION_SLOTS: usize = 256;
 
 /// Everything one request needs before the first attempt.
-struct Plan {
+#[derive(Debug, Clone)]
+pub struct Plan {
     /// Retry/failover settings from the combo row, defaults otherwise.
-    config: ComboConfig,
+    pub config: ComboConfig,
     /// Ordered `(backend, model)` attempts; empty means "nothing can serve it".
-    steps: Vec<(String, String)>,
+    pub steps: Vec<(String, String)>,
     /// Combo the request is served through, when it is served through one.
-    combo_name: Option<String>,
+    pub combo_name: Option<String>,
 }
+
+/// Candidate specification for Switchyard dynamic auto-routing.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AutoCandidate {
+    /// Provider identifier matching backend map keys (e.g. "gemini", "agentrouter", "mistral").
+    pub provider: &'static str,
+    /// Model identifier passed to upstream provider (e.g. "gemini-3-flash-preview").
+    pub model: &'static str,
+    /// Base priority score according to capability tier:
+    /// - Tier 1: 300, 290, 280
+    /// - Tier 2: 200, 190
+    /// - Tier 3: 100, 90
+    pub base_priority: f64,
+}
+
+/// Canonical dynamic priority ladder table according to NVIDIA Switchyard specifications.
+pub const DEFAULT_AUTO_CANDIDATES: &[AutoCandidate] = &[
+    // Tier 1: Flagships / Deep Reasoning & High Context
+    AutoCandidate {
+        provider: "gemini",
+        model: "gemini-3-flash-preview",
+        base_priority: 300.0,
+    },
+    AutoCandidate {
+        provider: "agentrouter",
+        model: "gpt-5.6-sol",
+        base_priority: 290.0,
+    },
+    AutoCandidate {
+        provider: "agentrouter",
+        model: "gpt-6.1-sol",
+        base_priority: 280.0,
+    },
+    // Tier 2: Workhorses / Specialized Coding & 262k
+    AutoCandidate {
+        provider: "mistral",
+        model: "codestral-latest",
+        base_priority: 200.0,
+    },
+    AutoCandidate {
+        provider: "gemini",
+        model: "gemma-4-26b-a4b-it",
+        base_priority: 190.0,
+    },
+    // Tier 3: Fast Execution / High-Quota Protectors
+    AutoCandidate {
+        provider: "gemini",
+        model: "gemini-3.5-flash-lite",
+        base_priority: 100.0,
+    },
+    AutoCandidate {
+        provider: "gemini",
+        model: "gemini-3.1-flash-lite",
+        base_priority: 90.0,
+    },
+];
 
 /// Backend router with failover.
 #[derive(Clone)]
@@ -195,6 +252,21 @@ impl RoutingBackend {
         self
     }
 
+    /// Access the provider cooldown set.
+    pub fn cooldowns(&self) -> &Arc<ProviderCooldownSet> {
+        &self.cooldowns
+    }
+
+    /// Access the model quality tracker.
+    pub fn quality_tracker(&self) -> &Arc<ModelQualityTracker> {
+        &self.quality_tracker
+    }
+
+    /// Access the circuit breakers.
+    pub fn breakers(&self) -> &Arc<Mutex<BreakerSet>> {
+        &self.breakers
+    }
+
     fn lock_breakers(&self) -> std::sync::MutexGuard<'_, BreakerSet> {
         self.breakers
             .lock()
@@ -222,6 +294,7 @@ impl RoutingBackend {
         backend: &dyn ChatBackend,
         combo_name: Option<&str>,
         tokens_compressed: Option<u32>,
+        target_model: Option<&str>,
     ) {
         let Some(token) = token else {
             return;
@@ -235,6 +308,7 @@ impl RoutingBackend {
             connection_id,
             combo_name: combo_name.map(str::to_string),
             tokens_compressed,
+            model: target_model.map(str::to_string),
         };
         let mut entries = self.lock_attributions();
         if entries.len() >= ATTRIBUTION_SLOTS {
@@ -373,30 +447,23 @@ impl RoutingBackend {
     }
 
     /// Build a dynamic Switchyard candidate plan for `heterion-router/auto` or `auto`.
-    fn auto_plan(&self, request: &ChatCompletionRequest) -> Plan {
+    pub fn auto_plan(&self, request: &ChatCompletionRequest) -> Plan {
+        self.auto_plan_at(request, Instant::now())
+    }
+
+    /// Build a dynamic Switchyard candidate plan with deterministic time injection.
+    pub fn auto_plan_at(&self, request: &ChatCompletionRequest, now: Instant) -> Plan {
         let inspection = crate::inspector::inspect_request(request);
+        let mut scored_candidates: Vec<((String, String), f64)> = Vec::new();
 
-        // Define all potential candidates with their base priorities and model specs
-        // Format: (provider, model_id, base_priority)
-        let candidates = vec![
-            ("agentrouter", "gpt-5.6-sol", 100.0),
-            ("agentrouter", "gpt-6.1-sol", 90.0),
-            ("gemini", "gemini-3-flash-preview", 95.0),
-            ("mistral", "codestral-latest", 50.0),
-            ("gemini", "gemma-4-26b-a4b-it", 45.0),
-            ("gemini", "gemini-3.5-flash-lite", 20.0),
-        ];
-
-        let mut scored_steps = Vec::new();
-
-        for (provider, target_model, base_priority) in candidates {
+        for candidate in DEFAULT_AUTO_CANDIDATES {
             // 1. Check if backend exists
-            if !self.backends.contains_key(provider) {
+            if !self.backends.contains_key(candidate.provider) {
                 continue;
             }
 
             // 2. Load model spec
-            let spec = crate::model_spec::model_spec(target_model);
+            let spec = crate::model_spec::model_spec(candidate.model);
 
             // 3. Vision constraint
             if inspection.has_images && !spec.supports_vision {
@@ -408,28 +475,77 @@ impl RoutingBackend {
                 if spec.tool_support == ToolSupport::None {
                     continue;
                 }
-                if crate::model_spec::is_pseudo_tool_model(provider, target_model) {
+                if crate::model_spec::is_pseudo_tool_model(candidate.provider, candidate.model) {
                     continue; // Exclude pseudo-tool models when tools are requested
                 }
             }
 
-            // 5. Calculate effective priority
-            let effective = self.quality_tracker.effective_priority(
-                base_priority,
-                target_model,
-                provider,
-                &self.cooldowns,
-            );
+            // 5. Context filter vs JIT pruning feasibility
+            if inspection.estimated_tokens > spec.context_window
+                && !crate::context_pruner::can_prune_to_fit(request, spec.context_window)
+            {
+                tracing::debug!(
+                    model = candidate.model,
+                    tokens = inspection.estimated_tokens,
+                    limit = spec.context_window,
+                    "filtering out candidate: prompt exceeds context limit and cannot be pruned"
+                );
+                continue;
+            }
+
+            // 6. Factor in inspection.stage weighting if applicable
+            let stage_weight = match (inspection.stage, spec.tier) {
+                (
+                    crate::inspector::AgentStage::Planning,
+                    crate::model_spec::ModelTier::FrontierReasoning,
+                ) => 1.05,
+                (
+                    crate::inspector::AgentStage::ErrorRecovery,
+                    crate::model_spec::ModelTier::FrontierReasoning,
+                ) => 1.05,
+                (
+                    crate::inspector::AgentStage::MechanicalToolLoop,
+                    crate::model_spec::ModelTier::FastExecution,
+                ) => 1.05,
+                _ => 1.0,
+            };
+            let adjusted_base = candidate.base_priority * stage_weight;
+
+            // 7. Dynamic Priority Formula:
+            // Effective Priority = Base Priority * Quality Score * Availability State
+            let quality_score = self
+                .quality_tracker
+                .effective_score_at(candidate.model, now);
+
+            // Availability State: 0.0 if in active cooldown or breaker is tripped; 1.0 if healthy.
+            let in_cooldown =
+                self.cooldowns
+                    .is_in_cooldown_at(candidate.provider, Some(candidate.model), now);
+            let breaker_open = !self.lock_breakers().allow(candidate.provider, now);
+            let availability_state = if in_cooldown || breaker_open {
+                0.0
+            } else {
+                1.0
+            };
+
+            let effective = adjusted_base * quality_score * availability_state;
 
             if effective > 0.0 {
-                scored_steps.push(((provider.to_string(), target_model.to_string()), effective));
+                scored_candidates.push((
+                    (candidate.provider.to_string(), candidate.model.to_string()),
+                    effective,
+                ));
             }
         }
 
         // Sort by effective priority descending
-        scored_steps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored_candidates
+            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let steps: Vec<(String, String)> = scored_steps.into_iter().map(|(step, _)| step).collect();
+        let steps: Vec<(String, String)> = scored_candidates
+            .into_iter()
+            .map(|(step, _)| step)
+            .collect();
 
         Plan {
             config: ComboConfig::default(),
@@ -458,6 +574,7 @@ impl ChatBackend for RoutingBackend {
                 connection_id: None,
                 combo_name: None,
                 tokens_compressed: None,
+                model: None,
             })
     }
 
@@ -475,15 +592,27 @@ impl ChatBackend for RoutingBackend {
         let mut last_error: Option<GatewayError> = None;
         let mut tripped = false;
 
-        // Inspect once for post-flight tool validation (only relevant for auto routing).
-        let is_auto = model == "heterion-router/auto" || model == "auto";
-        let inspection = if is_auto {
-            Some(crate::inspector::inspect_request(&request))
-        } else {
-            None
-        };
+        let is_failover_plan = combo_name.is_some() || plan.len() > 1;
 
         for (name, target_model) in &plan {
+            if is_failover_plan {
+                if !self.cooldowns.is_available(name, Some(target_model)) {
+                    tracing::debug!(
+                        provider = name,
+                        model = target_model,
+                        "skipping candidate: candidate is in active cooldown"
+                    );
+                    continue;
+                }
+                if self.quality_tracker.is_in_probation(target_model) {
+                    tracing::debug!(
+                        model = target_model,
+                        "skipping candidate: model is in 15-minute probation"
+                    );
+                    continue;
+                }
+            }
+
             let target_limit = crate::context_pruner::model_context_limit(target_model);
             let budget =
                 (target_limit as f64 * crate::context_pruner::TOKEN_BUDGET_SAFETY_FACTOR) as u32;
@@ -492,6 +621,15 @@ impl ChatBackend for RoutingBackend {
                 let mut pruned = request.clone();
                 let (new_tokens, orig_tokens) =
                     crate::context_pruner::prune_request(&mut pruned, target_limit);
+                if new_tokens > target_limit {
+                    tracing::warn!(
+                        model = target_model,
+                        prompt = new_tokens,
+                        limit = target_limit,
+                        "prompt exceeds context window after pruning; skipping candidate"
+                    );
+                    continue;
+                }
                 let compressed = orig_tokens.saturating_sub(new_tokens);
                 (
                     pruned,
@@ -520,27 +658,21 @@ impl ChatBackend for RoutingBackend {
                 {
                     Ok(response) => {
                         self.lock_breakers().record_success(name);
-                        // Post-flight tool validation for auto routing.
-                        if let Some(ref insp) = inspection
-                            && insp.has_tools
+                        // Post-flight tool validation.
+                        if let Err(e) = crate::resilience::verify_tool_response(&request, &response)
                         {
-                            let spec = crate::model_spec::model_spec(target_model);
-                            if let Err(e) =
-                                crate::resilience::verify_tool_response(&response, &spec)
-                            {
-                                tracing::warn!(
-                                    model = target_model,
-                                    provider = name,
-                                    error = ?e,
-                                    "auto: post-flight tool validation failed, penalising and failing over"
-                                );
-                                self.quality_tracker.record_failure(target_model);
-                                // Don't attribute — we're failing over.
-                                last_error = Some(GatewayError::Upstream(format!(
-                                    "upstream status 200: tool validation failed ({e:?})"
-                                )));
-                                break;
-                            }
+                            tracing::warn!(
+                                model = target_model,
+                                provider = name,
+                                error = %e,
+                                "auto: post-flight tool validation failed, penalising and failing over"
+                            );
+                            self.quality_tracker.record_failure(target_model);
+                            // Don't attribute — we're failing over.
+                            last_error = Some(GatewayError::Upstream(format!(
+                                "upstream status 200: tool validation failed ({e})"
+                            )));
+                            break;
                         }
                         self.quality_tracker.record_success(target_model);
                         self.attribute(
@@ -549,6 +681,7 @@ impl ChatBackend for RoutingBackend {
                             backend.as_ref(),
                             combo_name.as_deref(),
                             tokens_compressed,
+                            Some(target_model),
                         );
                         return Ok(response);
                     }
@@ -560,11 +693,15 @@ impl ChatBackend for RoutingBackend {
                         if let GatewayError::Upstream(ref msg) = error {
                             match upstream_status_or_recovered(msg) {
                                 Some(429) => {
-                                    self.cooldowns.record_429(name.clone(), None);
+                                    let retry_after =
+                                        crate::resilience::extract_retry_after_from_error_message(
+                                            msg,
+                                        );
+                                    self.cooldowns.record_429(name, None, retry_after);
                                     self.quality_tracker.record_failure(target_model);
                                 }
                                 Some(402) | Some(403) => {
-                                    self.cooldowns.record_quota_error(name.clone());
+                                    self.cooldowns.record_quota_error(name);
                                     self.quality_tracker.record_failure(target_model);
                                 }
                                 Some(s) if s >= 500 => {
@@ -579,6 +716,7 @@ impl ChatBackend for RoutingBackend {
                             backend.as_ref(),
                             combo_name.as_deref(),
                             tokens_compressed,
+                            Some(target_model),
                         );
                         let transient = Self::is_transient(&error);
                         last_error = Some(error);
@@ -632,8 +770,27 @@ impl ChatBackend for RoutingBackend {
             };
             let mut last_error: Option<GatewayError> = None;
             let mut tripped = false;
+            let is_failover_plan = combo_name.is_some() || plan.len() > 1;
 
             for (name, target_model) in &plan {
+                if is_failover_plan {
+                    if !this.cooldowns.is_available(name, Some(target_model)) {
+                        tracing::debug!(
+                            provider = name,
+                            model = target_model,
+                            "skipping candidate: candidate is in active cooldown"
+                        );
+                        continue;
+                    }
+                    if this.quality_tracker.is_in_probation(target_model) {
+                        tracing::debug!(
+                            model = target_model,
+                            "skipping candidate: model is in 15-minute probation"
+                        );
+                        continue;
+                    }
+                }
+
                 let target_limit = crate::context_pruner::model_context_limit(target_model);
                 let budget = (target_limit as f64
                     * crate::context_pruner::TOKEN_BUDGET_SAFETY_FACTOR)
@@ -643,6 +800,15 @@ impl ChatBackend for RoutingBackend {
                     let mut pruned = request.clone();
                     let (new_tokens, orig_tokens) =
                         crate::context_pruner::prune_request(&mut pruned, target_limit);
+                    if new_tokens > target_limit {
+                        tracing::warn!(
+                            model = target_model,
+                            prompt = new_tokens,
+                            limit = target_limit,
+                            "prompt exceeds context window after pruning; skipping candidate"
+                        );
+                        continue;
+                    }
                     let compressed = orig_tokens.saturating_sub(new_tokens);
                     (
                         pruned,
@@ -677,6 +843,7 @@ impl ChatBackend for RoutingBackend {
                                 backend.as_ref(),
                                 combo_name.as_deref(),
                                 tokens_compressed,
+                                Some(target_model),
                             );
                             if tx.send(Ok(first)).await.is_err() {
                                 return;
@@ -696,11 +863,13 @@ impl ChatBackend for RoutingBackend {
                             if let GatewayError::Upstream(ref msg) = error {
                                 match upstream_status_or_recovered(msg) {
                                     Some(429) => {
-                                        this.cooldowns.record_429(name.clone(), None);
+                                        let retry_after =
+                                            crate::resilience::extract_retry_after_from_error_message(msg);
+                                        this.cooldowns.record_429(name, None, retry_after);
                                         this.quality_tracker.record_failure(target_model);
                                     }
                                     Some(402) | Some(403) => {
-                                        this.cooldowns.record_quota_error(name.clone());
+                                        this.cooldowns.record_quota_error(name);
                                         this.quality_tracker.record_failure(target_model);
                                     }
                                     Some(s) if s >= 500 => {
@@ -715,6 +884,7 @@ impl ChatBackend for RoutingBackend {
                                 backend.as_ref(),
                                 combo_name.as_deref(),
                                 tokens_compressed,
+                                Some(target_model),
                             );
                             let transient = Self::is_transient(&error);
                             last_error = Some(error);
@@ -742,6 +912,7 @@ impl ChatBackend for RoutingBackend {
                                 backend.as_ref(),
                                 combo_name.as_deref(),
                                 tokens_compressed,
+                                Some(target_model),
                             );
                             return;
                         }
@@ -1083,6 +1254,7 @@ mod tests {
                 connection_id: Some(self.connection.to_string()),
                 combo_name: None,
                 tokens_compressed: None,
+                model: None,
             }
         }
 

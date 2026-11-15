@@ -67,6 +67,8 @@ pub struct Attribution {
     pub combo_name: Option<String>,
     /// Tokens saved by prompt context pruning, if pruning was applied.
     pub tokens_compressed: Option<u32>,
+    /// Actual candidate model used to serve the request.
+    pub model: Option<String>,
 }
 
 /// Stamp `request` with a fresh attribution token and hand it back.
@@ -126,6 +128,7 @@ pub trait ChatBackend: Send + Sync + 'static {
             connection_id: None,
             combo_name: None,
             tokens_compressed: None,
+            model: None,
         }
     }
 

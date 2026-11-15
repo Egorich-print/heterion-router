@@ -111,7 +111,17 @@ pub fn model_spec(model: &str) -> ModelSpec {
         };
     }
 
-    // 7. DeepSeek models (128k context)
+    // 7. Gemma models: gemma-4-26b-a4b-it (256k context, native tools, fast execution)
+    if bare.starts_with("gemma") {
+        return ModelSpec {
+            context_window: 256_000,
+            supports_vision: false,
+            tool_support: ToolSupport::Native,
+            tier: ModelTier::FastExecution,
+        };
+    }
+
+    // 8. DeepSeek models (128k context)
     if bare.starts_with("deepseek") {
         let tier = if bare.contains("reasoner") || bare.contains("r1") {
             ModelTier::FrontierReasoning
@@ -207,6 +217,13 @@ mod tests {
         assert!(!codestral.supports_vision);
         assert_eq!(codestral.tool_support, ToolSupport::Native);
         assert_eq!(codestral.tier, ModelTier::FastExecution);
+
+        // Gemma
+        let gemma = model_spec("gemini/gemma-4-26b-a4b-it");
+        assert_eq!(gemma.context_window, 256_000);
+        assert!(!gemma.supports_vision);
+        assert_eq!(gemma.tool_support, ToolSupport::Native);
+        assert_eq!(gemma.tier, ModelTier::FastExecution);
 
         // DeepSeek
         let ds_chat = model_spec("deepseek-chat");

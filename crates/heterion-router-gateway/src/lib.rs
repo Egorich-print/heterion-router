@@ -414,6 +414,46 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
 async fn list_models(State(state): State<AppState>, _auth: Authenticated) -> impl IntoResponse {
     let mut data: Vec<Value> = Vec::new();
 
+    // Advertise dynamic Switchyard auto-routing models at the top of the catalog
+    let auto_capabilities = json!({
+        "context_window": 1_000_000,
+        "supports_vision": true,
+        "tool_support": "native",
+        "streaming": true,
+        "zero_quota_pruning": true,
+        "dynamic_ladder": true,
+    });
+
+    data.push(json!({
+        "id": "heterion-router/auto",
+        "object": "model",
+        "created": state.started_unix,
+        "owned_by": "heterion-router",
+        "capabilities": auto_capabilities.clone(),
+        "heterion-router": {
+            "kind": "auto",
+            "strategy": "switchyard",
+            "is_canonical": true,
+            "alias": "auto",
+            "capabilities": auto_capabilities.clone(),
+        },
+    }));
+
+    data.push(json!({
+        "id": "auto",
+        "object": "model",
+        "created": state.started_unix,
+        "owned_by": "heterion-router",
+        "capabilities": auto_capabilities.clone(),
+        "heterion-router": {
+            "kind": "auto",
+            "strategy": "switchyard",
+            "is_alias": true,
+            "canonical_id": "heterion-router/auto",
+            "capabilities": auto_capabilities,
+        },
+    }));
+
     // Combo names are first-class models for clients.
     if let Some(db) = state.db.as_ref() {
         let guard = db.connection();
@@ -664,7 +704,7 @@ fn record_completion_usage(state: &AppState, auth: &Authenticated, context: Comp
     // The backend that answered, not the router that picked it: usage is
     // per-provider analytics.
     let attribution = state.backend.attribution(token);
-    let served = resolved.unwrap_or(model);
+    let served = resolved.or(attribution.model.as_deref()).unwrap_or(model);
     let guard = db.connection();
     let record = UsageRecord {
         provider: attribution.provider.clone(),
@@ -2334,6 +2374,7 @@ mod tests {
                 connection_id: Some(self.connection.to_string()),
                 combo_name: None,
                 tokens_compressed: None,
+                model: None,
             }
         }
 
@@ -3341,6 +3382,7 @@ mod tests {
                 connection_id: Some("conn-heterion-local".to_string()),
                 combo_name: None,
                 tokens_compressed: None,
+                model: None,
             }
         }
 
