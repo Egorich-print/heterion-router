@@ -95,6 +95,18 @@ pub const MIGRATIONS: &[Migration] = &[
                 PRIMARY KEY (provider, model_id)
             );",
     },
+    Migration {
+        version: "004",
+        name: "provider_probes",
+        sql: "CREATE TABLE IF NOT EXISTS provider_probes (
+                provider TEXT NOT NULL PRIMARY KEY,
+                url TEXT NOT NULL,
+                status INTEGER,
+                reason TEXT NOT NULL,
+                body_excerpt TEXT NOT NULL DEFAULT '',
+                probed_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+    },
 ];
 
 /// Columns the combo archive feature (ADR-015) needs on `combos` that
@@ -255,7 +267,12 @@ mod tests {
         let first = migrate(&mut guard).unwrap();
         assert_eq!(
             first,
-            vec!["001".to_string(), "002".to_string(), "003".to_string()]
+            vec![
+                "001".to_string(),
+                "002".to_string(),
+                "003".to_string(),
+                "004".to_string()
+            ]
         );
 
         let second = migrate(&mut guard).unwrap();
@@ -268,8 +285,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // 17 base tables + the three capability tables + the ledger.
-        assert_eq!(tables, 21);
+        // 17 base tables + the three capability tables + the probe table + the ledger.
+        assert_eq!(tables, 22);
     }
 
     /// The exact schema a database created before ADR-015 has: ledger says
@@ -317,7 +334,10 @@ mod tests {
 
         let mut guard = db.connection();
         let applied = migrate(&mut guard).unwrap();
-        assert_eq!(applied, vec!["002".to_string(), "003".to_string()]);
+        assert_eq!(
+            applied,
+            vec!["002".to_string(), "003".to_string(), "004".to_string()]
+        );
 
         let columns: HashSet<String> = {
             let mut statement = guard.prepare("PRAGMA table_info(combos)").unwrap();
@@ -389,7 +409,10 @@ mod tests {
         // schema re-run — only the later migrations apply on top.
         let mut guard = db.connection();
         let applied = migrate(&mut guard).unwrap();
-        assert_eq!(applied, vec!["002".to_string(), "003".to_string()]);
+        assert_eq!(
+            applied,
+            vec!["002".to_string(), "003".to_string(), "004".to_string()]
+        );
     }
 
     fn api_keys_columns(conn: &rusqlite::Connection) -> HashSet<String> {

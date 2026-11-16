@@ -625,6 +625,77 @@ pub fn list_model_capabilities(conn: &Connection) -> Vec<ModelCapabilityRow> {
     }
 }
 
+/// One measured probe of a provider.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderProbeRow {
+    /// Provider id.
+    pub provider: String,
+    /// The URL that was probed.
+    pub url: String,
+    /// The HTTP status, when the platform answered at all.
+    pub status: Option<i64>,
+    /// The reason, as the gateway classifies it (`served`, `needs_key`, …).
+    pub reason: String,
+    /// A short excerpt of the answer.
+    pub body_excerpt: String,
+    /// When the probe ran (SQLite timestamp).
+    pub probed_at: String,
+}
+
+/// Store (or refresh) the probe of one provider.
+pub fn upsert_provider_probe(conn: &Connection, row: &ProviderProbeRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO provider_probes (provider, url, status, reason, body_excerpt, probed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+         ON CONFLICT(provider) DO UPDATE SET
+             url = excluded.url,
+             status = excluded.status,
+             reason = excluded.reason,
+             body_excerpt = excluded.body_excerpt,
+             probed_at = datetime('now')",
+        params![
+            row.provider,
+            row.url,
+            row.status,
+            row.reason,
+            row.body_excerpt
+        ],
+    )?;
+    Ok(())
+}
+
+/// Read every stored probe.
+pub fn list_provider_probes(conn: &Connection) -> Vec<ProviderProbeRow> {
+    let mut statement = match conn.prepare(
+        "SELECT provider, url, status, reason, body_excerpt, probed_at
+         FROM provider_probes",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = statement.query_map([], |row| {
+        Ok(ProviderProbeRow {
+            provider: row.get("provider")?,
+            url: row.get("url")?,
+            status: row.get("status")?,
+            reason: row.get("reason")?,
+            body_excerpt: row.get("body_excerpt")?,
+            probed_at: row.get("probed_at")?,
+        })
+    });
+    match rows {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The probe of one provider, if it was ever measured.
+pub fn get_provider_probe(conn: &Connection, provider: &str) -> Option<ProviderProbeRow> {
+    list_provider_probes(conn)
+        .into_iter()
+        .find(|row| row.provider == provider)
+}
+
 /// A row in `combos`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComboRow {

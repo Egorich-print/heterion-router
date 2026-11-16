@@ -1,9 +1,10 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use heterion_router_config::GatewayConfig;
 use heterion_router_crypto::{FieldCrypto, load_secret};
 use heterion_router_db::Db;
@@ -25,6 +26,92 @@ use heterion_router_gateway::{
 };
 use heterion_router_providers::ProviderRegistry;
 use heterion_router_routing::{RouteRule, Router};
+
+/// Probe every keyless provider the registry declares and store the verdicts.
+///
+/// The probe asks each platform whether it answers *without* a credential.
+/// The answer is what lets the provider into the catalogue (ADR-026): a
+/// keyless provider whose platform wants a key is a claim, not a service, and
+/// a catalogue entry that always fails is worse than an absent one (ADR-025).
+///
+/// The verdicts land in `provider_probes`, so the admin API and the matrix
+/// report read the same measurement.
+async fn probe_keyless_providers(registry: &ProviderRegistry, db: &Arc<Db>) -> usize {
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    else {
+        return 0;
+    };
+    let connected: HashSet<String> = {
+        let guard = db.connection();
+        heterion_router_db::repos::list_connections(&guard)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| row.provider)
+            .collect()
+    };
+    let candidates: Vec<(String, Option<String>, String, Option<String>)> = registry
+        .iter()
+        .filter(|entry| {
+            heterion_router_gateway::provider_status::keyless_candidate(
+                entry.format.as_deref(),
+                entry.auth_type.as_deref(),
+                entry.base_url.as_deref(),
+                connected.contains(&entry.id),
+            )
+        })
+        .filter_map(|entry| {
+            let base_url = entry.base_url.as_deref()?.to_string();
+            let model = entry.models.first().map(|model| model.id.clone());
+            Some((entry.id.clone(), entry.format.clone(), base_url, model))
+        })
+        .collect();
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let probes = futures::stream::iter(candidates).map(|(provider, format, base_url, model)| {
+        let http = &http;
+        async move {
+            let outcome = heterion_router_gateway::provider_status::probe(
+                http,
+                format.as_deref(),
+                &base_url,
+                model.as_deref(),
+            )
+            .await?;
+            Some((provider, outcome))
+        }
+    });
+
+    let mut probed = 0usize;
+    for outcome in probes.buffer_unordered(8).collect::<Vec<_>>().await {
+        let Some((provider, outcome)) = outcome else {
+            continue;
+        };
+        probed += 1;
+        tracing::info!(
+            provider = %provider,
+            status = ?outcome.status,
+            reason = outcome.reason.as_str(),
+            "keyless provider probed"
+        );
+        let guard = db.connection();
+        let _ = heterion_router_db::repos::upsert_provider_probe(
+            &guard,
+            &heterion_router_db::repos::ProviderProbeRow {
+                provider,
+                url: outcome.url,
+                status: outcome.status.map(|status| status as i64),
+                reason: outcome.reason.as_str().to_string(),
+                body_excerpt: outcome.body,
+                probed_at: String::new(),
+            },
+        );
+    }
+    probed
+}
 
 /// Resolve grok-cli credentials: an explicit env token wins, otherwise every
 /// active connection in the database (decrypted, priority-ordered) forms the
@@ -66,7 +153,12 @@ fn grok_credentials(db: &Db, data_dir: &std::path::Path) -> Vec<GrokCredential> 
 /// and is only registered when `HETERION_ROUTER_ENABLE_ECHO=1`
 /// (`OMNIROUTE_ENABLE_ECHO` still honored) — it must never
 /// silently answer production traffic.
-type Selected = (Arc<dyn ChatBackend>, Arc<ProviderRegistry>, Vec<String>);
+type Selected = (
+    Arc<dyn ChatBackend>,
+    Arc<ProviderRegistry>,
+    Vec<String>,
+    Vec<String>,
+);
 
 /// Write a refreshed OAuth token pair back to `provider_connections`.
 ///
@@ -512,12 +604,12 @@ fn select_backend(
     // cannot answer is worse than an absent one.
     let driver_url = std::env::var("HETERION_WEB_DRIVER_URL")
         .unwrap_or_else(|_| web_driver::DEFAULT_DRIVER_URL.to_string());
+    // Only the providers the driver has an adapter for: without one the
+    // backend could not answer, and a catalog entry that always fails is
+    // worse than an absent provider.
+    let supported: BTreeSet<String> = web_driver::driver_providers(&driver_url);
     if web_driver::driver_reachable(&driver_url) {
         let web_driver = web_driver::WebDriverClient::new(&driver_url);
-        // Only the providers the driver has an adapter for: without one the
-        // backend could not answer, and a catalog entry that always fails is
-        // worse than an absent provider.
-        let supported = web_driver::driver_providers(&driver_url);
         if supported.is_empty() {
             tracing::warn!(
                 "web executors skipped: the driver at {driver_url} reports no adapter \
@@ -559,6 +651,62 @@ fn select_backend(
             "web executors skipped: the Camoufox driver does not answer at {driver_url} \
              (start scripts/webdriver/server.py, or point HETERION_WEB_DRIVER_URL at it)"
         );
+    }
+
+    // Keyless providers (ADR-026): the registry declares them usable without a
+    // credential, but a declaration is a claim. One joins the catalogue only
+    // after a probe proved that it answers without a key — a catalogue entry
+    // that always fails is worse than an absent one (ADR-025).
+    //
+    // The verdict is the one the probe stored in `provider_probes`: the probe
+    // ran at startup, without any credential.
+    for entry in registry.iter() {
+        if backends.contains_key(&entry.id) {
+            continue;
+        }
+        let Some(base_url) = provider_base_url_from(&registry, &entry.id, None) else {
+            continue;
+        };
+        if !heterion_router_gateway::provider_status::keyless_candidate(
+            entry.format.as_deref(),
+            entry.auth_type.as_deref(),
+            Some(base_url.as_str()),
+            providers.contains_key(&entry.id),
+        ) {
+            continue;
+        }
+        let verdict = {
+            let guard = db.connection();
+            heterion_router_db::repos::get_provider_probe(&guard, &entry.id)
+        };
+        let Some(verdict) = verdict else {
+            tracing::debug!(
+                provider = %entry.id,
+                "keyless provider skipped: it was never probed"
+            );
+            continue;
+        };
+        if verdict.reason
+            != heterion_router_gateway::provider_status::ProviderReason::Served.as_str()
+        {
+            tracing::info!(
+                provider = %entry.id,
+                reason = %verdict.reason,
+                "keyless provider skipped: the platform does not answer without a key"
+            );
+            continue;
+        }
+        let backend =
+            ProviderOpenAiBackend::new(entry.id.clone(), resolve_chat_url(&base_url), Vec::new());
+        match backend {
+            Ok(backend) => {
+                backends.insert(entry.id.clone(), status_aware(Arc::new(backend)));
+                tracing::info!("backend available: {} (keyless, {base_url})", entry.id);
+            }
+            Err(error) => {
+                tracing::warn!("backend {} skipped: {error}", entry.id);
+            }
+        }
     }
 
     report_unserved(&unserved);
@@ -611,7 +759,12 @@ fn select_backend(
             std::env::var("HETERION_ROUTER_VISION_SAVING")
                 .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
         );
-    Ok((Arc::new(routing), registry, names))
+    Ok((
+        Arc::new(routing),
+        registry,
+        names,
+        supported.into_iter().collect(),
+    ))
 }
 
 /// When spawned as a Tauri sidecar, the app passes its pid; the gateway exits
@@ -761,7 +914,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     validate_auth_policy(&config, &db)?;
 
     let db = Arc::new(db);
-    let (backend, registry, backend_names) = select_backend(db.clone(), &config.data_dir)?;
+    // Measure the keyless platforms before the catalogue is built: the
+    // verdict decides whether a provider without a credential may serve.
+    let probe_registry = Arc::new(ProviderRegistry::load());
+    let probed = probe_keyless_providers(&probe_registry, &db).await;
+    if probed > 0 {
+        tracing::info!(probed, "keyless providers probed");
+    }
+    let (backend, registry, backend_names, web_adapters) =
+        select_backend(db.clone(), &config.data_dir)?;
     let ui_dir = heterion_router_gateway::ui::ui_dir();
     match ui_dir.as_ref() {
         Some(dir) => tracing::info!("dashboard served from {}", dir.display()),
@@ -771,6 +932,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_require_auth(config.require_auth)
         .with_max_body_bytes(config.max_body_bytes)
         .with_catalog(registry, backend_names)
+        .with_web_adapters(web_adapters)
         .with_ui_dir(ui_dir)
         .with_data_dir(config.data_dir.clone());
     let app = build_router_with_state(state);

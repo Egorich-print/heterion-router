@@ -12,6 +12,7 @@
 //! operation until the Rust side owns decryption.
 
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path as StdPath, PathBuf};
 
@@ -23,6 +24,7 @@ use axum::{
 };
 use heterion_router_crypto::{FieldCrypto, load_secret};
 use heterion_router_db::repos;
+use heterion_router_db::repos::ProviderProbeRow;
 use heterion_router_providers::{ProviderEntry, parse_wire_format};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -203,28 +205,180 @@ pub async fn connections(State(state): State<AppState>, _auth: ManageAuthenticat
 /// actually serve: an HTTP(S) base URL, at least one model, and a wire
 /// format the transports understand. The registry is bigger; this is the
 /// subset a credential can be attached to.
+///
+/// Every entry also carries the *measured* reason it is (not) served, and the
+/// `matrix` key holds the whole registry with the same reasons — so the
+/// operator can tell "needs a key" from "needs code" from "the platform is
+/// gone".
 pub async fn providers(State(state): State<AppState>, _auth: ManageAuthenticated) -> Json<Value> {
     let Some(registry) = state.registry.as_ref() else {
-        return Json(json!({ "providers": [] }));
+        return Json(json!({ "providers": [], "matrix": [] }));
     };
 
-    let providers: Vec<Value> = registry
+    let (probes, connected) = provider_probe_state(&state);
+    let served: HashSet<&str> = state.backend_names.iter().map(String::as_str).collect();
+    let web_adapters = web_adapter_ids(&state);
+
+    let matrix: Vec<Value> = registry
         .iter()
-        .filter(|entry| is_key_provider(entry))
         .map(|entry| {
-            let auth_type = entry.auth_type.clone().unwrap_or_default();
+            let facts = crate::provider_status::ProviderFacts {
+                served: served.contains(entry.id.as_str()),
+                connected: connected.contains(entry.id.as_str()),
+                format: entry.format.clone(),
+                executor: entry.executor.clone(),
+                auth_type: entry.auth_type.clone(),
+                modelled: entry
+                    .format
+                    .as_deref()
+                    .is_some_and(|format| parse_wire_format(format).is_some())
+                    || has_own_executor(entry),
+                web_adapter: web_adapters.contains(entry.id.as_str()),
+                probe: probes
+                    .get(entry.id.as_str())
+                    .map(|row| crate::provider_status::ProviderReason::parse(&row.reason)),
+            };
+            let reason = crate::provider_status::reason_for(&facts);
             json!({
                 "id": entry.id,
                 "name": provider_label(&entry.id),
-                "auth_type": auth_type,
+                "auth_type": entry.auth_type.clone().unwrap_or_default(),
                 "format": entry.format.clone().unwrap_or_default(),
-                "needs_key": !matches!(auth_type.as_str(), "none" | "optional"),
+                "needs_key": !matches!(
+                    entry.auth_type.as_deref().unwrap_or_default(),
+                    "none" | "optional"
+                ),
                 "base_url": entry.base_url.clone().unwrap_or_default(),
+                "models": entry.models.len(),
+                "served": reason.is_served(),
+                "reason": reason.as_str(),
+                "can_add_key": is_key_provider(entry),
+                "last_probe": probe_payload(probes.get(entry.id.as_str())),
             })
         })
         .collect();
 
-    Json(json!({ "providers": providers }))
+    let providers: Vec<Value> = matrix
+        .iter()
+        .filter(|entry| entry["can_add_key"] == json!(true))
+        .cloned()
+        .collect();
+
+    Json(json!({ "providers": providers, "matrix": matrix }))
+}
+
+/// The stored probes and the providers that have a connection.
+fn provider_probe_state(state: &AppState) -> (HashMap<String, ProviderProbeRow>, HashSet<String>) {
+    let Some(db) = state.db.as_ref() else {
+        return (HashMap::new(), HashSet::new());
+    };
+    let guard = db.connection();
+    let probes = repos::list_provider_probes(&guard)
+        .into_iter()
+        .map(|row| (row.provider.clone(), row))
+        .collect();
+    let connected = repos::list_connections(&guard)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|row| row.provider)
+        .collect();
+    (probes, connected)
+}
+
+/// The providers the web driver has an adapter for.
+fn web_adapter_ids(state: &AppState) -> HashSet<String> {
+    state.web_adapters.iter().cloned().collect()
+}
+
+/// The probe of one provider, as the API shows it.
+fn probe_payload(probe: Option<&ProviderProbeRow>) -> Value {
+    match probe {
+        Some(row) => json!({
+            "url": row.url,
+            "status": row.status,
+            "reason": row.reason,
+            "body": row.body_excerpt,
+            "at": row.probed_at,
+        }),
+        None => Value::Null,
+    }
+}
+
+/// `POST /api/providers/{id}/probe` — measure one provider again.
+///
+/// The probe asks the platform whether it answers *without* a credential and
+/// stores the verdict, so the matrix stops being a snapshot of a past run.
+/// A provider that cannot be probed (no base URL, a format the gateway cannot
+/// speak) is reported as such rather than silently kept.
+pub async fn probe_provider(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    _auth: ManageAuthenticated,
+) -> impl IntoResponse {
+    let Some(registry) = state.registry.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "registry unavailable"})),
+        );
+    };
+    let Some(entry) = registry.get(&provider) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown provider: {provider}")})),
+        );
+    };
+    let Some(base_url) = entry.base_url.as_deref() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the provider declares no base URL"})),
+        );
+    };
+    let model = entry.models.first().map(|model| model.id.clone());
+    let http = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(http) => http,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": error.to_string()})),
+            );
+        }
+    };
+    let Some(outcome) =
+        crate::provider_status::probe(&http, entry.format.as_deref(), base_url, model.as_deref())
+            .await
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the provider has no probeable endpoint"})),
+        );
+    };
+    if let Some(db) = state.db.as_ref() {
+        let guard = db.connection();
+        let _ = repos::upsert_provider_probe(
+            &guard,
+            &ProviderProbeRow {
+                provider: provider.clone(),
+                url: outcome.url.clone(),
+                status: outcome.status.map(|status| status as i64),
+                reason: outcome.reason.as_str().to_string(),
+                body_excerpt: outcome.body.clone(),
+                probed_at: String::new(),
+            },
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "provider": provider,
+            "url": outcome.url,
+            "status": outcome.status,
+            "reason": outcome.reason.as_str(),
+            "body": outcome.body,
+        })),
+    )
 }
 
 /// Whether a registry entry can take a provider credential.

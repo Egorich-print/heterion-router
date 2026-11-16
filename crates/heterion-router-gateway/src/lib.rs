@@ -30,6 +30,7 @@ pub mod ids;
 pub mod inspector;
 pub mod model_spec;
 pub mod openai;
+pub mod provider_status;
 pub mod reasoning;
 pub mod repetition_guard;
 pub mod resilience;
@@ -232,6 +233,8 @@ pub struct AppState {
     pub(crate) prices: PriceTable,
     pub(crate) registry: Option<Arc<ProviderRegistry>>,
     pub(crate) backend_names: Vec<String>,
+    /// The web providers the Camoufox driver has an adapter for.
+    pub(crate) web_adapters: Vec<String>,
     pub(crate) data_dir: Option<std::path::PathBuf>,
     /// Built dashboard bundle, when one is present.
     pub(crate) ui_dir: Option<std::path::PathBuf>,
@@ -264,6 +267,7 @@ impl AppState {
             prices: PriceTable::with_defaults(),
             registry: None,
             backend_names: Vec::new(),
+            web_adapters: Vec::new(),
             data_dir: None,
             ui_dir: None,
             started_unix: now_unix(),
@@ -280,6 +284,7 @@ impl AppState {
             prices: PriceTable::with_defaults(),
             registry: None,
             backend_names: Vec::new(),
+            web_adapters: Vec::new(),
             data_dir: None,
             ui_dir: None,
             started_unix: now_unix(),
@@ -296,6 +301,15 @@ impl AppState {
     ) -> Self {
         self.registry = Some(registry);
         self.backend_names = backend_names;
+        self
+    }
+
+    /// Attach the web providers the Camoufox driver has an adapter for.
+    ///
+    /// A web executor without an adapter cannot answer, and the provider
+    /// matrix has to say so instead of guessing.
+    pub fn with_web_adapters(mut self, adapters: Vec<String>) -> Self {
+        self.web_adapters = adapters;
         self
     }
 
@@ -361,6 +375,7 @@ pub fn build_router_with(state: AppState, cache_layer: cache::CacheLayer) -> Rou
         )
         .route("/api/connections/{id}", patch(admin::update_connection))
         .route("/api/providers", get(admin::providers))
+        .route("/api/providers/{id}/probe", post(admin::probe_provider))
         .route("/api/usage", get(admin::usage))
         .route("/api/logs", get(admin::logs))
         .route("/api/logs/app", get(admin::logs_app))
