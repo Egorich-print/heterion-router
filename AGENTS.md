@@ -367,7 +367,7 @@ Plist — машинно-локальный (`~/Library/LaunchAgents`), не х�
 code path: в текущей рабочей БД нет активной строки `provider_connections`, и
 backend не поднимается. URL по умолчанию `http://127.0.0.1:8080/v1`, override —
 `HETERION_LOCAL_BASE_URL`. Model id — транзит на Heterion (там один загруженный
-вес). Registry содержит 277 providers / 2329 models; в каталог формы добавления
+вес). Registry содержит 276 providers / 2257 models; в каталог формы добавления
 ключа (`GET /api/providers`) проходят записи с поддерживаемой схемой. Перечень:
 `docs/PROVIDERS.md`; метод аудита: `docs/research/PROJECT-AUDIT-2026-09.md`.
 
@@ -534,12 +534,12 @@ drag-головоломку перед OAuth; это шаг оператора (
     `kilocode` — `anthropic/claude-opus-5`, `anthropic/claude-sonnet-5`,
     `api-airforce` — `x-ai/grok-3`, `moonshot/kimi-k2.6`,
     `openrouter/auto`.
-  Итог: 276 провайдеров, 2291 модель (было 2329).
+  Итог: 276 провайдеров, 2291 модель (было 2328).
 - **Четвёртая волна чистки — тот же прогон, журнал до 22:40 UTC:**
   - `pollinations` — Classic API площадки обслуживает ровно одну модель
     (`openai-fast` + псевдоним `openai`); 29 id отвечали `404 NOT_FOUND:
     Model "…" isn't on the Classic API` при нуле успехов (было 31, осталось 2).
-  Итог после волны: 276 провайдеров, 2262 модели (было 2329).
+  Итог после волны: 276 провайдеров, 2262 модели (было 2328).
 - **Пятая волна чистки — модели, снятые самой площадкой:**
   - `minimax` — четыре id отвечают `404 not_found_error: The model "…" is no
     longer available. (2069)` (28–30 отказов на каждый): `MiniMax-M2.5`,
@@ -548,7 +548,7 @@ drag-головоломку перед OAuth; это шаг оператора (
   - `ollama-cloud/nemotron-3-nano:30b` — `410 Gone: nemotron-3-nano:30b was
     retired on November 9, 2026. Try glm-5.3-flash:cloud` (площадка сама
     называет замену).
-  Итог после волны: 276 провайдеров, 2257 моделей.
+  Итог после волны: 276 провайдеров, 2257 моделей (было 2328).
 
 **Отказ соединения — не отказ модели.** `sambanova` отвечает `401 Incorrect
 API key provided` (все пять соединений отключены: ключи мертвы), поэтому её
