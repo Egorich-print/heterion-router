@@ -80,10 +80,7 @@ pipeline {
         RUST_BACKTRACE     = '1'
         RUST_BACKTRACE_FULL = '1'
         // rustup подхватывает версию из rust-toolchain.toml репозитория
-        // (репозиторий теперь использует 1.99.1). В контейнере эта версия может
-        // отсутствовать — при первом обращении rustup скачает её при наличии
-        // сети, либо её нужно доставить в образ Jenkins-контейнера. Не
-        // полагайтесь на предустановленные 1.99.0/1.98.0/stable как на гарантии.
+        // (1.99.0 / 1.98.0 / stable — все три установлены в контейнере).
         PATH               = '/var/lib/jenkins/.cargo/bin:/opt/node24/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin'
     }
 
@@ -144,9 +141,21 @@ pipeline {
                     env.REPO_GATE = gates.find { fileExists(it) } ?: ''
 
                     // Свой release-workflow — тогда релиз создаёт он, а не Jenkins.
-                    env.REPO_HAS_RELEASE = fileExists('.github/workflows/release.yml') ||
-                                          fileExists('.github/workflows/release.yaml') ||
-                                          fileExists('.github/workflows/ide-release.yml')
+                    //
+                    // Значение — строка 'yes'/'no', а НЕ булево: env хранит
+                    // строки, и строка "false" в Groovy истинна (непустая).
+                    // С булевым env.REPO_HAS_RELEASE = false условие
+                    // "env.REPO_HAS_RELEASE ? ... : ..." всегда срабатывало в
+                    // первую сторону — и Jenkins не публиковал релиз НИ ОДНОГО
+                    // репозитория, объявляя, что релиз создаёт сам репозиторий.
+                    env.REPO_HAS_RELEASE = (fileExists('.github/workflows/release.yml') ||
+                                            fileExists('.github/workflows/release.yaml') ||
+                                            fileExists('.github/workflows/ide-release.yml')) ? 'yes' : 'no'
+
+                    // Свой релизный скрипт репозитория — приоритет над базовым
+                    // набором ассетов, по той же логике, что и гейт-скрипт:
+                    // имена и состав ассетов задаёт репозиторий, а не Jenkins.
+                    env.REPO_RELEASE_HOOK = ['scripts/release.sh'].find { fileExists(it) } ?: ''
 
                     def ref = env.TAG_NAME ?: env.BRANCH_NAME ?: '-'
                     currentBuild.displayName = "#${env.BUILD_NUMBER} ${env.PROJECT_TYPE} ${ref}"
@@ -154,7 +163,8 @@ pipeline {
                     echo "Тип проекта: ${env.PROJECT_TYPE}"
                     echo "Репозиторий: ${env.GH_REPO ?: 'не определён'}"
                     echo "Гейт-скрипт репозитория: ${env.REPO_GATE ?: 'нет — базовый набор'}"
-                    echo "Свой release-workflow: ${env.REPO_HAS_RELEASE ? 'есть — релиз создаёт он' : 'нет'}"
+                    echo "Релизный скрипт репозитория: ${env.REPO_RELEASE_HOOK ?: 'нет — базовый набор'}"
+                    echo "Свой release-workflow: ${env.REPO_HAS_RELEASE == 'yes' ? 'есть — релиз создаёт он' : 'нет'}"
                 }
                 sh '''
                     set -e
@@ -209,31 +219,31 @@ pipeline {
                                 sh '''
                                     set -e
                                     if command -v just >/dev/null 2>&1 && [ -f Justfile ]; then
-                                        flock --close "${LOCK_FILE}" just --list >/dev/null
+                                      flock --close "${LOCK_FILE}" just --list >/dev/null
                                     else
-                                        make -n >/dev/null
+                                      make -n >/dev/null
                                     fi
                                 '''
                                 break
                             default:
                                 // shell-проекты: синтаксис всех tracked *.sh и *.py.
                                 // Списки — во временные файлы: перенаправление
-                                // "done < file" работает in dash, process
+                                // "done < file" работает в dash, process
                                 // substitution "<(...)" — нет.
                                 sh '''
                                     set -e
                                     fail=0
                                     git ls-files '*.sh' > /tmp/jenkins_gate_sh.txt || true
                                     while IFS= read -r f; do
-                                        [ -n "$f" ] || continue
-                                        bash -n "$f" || { echo "syntax error: $f"; fail=1; }
+                                      [ -n "$f" ] || continue
+                                      bash -n "$f" || { echo "syntax error: $f"; fail=1; }
                                     done < /tmp/jenkins_gate_sh.txt
                                     git ls-files '*.py' > /tmp/jenkins_gate_py.txt || true
                                     if command -v python3 >/dev/null 2>&1; then
-                                        while IFS= read -r f; do
-                                            [ -n "$f" ] || continue
-                                            python3 -m py_compile "$f" || { echo "python error: $f"; fail=1; }
-                                        done < /tmp/jenkins_gate_py.txt
+                                      while IFS= read -r f; do
+                                        [ -n "$f" ] || continue
+                                        python3 -m py_compile "$f" || { echo "python error: $f"; fail=1; }
+                                      done < /tmp/jenkins_gate_py.txt
                                     fi
                                     [ "$fail" = 0 ] || exit 1
                                     echo "все tracked shell/python скрипты разбираются"
@@ -293,8 +303,12 @@ pipeline {
                 }
             }
             steps {
+                // Всё в одном script-блоке — иначе `return` из script-блока
+                // выполняет только сам блок, а следующие шаги stage всё равно
+                // исполнились бы. Прежняя версия объявляла «релиз создаёт он»
+                // и тут же создавала релиз сама: дубль.
                 script {
-                    if (env.REPO_HAS_RELEASE) {
+                    if (env.REPO_HAS_RELEASE == 'yes') {
                         echo 'В репозитории есть свой release-workflow — релиз создаёт он, Jenkins не дублирует.'
                         return
                     }
@@ -303,30 +317,45 @@ pipeline {
                     }
                     def tag = env.TAG_NAME ?: env.GIT_TAG
                     echo "Публикация релиза ${tag} для ${env.GH_REPO}"
-                }
-                sh '''
-                    set -e
-                    mkdir -p dist
-                    if [ -d /srv/jenkins/archive/"${JOB_NAME}" ]; then
-                      cp -a /srv/jenkins/archive/"${JOB_NAME}"/. dist/ 2>/dev/null || true
-                    fi
-                    ( cd dist && sha256sum * > SHA256SUMS ) 2>/dev/null || true
-                    ls -la dist
-                '''
-                script {
-                    def token = withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
-                        return sh(script: 'echo "$GH_TOKEN"', returnStdout: true).trim()
+
+                    if (env.REPO_RELEASE_HOOK) {
+                        // Свой релизный скрипт репозитория: он сам собирает,
+                        // упаковывает и публикует ассеты — состав и имена
+                        // ассетов задаёт репозиторий.
+                        echo "Релизный скрипт репозитория: ${env.REPO_RELEASE_HOOK}"
+                        withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
+                            sh """
+                                set -e
+                                chmod +x './${env.REPO_RELEASE_HOOK}' 2>/dev/null || true
+                                flock --close "${LOCK_FILE}" './${env.REPO_RELEASE_HOOK}' '${env.TAG_NAME}'
+                            """
+                        }
+                        return
                     }
+
+                    sh '''
+                        set -e
+                        mkdir -p dist
+                        if [ -d /srv/jenkins/archive/"${JOB_NAME}" ]; then
+                          cp -a /srv/jenkins/archive/"${JOB_NAME}"/. dist/ 2>/dev/null || true
+                        fi
+                        ( cd dist && sha256sum * > SHA256SUMS ) 2>/dev/null || true
+                        ls -la dist
+                    '''
                     def hasAssets = sh(script: 'ls dist 2>/dev/null | wc -l', returnStdout: true).trim().toInteger() > 0
                     if (!hasAssets) {
                         echo 'Артефактов нет — релиз без вложений создавать не буду'
                         return
                     }
-                    sh """
-                        set -e
-                        export GH_TOKEN='${token}'
-                        gh release create '${env.TAG_NAME}' dist/* --verify-tag --generate-notes --repo '${env.GH_REPO}'
-                    """
+                    // Токен — в переменной окружения шага, а не в тексте
+                    // команды: withCredentials подставляет его и маскирует в
+                    // выводе.
+                    withCredentials([string(credentialsId: 'github-token', variable: 'GH_TOKEN')]) {
+                        sh """
+                            set -e
+                            gh release create '${env.TAG_NAME}' dist/* --verify-tag --generate-notes --repo '${env.GH_REPO}'
+                        """
+                    }
                 }
             }
         }
