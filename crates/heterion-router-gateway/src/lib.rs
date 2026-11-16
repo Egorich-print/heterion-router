@@ -3884,6 +3884,144 @@ mod tests {
         }
     }
 
+    /// A candidate whose provider cannot take the prompt is not called at
+    /// all.
+    ///
+    /// groq's account budget is 8000 tokens per minute, and the agent
+    /// prompts are tens of thousands: the refusal is certain, so paying for
+    /// it wastes a slot of the failover. The router skips such a candidate.
+    #[derive(Clone)]
+    struct CountingBackend {
+        provider: &'static str,
+        connection: &'static str,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl backend::ChatBackend for CountingBackend {
+        fn name(&self) -> &'static str {
+            "provider"
+        }
+
+        fn attribution(&self, _token: &str) -> backend::Attribution {
+            backend::Attribution {
+                provider: Some(self.provider.to_string()),
+                connection_id: Some(self.connection.to_string()),
+                combo_name: None,
+                tokens_compressed: None,
+                model: None,
+            }
+        }
+
+        async fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatCompletionResponse {
+                id: ids::completion_id(),
+                object: "chat.completion",
+                created: ids::unix_seconds(),
+                model: request.model.clone(),
+                choices: vec![heterion_router_core::ChatChoice {
+                    index: 0,
+                    message: ChatMessage::plain("assistant".to_string(), "ok".to_string()),
+                    finish_reason: "stop".to_string(),
+                }],
+                usage: heterion_router_core::Usage {
+                    prompt_tokens: 7,
+                    completion_tokens: 4,
+                    total_tokens: 11,
+                },
+                raw: None,
+            })
+        }
+
+        fn stream(&self, _request: ChatCompletionRequest) -> backend::ChunkStream {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(futures::stream::once(async {
+                Ok(StreamChunk::done("stop"))
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_candidate_with_an_unservable_prompt_is_not_called_at_all() {
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        {
+            let guard = db.connection();
+            heterion_router_db::repos::upsert_combo(
+                &guard,
+                &heterion_router_db::repos::ComboRow {
+                    id: "c-skip-big".to_string(),
+                    name: "skip-big".to_string(),
+                    data: json!({
+                        "strategy": "priority",
+                        "models": [
+                            {"kind": "model", "model": "grok-4.6", "providerId": "groq"},
+                            {"kind": "model", "model": "grok-4.6", "providerId": "heterion-local"},
+                        ],
+                    })
+                    .to_string(),
+                    sort_order: 0,
+                    active: true,
+                },
+            )
+            .unwrap();
+        }
+        let groq_calls = Arc::new(AtomicUsize::new(0));
+        let mut backends: HashMap<String, Arc<dyn backend::ChatBackend>> = HashMap::new();
+        backends.insert(
+            "groq".to_string(),
+            Arc::new(CountingBackend {
+                provider: "groq",
+                connection: "conn-groq",
+                calls: groq_calls.clone(),
+            }),
+        );
+        backends.insert(
+            "heterion-local".to_string(),
+            Arc::new(CountingBackend {
+                provider: "heterion-local",
+                connection: "conn-heterion-local",
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+        );
+        let routing = Arc::new(
+            routing::RoutingBackend::new(backends, Planner::new(vec![], vec![]))
+                .with_combo_source(db.clone(), Arc::new(ProviderRegistry::load())),
+        );
+        let router = build_router_with_state(AppState::with_db(routing, db.clone()));
+
+        // A prompt well past groq's 8000-token budget.
+        let big = "x".repeat(120_000);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "skip-big",
+                               "messages": [{"role": "user", "content": big}]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The provider that cannot take the prompt was never called.
+        assert_eq!(groq_calls.load(Ordering::Relaxed), 0);
+
+        // And the journal shows the call that answered, with no refusal row.
+        let guard = db.connection();
+        let calls = rows(&guard, "SELECT provider FROM call_logs ORDER BY rowid");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0][0].as_deref(), Some("heterion-local"), "{calls:?}");
+    }
+
     /// A request that fails everywhere leaves one row per refusal — and no
     /// extra summary row.
     ///

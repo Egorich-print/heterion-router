@@ -368,7 +368,12 @@ fn elapsed_ms(started: std::time::Instant) -> u32 {
 /// output budget or no place for the thinking sidecar kills the whole
 /// request otherwise. The provider id is part of the decision on purpose: the
 /// same model id behind two providers is served by two different APIs.
-fn attempt(request: &ChatCompletionRequest, provider: &str, model: &str) -> ChatCompletionRequest {
+fn attempt(
+    request: &ChatCompletionRequest,
+    provider: &str,
+    model: &str,
+    context_limit: Option<u32>,
+) -> ChatCompletionRequest {
     const OPENAI_ONLY_FIELDS: [&str; 1] = ["store"];
     let mut attempt = request.clone();
     attempt.model = model.to_string();
@@ -428,6 +433,26 @@ fn attempt(request: &ChatCompletionRequest, provider: &str, model: &str) -> Chat
             attempt.max_completion_tokens = Some(cap);
         }
     }
+    // The output budget shares the context window with the prompt: the
+    // platform counts them together ("This model's maximum context length is
+    // 32000 tokens. However, you requested 32000 output tokens and your
+    // prompt contains ..." — probed live 2026-11-16 on sealion's 32B model).
+    // So the room left for the answer is the window minus the prompt.
+    if let Some(limit) = context_limit.filter(|limit| *limit > 0) {
+        let prompt = crate::context_pruner::fast_estimate_tokens(&attempt);
+        let room = limit.saturating_sub(prompt);
+        if room > 0 {
+            if attempt.max_tokens.is_some_and(|tokens| tokens > room) {
+                attempt.max_tokens = Some(room);
+            }
+            if attempt
+                .max_completion_tokens
+                .is_some_and(|tokens| tokens > room)
+            {
+                attempt.max_completion_tokens = Some(room);
+            }
+        }
+    }
     attempt
 }
 
@@ -455,7 +480,7 @@ mod attempt_tests {
             .extra
             .insert("logprobs".into(), serde_json::json!(true));
 
-        let out = attempt(&request, "mistral", "codestral-latest");
+        let out = attempt(&request, "mistral", "codestral-latest", None);
         assert_eq!(out.model, "codestral-latest");
         assert!(!out.extra.contains_key("_heterion_router_attribution"));
         assert!(!out.extra.contains_key("store"));
@@ -472,11 +497,11 @@ mod attempt_tests {
             ..Default::default()
         };
         // The client's field survives dispatch to a family that accepts it.
-        let glm = attempt(&request, "zai", "glm-5.3-flash");
+        let glm = attempt(&request, "zai", "glm-5.3-flash", None);
         assert_eq!(glm.reasoning_effort.as_deref(), Some("high"));
         // Mistral 400s on the field, so the attempt must not carry it.
         request.reasoning_effort = Some("medium".into());
-        let codestral = attempt(&request, "mistral", "codestral-latest");
+        let codestral = attempt(&request, "mistral", "codestral-latest", None);
         assert_eq!(codestral.reasoning_effort, None);
     }
 
@@ -490,10 +515,10 @@ mod attempt_tests {
             temperature: Some(0.2),
             ..Default::default()
         };
-        let sol = attempt(&request, "agentrouter", "gpt-5.6-sol");
+        let sol = attempt(&request, "agentrouter", "gpt-5.6-sol", None);
         assert_eq!(sol.temperature, None);
         // A family that accepts sampling parameters keeps the client's value.
-        let codestral = attempt(&request, "mistral", "codestral-latest");
+        let codestral = attempt(&request, "mistral", "codestral-latest", None);
         assert_eq!(codestral.temperature, Some(0.2));
     }
 
@@ -507,10 +532,10 @@ mod attempt_tests {
             reasoning_effort: Some("max".into()),
             ..Default::default()
         };
-        let groq = attempt(&request, "groq", "openai/gpt-oss-120b");
+        let groq = attempt(&request, "groq", "openai/gpt-oss-120b", None);
         assert_eq!(groq.reasoning_effort.as_deref(), Some("high"));
         // Another provider keeps the client's value: groq's set is groq's.
-        let gemini = attempt(&request, "gemini", "gemini-3.5-flash");
+        let gemini = attempt(&request, "gemini", "gemini-3.5-flash", None);
         assert_eq!(gemini.reasoning_effort.as_deref(), Some("max"));
     }
 
@@ -524,10 +549,10 @@ mod attempt_tests {
             reasoning_effort: Some("high".into()),
             ..Default::default()
         };
-        let qwen = attempt(&request, "groq", "qwen/qwen3.8-27b");
+        let qwen = attempt(&request, "groq", "qwen/qwen3.8-27b", None);
         assert_eq!(qwen.reasoning_effort, None);
         // The same field is fine for another model of the same provider.
-        let oss = attempt(&request, "groq", "openai/gpt-oss-120b");
+        let oss = attempt(&request, "groq", "openai/gpt-oss-120b", None);
         assert_eq!(oss.reasoning_effort.as_deref(), Some("high"));
     }
 
@@ -542,7 +567,7 @@ mod attempt_tests {
             messages: vec![ChatMessage::plain("user", "hi"), assistant],
             ..Default::default()
         };
-        let groq = attempt(&request, "groq", "openai/gpt-oss-120b");
+        let groq = attempt(&request, "groq", "openai/gpt-oss-120b", None);
         assert_eq!(groq.messages[1].reasoning_content, None);
         // The visible text of the turn is untouched.
         assert_eq!(
@@ -552,11 +577,41 @@ mod attempt_tests {
             groq.messages[1]
         );
         // A provider that takes the sidecar keeps it.
-        let gemini = attempt(&request, "gemini", "gemini-3.5-flash");
+        let gemini = attempt(&request, "gemini", "gemini-3.5-flash", None);
         assert_eq!(
             gemini.messages[1].reasoning_content.as_deref(),
             Some("the thinking")
         );
+    }
+
+    /// The output budget shares the context window with the prompt (probed
+    /// live 2026-11-16 on sealion's 32B model: "This model's maximum context
+    /// length is 32000 tokens. However, you requested 32000 output tokens
+    /// and your prompt contains ...").
+    #[test]
+    fn attempt_caps_the_output_budget_to_the_room_left_in_the_window() {
+        let request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages: vec![ChatMessage::plain("user", "x".repeat(4000))],
+            max_completion_tokens: Some(60_000),
+            ..Default::default()
+        };
+        let out = attempt(
+            &request,
+            "sealion",
+            "aisingapore/Qwen-SEA-LION-v4-32B-IT",
+            Some(32_000),
+        );
+        let prompt = crate::context_pruner::fast_estimate_tokens(&request);
+        assert!(
+            prompt > 0,
+            "the prompt must be measured for the room to shrink"
+        );
+        assert_eq!(out.max_completion_tokens, Some(32_000 - prompt));
+        // Without a known window the client's budget rides along unchanged
+        // (a provider with a cap of its own is clamped by that cap instead).
+        let unknown = attempt(&request, "gemini", "gemini-3.5-flash", None);
+        assert_eq!(unknown.max_completion_tokens, Some(60_000));
     }
 
     /// The output budget the platform publishes is a cap, not a policy
@@ -570,7 +625,7 @@ mod attempt_tests {
             max_completion_tokens: Some(64_000),
             ..Default::default()
         };
-        let typhoon = attempt(&request, "typhoon", "typhoon-v2.5-30b-a3b-instruct");
+        let typhoon = attempt(&request, "typhoon", "typhoon-v2.5-30b-a3b-instruct", None);
         assert_eq!(typhoon.max_tokens, Some(16_384));
         assert_eq!(typhoon.max_completion_tokens, Some(16_384));
         // A budget inside the cap rides along unchanged.
@@ -582,10 +637,11 @@ mod attempt_tests {
             },
             "typhoon",
             "typhoon-v2.5-30b-a3b-instruct",
+            None,
         );
         assert_eq!(small.max_tokens, Some(1_000));
         // A provider without a published cap keeps the client's budget.
-        let gemini = attempt(&request, "gemini", "gemini-3.5-flash");
+        let gemini = attempt(&request, "gemini", "gemini-3.5-flash", None);
         assert_eq!(gemini.max_tokens, Some(64_000));
     }
 }
@@ -1174,7 +1230,7 @@ impl RoutingBackend {
                 continue;
             };
             let response = match backend
-                .complete(attempt(&describer_request, &provider, &model))
+                .complete(attempt(&describer_request, &provider, &model, None))
                 .await
             {
                 Ok(response) => response,
@@ -1658,6 +1714,23 @@ impl ChatBackend for RoutingBackend {
                 (request.clone(), None)
             };
 
+            // A provider whose account budget is smaller than the prompt can
+            // never serve it — the refusal is certain, so the ladder moves on
+            // instead of paying for it (measured live 2026-11-16: groq's
+            // per-minute budget is 8000 tokens, the agent prompts are tens of
+            // thousands).
+            if let Some(ceiling) = crate::provider_caps::max_prompt_tokens(name)
+                && crate::context_pruner::fast_estimate_tokens(&candidate_req) > ceiling
+            {
+                tracing::debug!(
+                    provider = %name,
+                    model = %target_model,
+                    ceiling = ceiling,
+                    "skipping candidate: the prompt is bigger than the provider's budget"
+                );
+                continue;
+            }
+
             let mut retry_count = 0;
             loop {
                 if !self.lock_breakers().allow(name, Instant::now()) {
@@ -1670,7 +1743,12 @@ impl ChatBackend for RoutingBackend {
                 attempts += 1;
                 let attempt_started = std::time::Instant::now();
                 match backend
-                    .complete(attempt(&candidate_req, name, target_model))
+                    .complete(attempt(
+                        &candidate_req,
+                        name,
+                        target_model,
+                        Some(target_limit),
+                    ))
                     .await
                 {
                     Ok(response) => {
@@ -1918,6 +1996,20 @@ impl ChatBackend for RoutingBackend {
                     (request.clone(), None)
                 };
 
+                // The same rule as in the non-streaming path: a prompt bigger
+                // than the provider's account budget can never be served.
+                if let Some(ceiling) = crate::provider_caps::max_prompt_tokens(name)
+                    && crate::context_pruner::fast_estimate_tokens(&candidate_req) > ceiling
+                {
+                    tracing::debug!(
+                        provider = %name,
+                        model = %target_model,
+                        ceiling = ceiling,
+                        "skipping candidate: the prompt is bigger than the provider's budget"
+                    );
+                    continue;
+                }
+
                 let mut retry_count = 0;
                 loop {
                     if !this.lock_breakers().allow(name, Instant::now()) {
@@ -1929,7 +2021,12 @@ impl ChatBackend for RoutingBackend {
                     };
                     attempts += 1;
                     let attempt_started = std::time::Instant::now();
-                    let mut stream = backend.stream(attempt(&candidate_req, name, target_model));
+                    let mut stream = backend.stream(attempt(
+                        &candidate_req,
+                        name,
+                        target_model,
+                        Some(target_limit),
+                    ));
 
                     match stream.next().await {
                         Some(Ok(first)) => {

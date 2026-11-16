@@ -21,6 +21,10 @@
 pub fn allowed_efforts(provider: &str) -> Option<&'static [&'static str]> {
     match provider {
         "groq" => Some(&["low", "medium", "high"]),
+        // oneminai knows every OpenAI level except `max` (probed live
+        // 2026-11-16: "Invalid option: expected one of none|minimal|low|
+        // medium|high|xhigh").
+        "oneminai" => Some(&["none", "minimal", "low", "medium", "high", "xhigh"]),
         _ => None,
     }
 }
@@ -70,7 +74,29 @@ pub fn max_output_tokens(provider: &str, model: &str) -> Option<u32> {
         "typhoon" => Some(16_384),
         "oneminai" if model == "gpt-4o-mini" => Some(16_384),
         "oneminai" => Some(32_768),
+        // groq's Qwen3.8 answers "max_completion_tokens must be less than or
+        // equal to 16384, the maximum value for max_completion_tokens is
+        // less than the context_window for this model" (measured live
+        // 2026-11-16).
+        "groq" if model.contains("qwen3.8") => Some(16_384),
         "sealion" if model.contains("SEA-LION-v4-32B") => Some(32_000),
+        _ => None,
+    }
+}
+
+/// The largest prompt a provider can take in one call.
+///
+/// groq answers `413 Request too large ... on tokens per minute (TPM): Limit
+/// 8000, Requested 96330, please reduce your message size and try again` —
+/// the account's whole per-minute token budget is smaller than the request,
+/// so a prompt above the ceiling can never be served, however long we wait
+/// (measured live 2026-11-16, 924 refusals on groq alone).
+///
+/// The router skips such a candidate instead of paying for the refusal: the
+/// ladder moves on to a provider that can take the prompt.
+pub fn max_prompt_tokens(provider: &str) -> Option<u32> {
+    match provider {
+        "groq" => Some(8_000),
         _ => None,
     }
 }
@@ -80,7 +106,7 @@ pub fn max_output_tokens(provider: &str, model: &str) -> Option<u32> {
 ///
 /// A provider with a narrower set gets the closest level that is not stronger
 /// than the one the client asked for.
-const EFFORT_LADDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_LADDER: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 /// The effort to send, given what the client asked for and what the provider
 /// accepts.
@@ -96,10 +122,7 @@ const EFFORT_LADDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "
 /// `None` means "send no effort at all".
 pub fn clamp_effort(requested: Option<&str>, allowed: &[&str]) -> Option<String> {
     let requested = requested?;
-    let requested_rank = EFFORT_LADDER
-        .iter()
-        .position(|level| *level == requested)
-        .or_else(|| if requested == "none" { Some(0) } else { None })?;
+    let requested_rank = EFFORT_LADDER.iter().position(|level| *level == requested)?;
     // The allowed set, ranked the same way.
     let mut ranked: Vec<(usize, &str)> = allowed
         .iter()
@@ -128,6 +151,7 @@ mod tests {
     use super::allowed_efforts;
     use super::clamp_effort;
     use super::max_output_tokens;
+    use super::max_prompt_tokens;
     use super::rejects_reasoning_content;
     use super::rejects_reasoning_effort_field;
 
@@ -206,6 +230,33 @@ mod tests {
         assert!(rejects_reasoning_content("mistral"));
         assert!(!rejects_reasoning_content("gemini"));
         assert!(!rejects_reasoning_content("pollinations"));
+    }
+
+    /// oneminai knows every level except `max`.
+    #[test]
+    fn oneminai_knows_every_level_but_max() {
+        let allowed = allowed_efforts("oneminai").expect("oneminai has its own set");
+        assert_eq!(clamp_effort(Some("max"), allowed).as_deref(), Some("xhigh"));
+        assert_eq!(
+            clamp_effort(Some("xhigh"), allowed).as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(clamp_effort(Some("none"), allowed).as_deref(), Some("none"));
+    }
+
+    /// groq's Qwen3.8 has its own output ceiling.
+    #[test]
+    fn groq_qwen38_has_its_own_output_ceiling() {
+        assert_eq!(max_output_tokens("groq", "qwen/qwen3.8-27b"), Some(16_384));
+        // Its neighbours keep the context-based rule.
+        assert_eq!(max_output_tokens("groq", "openai/gpt-oss-120b"), None);
+    }
+
+    /// The per-minute token budget of the account is a ceiling for one call.
+    #[test]
+    fn groq_has_a_prompt_ceiling_of_its_budget() {
+        assert_eq!(max_prompt_tokens("groq"), Some(8_000));
+        assert_eq!(max_prompt_tokens("gemini"), None);
     }
 
     /// The output caps the platforms publish.
