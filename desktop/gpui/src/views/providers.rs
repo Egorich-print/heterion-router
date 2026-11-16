@@ -18,7 +18,7 @@ use gpui::{
 
 use crate::api::{
     self, Connection, ConnectionsResponse, CreateConnectionBody, CreateConnectionResponse,
-    ProviderCatalog, ProviderInfo, RestartResponse, UpdateConnectionBody,
+    MatrixEntry, ProviderCatalog, ProviderInfo, RestartResponse, UpdateConnectionBody,
 };
 use crate::theme;
 use crate::widgets::{self, ColumnAlign, ColumnDef, ColumnSizing, TextInput, Tone};
@@ -106,9 +106,76 @@ fn connection_columns() -> [ColumnDef; 10] {
     ]
 }
 
+/// The columns of the provider matrix.
+///
+/// The last column holds the probe button, so it carries no label — the
+/// header cell is empty rather than missing.
+const MATRIX_COLUMNS: [&str; 7] = [
+    "provider",
+    "name",
+    "format",
+    "models",
+    "reason",
+    "last probe",
+    "",
+];
+
+/// The layout of the provider matrix table.
+fn matrix_columns() -> [ColumnDef; 7] {
+    [
+        ColumnDef {
+            label: MATRIX_COLUMNS[0],
+            sizing: ColumnSizing::Fixed(120),
+            align: ColumnAlign::Left,
+        },
+        ColumnDef {
+            label: MATRIX_COLUMNS[1],
+            sizing: ColumnSizing::GrowBasis(160),
+            align: ColumnAlign::Left,
+        },
+        ColumnDef {
+            label: MATRIX_COLUMNS[2],
+            sizing: ColumnSizing::Fixed(84),
+            align: ColumnAlign::Left,
+        },
+        ColumnDef {
+            label: MATRIX_COLUMNS[3],
+            sizing: ColumnSizing::Fixed(64),
+            align: ColumnAlign::Right,
+        },
+        ColumnDef {
+            label: MATRIX_COLUMNS[4],
+            sizing: ColumnSizing::GrowBasis(150),
+            align: ColumnAlign::Left,
+        },
+        ColumnDef {
+            label: MATRIX_COLUMNS[5],
+            sizing: ColumnSizing::Fixed(150),
+            align: ColumnAlign::Left,
+        },
+        ColumnDef {
+            label: MATRIX_COLUMNS[6],
+            sizing: ColumnSizing::Fixed(80),
+            align: ColumnAlign::Left,
+        },
+    ]
+}
+
+/// The groups the matrix is filtered by.
+///
+/// The groups are the reasons of the matrix, folded into the four the
+/// operator works with: served, needs code, dead, waiting for a key — plus
+/// the leftovers that belong to none of them.
+const MATRIX_GROUPS: [(&str, &str); 5] = [
+    ("all", "all"),
+    ("served", "served now"),
+    ("code", "needs code"),
+    ("dead", "dead"),
+    ("key", "waiting for a key"),
+];
+
 /// The notice shown when a save flipped the active flag.
 const RESTART_NOTICE: &str = "Saved. Connection activity changed — restart the gateway to apply it (backends are built at startup).";
-
 /// The notice shown while the gateway is coming back.
 const RESTART_WAITING: &str = "Restart requested — waiting for the gateway to come back…";
 
@@ -193,6 +260,13 @@ pub struct ProvidersView {
     catalog_filter: String,
     /// The search field of the add form.
     catalog_filter_input: Entity<TextInput>,
+
+    /// The whole registry with the measured reason of each provider (ADR-032).
+    matrix: Vec<MatrixEntry>,
+    /// Which group of the matrix is shown (`all` shows every row).
+    matrix_group: &'static str,
+    /// The provider being probed right now.
+    probing_id: Option<String>,
 }
 
 impl ProvidersView {
@@ -252,6 +326,9 @@ impl ProvidersView {
             add_priority_input,
             catalog_filter: String::new(),
             catalog_filter_input,
+            matrix: Vec::new(),
+            matrix_group: "all",
+            probing_id: None,
         };
 
         // The name editor reports every keystroke back to the view.
@@ -371,6 +448,177 @@ impl ProvidersView {
                 cx.notify();
             },
         );
+
+        // The matrix answers a different question than the connections, but it
+        // changes with them — one reload carries both.
+        self.load_matrix(cx);
+    }
+
+    /// Load the provider matrix — the whole registry with the *measured*
+    /// reason of each provider (ADR-032).
+    ///
+    /// The reason is the platform's own answer, not the registry's claim, so
+    /// the matrix is what tells "needs a key" from "needs code" from "gone".
+    fn load_matrix(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = api::session_client(cx) else {
+            return;
+        };
+        api::spawn_request(
+            cx,
+            move || client.get_json::<ProviderCatalog>("/api/providers"),
+            |result, view: &mut ProvidersView, cx| {
+                match result {
+                    Ok(catalog) => {
+                        view.matrix = catalog.matrix;
+                    }
+                    Err(error) => {
+                        view.error = Some(error.to_string());
+                        crate::app::report_error(cx, &error);
+                    }
+                }
+                cx.notify();
+            },
+        );
+    }
+
+    /// Probe one provider again — a measurement goes stale.
+    fn probe_provider(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(client) = api::session_client(cx) else {
+            return;
+        };
+        let path = format!("/api/providers/{id}/probe");
+        self.probing_id = Some(id.to_string());
+        self.error = None;
+
+        api::spawn_request(
+            cx,
+            move || client.post_json::<serde_json::Value, _>(&path, &serde_json::json!({})),
+            |result, view: &mut ProvidersView, cx| {
+                if let Err(error) = result {
+                    view.error = Some(error.to_string());
+                    crate::app::report_error(cx, &error);
+                }
+                view.probing_id = None;
+                view.load_matrix(cx);
+                cx.notify();
+            },
+        );
+    }
+
+    /// The provider matrix — the whole registry with the measured reason.
+    ///
+    /// The groups are the filter: served, needs code, dead, waiting for a
+    /// key. The reason on every row is what the platform answered, not what
+    /// the registry claims (ADR-032).
+    fn render_matrix(&self, cx: &Context<Self>) -> AnyElement {
+        let mut section = div()
+            .flex()
+            .flex_col()
+            .w_full()
+            .gap_2()
+            .child(widgets::page_header(
+                "Provider matrix",
+                "The whole registry with the measured reason for each provider — the platform's own \
+                 answer, not what the registry claims. Probe a provider to refresh its reason.",
+            ));
+
+        // The group filter: the active group is the highlighted one.
+        let mut filters = div().flex().items_center().gap_2();
+        for (id, label) in MATRIX_GROUPS {
+            let count = self
+                .matrix
+                .iter()
+                .filter(|row| id == "all" || matrix_group_of(&row.reason) == id)
+                .count();
+            let view = cx.entity();
+            let group = id;
+            let text = format!("{label} {count}");
+            let on_click = move |_window: &mut Window, cx: &mut App| {
+                view.update(cx, |view, cx| {
+                    view.matrix_group = group;
+                    cx.notify();
+                });
+            };
+            let button = if self.matrix_group == id {
+                widgets::primary_button(
+                    format!("providers-matrix-group:{id}"),
+                    text,
+                    true,
+                    on_click,
+                )
+                .into_any_element()
+            } else {
+                widgets::compact_button(
+                    format!("providers-matrix-group:{id}"),
+                    text,
+                    true,
+                    on_click,
+                )
+            };
+            filters = filters.child(button);
+        }
+        section = section.child(filters);
+
+        // The rows of the selected group.
+        let mut rows: Vec<AnyElement> = vec![widgets::defined_header(&matrix_columns())];
+        let mut shown = 0usize;
+        for row in &self.matrix {
+            if self.matrix_group != "all" && matrix_group_of(&row.reason) != self.matrix_group {
+                continue;
+            }
+            shown += 1;
+            rows.push(self.render_matrix_row(row, cx));
+        }
+        section = section.child(widgets::table(rows));
+
+        if shown == 0 {
+            section = section.child(widgets::muted("No provider matches this group."));
+        }
+
+        section.into_any_element()
+    }
+
+    /// One row of the provider matrix.
+    fn render_matrix_row(&self, row: &MatrixEntry, cx: &Context<Self>) -> AnyElement {
+        let probing = self.probing_id.as_deref() == Some(row.id.as_str());
+        let view = cx.entity();
+        let id = row.id.clone();
+        let on_click = move |_window: &mut Window, cx: &mut App| {
+            view.update(cx, |view, cx| view.probe_provider(&id, cx));
+        };
+        let probe = widgets::compact_button(
+            format!("providers-matrix-probe:{}", row.id),
+            if probing { "probing…" } else { "probe" },
+            !probing,
+            on_click,
+        );
+
+        let probe_text = match &row.last_probe {
+            Some(probe) => {
+                let status = probe
+                    .status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                format!("{status} · {}", short_time(dash(&probe.at)))
+            }
+            None => "never".to_string(),
+        };
+
+        let cells = vec![
+            mono_truncated(row.id.clone()).into_any_element(),
+            muted_truncated(dash(&row.name)).into_any_element(),
+            mono_truncated(dash(&row.format)).into_any_element(),
+            widgets::number(row.models.to_string()).into_any_element(),
+            widgets::compact_badge(
+                reason_label(&row.reason),
+                if row.served { Tone::Ok } else { Tone::Bad },
+            )
+            .into_any_element(),
+            mono_muted(probe_text).into_any_element(),
+            probe.into_any_element(),
+        ];
+
+        widgets::defined_row(&matrix_columns(), cells, ROW_HEIGHT)
     }
 
     /// Patch one connection.
@@ -1263,6 +1511,10 @@ impl Render for ProvidersView {
             }
         }
 
+        // The matrix: the whole registry and the measured reason of each
+        // provider. It answers a different question than the connections.
+        page = page.child(self.render_matrix(cx));
+
         // The page scrolls: a long connection list must stay reachable.
         div()
             .id(theme::element_id("providers-page"))
@@ -1404,6 +1656,40 @@ fn short_time(value: String) -> String {
         return value;
     }
     format!("{} {}", date, &time[..5])
+}
+
+/// The group a measured reason belongs to.
+///
+/// The reasons are the ones the gateway classifies (`provider_status.rs`);
+/// the groups are the four the operator works with — served, needs code,
+/// dead, waiting for a key — and the leftovers.
+fn matrix_group_of(reason: &str) -> &'static str {
+    match reason {
+        "served" => "served",
+        "unsupported_format" | "no_web_adapter" => "code",
+        "dead_endpoint" | "not_a_chat_api" => "dead",
+        "needs_key" | "no_connection_row" => "key",
+        _ => "other",
+    }
+}
+
+/// The short label of a measured reason.
+///
+/// The reason says what the platform answered; the label says what it means
+/// for the operator.
+fn reason_label(reason: &str) -> &'static str {
+    match reason {
+        "served" => "served",
+        "needs_key" => "needs key",
+        "credits_required" => "needs credits",
+        "not_served" => "not served",
+        "no_connection_row" => "no connection row",
+        "no_web_adapter" => "needs adapter",
+        "unsupported_format" => "needs format",
+        "not_a_chat_api" => "not a chat api",
+        "dead_endpoint" => "dead endpoint",
+        _ => "unknown",
+    }
 }
 
 /// Whether a connection needs the operator's attention.

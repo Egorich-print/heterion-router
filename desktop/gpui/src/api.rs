@@ -756,6 +756,57 @@ pub struct ProviderCatalog {
     /// The providers.
     #[serde(default)]
     pub providers: Vec<ProviderInfo>,
+    /// The whole registry with the *measured* reason for each provider
+    /// (ADR-032) — the platform's own answer, not the registry's claim.
+    #[serde(default)]
+    pub matrix: Vec<MatrixEntry>,
+}
+
+/// One row of the provider matrix.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct MatrixEntry {
+    /// Provider id, as the registry knows it.
+    pub id: String,
+    /// Human-readable name.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub name: String,
+    /// Wire format the provider speaks.
+    #[serde(default, deserialize_with = "null_to_default")]
+    pub format: String,
+    /// How many models the registry lists for it.
+    #[serde(default)]
+    pub models: usize,
+    /// Whether the gateway serves it right now.
+    #[serde(default)]
+    pub served: bool,
+    /// The measured reason: `served`, `needs_key`, `credits_required`,
+    /// `not_served`, `no_connection_row`, `no_web_adapter`,
+    /// `unsupported_format`, `not_a_chat_api`, `dead_endpoint`, `unknown`.
+    #[serde(default)]
+    pub reason: String,
+    /// The last probe of this provider, if it was ever probed.
+    #[serde(default)]
+    pub last_probe: Option<ProbeInfo>,
+}
+
+/// The last probe of one provider.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct ProbeInfo {
+    /// The URL that was called.
+    #[serde(default)]
+    pub url: String,
+    /// The HTTP status the platform answered with.
+    #[serde(default)]
+    pub status: Option<u16>,
+    /// The reason that status was classified into.
+    #[serde(default)]
+    pub reason: String,
+    /// A short excerpt of the answer.
+    #[serde(default)]
+    pub body: String,
+    /// When the probe ran.
+    #[serde(default)]
+    pub at: String,
 }
 
 /// Body of `POST /api/connections` — add a provider key.

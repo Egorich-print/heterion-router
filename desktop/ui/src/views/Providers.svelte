@@ -85,6 +85,96 @@
     }),
   );
 
+  /// The measured reason of a provider, in the operator's words.
+  ///
+  /// The reason comes from the platform's own answer (ADR-032), not from what
+  /// the registry claims — so the wording says what the platform did.
+  const REASON_TEXT = {
+    served: "served — answers without a key",
+    needs_key: "needs a key — the platform refused an anonymous call",
+    credits_required: "needs credits — the platform wants a paid balance",
+    not_served: "not served",
+    no_connection_row: "no connection row — keyless, nothing to attach",
+    no_web_adapter: "needs code — the web driver has no adapter for it",
+    unsupported_format: "needs code — the gateway cannot speak this format",
+    not_a_chat_api: "dead — the endpoint is not a chat API",
+    dead_endpoint: "dead — the endpoint is gone",
+    unknown: "unknown — the platform did not answer clearly",
+  };
+
+  /// The four groups the operator works with, plus the leftovers.
+  const GROUPS = [
+    { id: "live", label: "served now", reasons: ["served"] },
+    { id: "code", label: "needs code", reasons: ["unsupported_format", "no_web_adapter"] },
+    { id: "dead", label: "dead", reasons: ["dead_endpoint", "not_a_chat_api"] },
+    { id: "key", label: "waiting for a key", reasons: ["needs_key", "no_connection_row"] },
+    { id: "other", label: "other", reasons: ["credits_required", "not_served", "unknown"] },
+  ];
+
+  function groupOf(reason) {
+    const found = GROUPS.find((group) => group.reasons.includes(reason));
+    return found ? found.id : "other";
+  }
+
+  function reasonText(reason) {
+    return REASON_TEXT[reason] ?? reason;
+  }
+
+  /// The matrix is fetched next to the connections: both come from the
+  /// gateway, the matrix just answers a different question.
+  let matrix = $state(null);
+  let matrixError = $state("");
+  let matrixGroup = $state("all");
+  let matrixQuery = $state("");
+  let probingId = $state(null);
+
+  async function loadMatrix() {
+    try {
+      const payload = await getJson("/api/providers", key);
+      matrix = payload.matrix ?? [];
+      matrixError = "";
+    } catch (err) {
+      matrixError = err.message;
+    }
+  }
+
+  $effect(() => {
+    if (!key) return;
+    loadMatrix();
+  });
+
+  /// Count the providers per group, ignoring the current filter.
+  const groupCounts = $derived.by(() => {
+    const counts = { all: (matrix ?? []).length };
+    for (const group of GROUPS) counts[group.id] = 0;
+    for (const row of matrix ?? []) counts[groupOf(row.reason)] += 1;
+    return counts;
+  });
+
+  const matrixShown = $derived(
+    (matrix ?? []).filter((row) => {
+      if (matrixGroup !== "all" && groupOf(row.reason) !== matrixGroup) return false;
+      const query = matrixQuery.trim().toLowerCase();
+      if (!query) return true;
+      return row.id.toLowerCase().includes(query) || (row.name ?? "").toLowerCase().includes(query);
+    }),
+  );
+
+  /// Probe one provider again — the reason on screen is a measurement, and a
+  /// measurement goes stale.
+  async function probe(row) {
+    probingId = row.id;
+    matrixError = "";
+    try {
+      await postJson(`/api/providers/${row.id}/probe`, key, {});
+      await loadMatrix();
+    } catch (err) {
+      matrixError = err.message;
+    } finally {
+      probingId = null;
+    }
+  }
+
   /// Secrets are never returned; only whether one exists.
   function credentialLabel(row) {
     if (row.has_credential) return row.auth_type === "oauth" ? "token" : "key";
@@ -174,5 +264,70 @@
     <p class="muted">All connections look healthy.</p>
   {/if}
 {:else if !error}
+  <p class="muted">loading…</p>
+{/if}
+
+<h2>Provider matrix</h2>
+<p class="sub">
+  The whole registry with the <strong>measured</strong> reason for each provider — the platform's own
+  answer, not what the registry claims (ADR-032). Probe a provider to refresh its reason.
+</p>
+
+{#if matrixError}<div class="error">{matrixError}</div>{/if}
+
+{#if matrix}
+  <div class="toolbar">
+    <button class:primary={matrixGroup === "all"} onclick={() => (matrixGroup = "all")}>
+      all {groupCounts.all}
+    </button>
+    {#each GROUPS as group}
+      <button class:primary={matrixGroup === group.id} onclick={() => (matrixGroup = group.id)}>
+        {group.label} {groupCounts[group.id]}
+      </button>
+    {/each}
+    <input type="search" placeholder="filter by id or name" bind:value={matrixQuery} />
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>provider</th><th>name</th><th>format</th><th>models</th><th>reason</th>
+        <th>last probe</th><th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {#each matrixShown as row}
+        <tr>
+          <td class="mono">{row.id}</td>
+          <td>{row.name ?? "—"}</td>
+          <td class="mono muted">{row.format || "—"}</td>
+          <td class="mono">{row.models}</td>
+          <td>
+            {#if row.served}
+              <span class="tag ok">{reasonText(row.reason)}</span>
+            {:else}
+              <span class="tag bad">{reasonText(row.reason)}</span>
+            {/if}
+          </td>
+          <td class="mono muted">
+            {#if row.last_probe}
+              {row.last_probe.status ?? "—"} · {row.last_probe.at ?? "—"}
+            {:else}
+              never
+            {/if}
+          </td>
+          <td>
+            <button disabled={probingId === row.id} onclick={() => probe(row)}>
+              {probingId === row.id ? "probing…" : "probe"}
+            </button>
+          </td>
+        </tr>
+      {/each}
+    </tbody>
+  </table>
+  {#if matrixShown.length === 0}
+    <p class="muted">No provider matches this filter.</p>
+  {/if}
+{:else if !matrixError}
   <p class="muted">loading…</p>
 {/if}
