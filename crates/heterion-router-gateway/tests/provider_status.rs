@@ -131,14 +131,14 @@ fn the_keyless_pass_takes_only_unconnected_keyless_http_providers() {
         Some("openai"),
         Some("none"),
         Some("https://api.x/v1"),
-        None,
+        Some("default"),
         false
     ));
     assert!(!keyless_candidate(
         Some("openai"),
         Some("apikey"),
         Some("https://api.x/v1"),
-        None,
+        Some("default"),
         false
     ));
     assert!(!keyless_candidate(
@@ -162,12 +162,28 @@ fn the_keyless_pass_takes_only_unconnected_keyless_http_providers() {
         None,
         false
     ));
-    // A web executor is answered by the browser driver, not by HTTP.
+    // A named executor is answered by something of its own — a chat page
+    // answers 200 to any POST, so a probe there measures nothing.
     assert!(!keyless_candidate(
         Some("openai"),
         Some("none"),
         Some("https://duck.ai/duckchat/v1/chat"),
+        Some("duckduckgo-web"),
+        false
+    ));
+    assert!(!keyless_candidate(
+        Some("openai"),
+        Some("none"),
+        Some("https://app.blackbox.ai/api/chat"),
         Some("web"),
+        false
+    ));
+    // The plain transport does qualify.
+    assert!(keyless_candidate(
+        Some("openai"),
+        Some("none"),
+        Some("https://g4f.space/api/groq/v1/chat/completions"),
+        Some("default"),
         false
     ));
 

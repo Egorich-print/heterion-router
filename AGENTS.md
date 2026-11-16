@@ -267,10 +267,37 @@ Plist — машинно-локальный (`~/Library/LaunchAgents`), не х�
 code path: в текущей рабочей БД нет активной строки `provider_connections`, и
 backend не поднимается. URL по умолчанию `http://127.0.0.1:8080/v1`, override —
 `HETERION_LOCAL_BASE_URL`. Model id — транзит на Heterion (там один загруженный
-вес). Registry содержит 280 providers / 2741 models; в каталог формы добавления
-ключа (`GET /api/providers`) проходят 221 запись, 7 используют неподдерживаемые
-схемы, 43 — без моделей. Перечень: `docs/PROVIDERS.md`; метод аудита:
-`docs/research/PROJECT-AUDIT-2026-09.md`.
+вес). Registry содержит 277 providers / 2329 models; в каталог формы добавления
+ключа (`GET /api/providers`) проходят записи с поддерживаемой схемой. Перечень:
+`docs/PROVIDERS.md`; метод аудита: `docs/research/PROJECT-AUDIT-2026-09.md`.
+
+## Матрица провайдеров (ADR-032)
+
+**Причина провайдера — измеренный ответ площадки, а не заявление реестра.**
+Модуль `crates/heterion-router-gateway/src/provider_status.rs`: enum
+`ProviderReason` (`served`, `needs_key`, `credits_required`, `not_served`,
+`no_connection_row`, `no_web_adapter`, `unsupported_format`, `not_a_chat_api`,
+`dead_endpoint`, `unknown`), `classify(status, body)`, `probe`, `reason_for`.
+Классификация: 2xx → `served`; 401/403 → `needs_key`; 402 → `credits_required`;
+JSON-404 → `not_a_chat_api`; HTML-404/410 → `dead_endpoint`; 405 →
+`not_a_chat_api`; 429/5xx/таймаут → `unknown`. Порядок выбора причины: `served`
+→ структурный пробел (`unsupported_format` / `no_web_adapter`) → измеренная
+причина → `needs_key` (нужен ключ и нет подключения) → `no_connection_row`
+(keyless без строки) → `not_served`.
+
+- **Keyless-проход берёт только `executor: default` + `format: openai` +
+  http(s) + keyless + без подключения + проба доказала `served`.** Именованные
+  исполнители (web-страницы, CLI, websocket) исключены: их «эндпоинт» отвечает
+  200 на любой POST, и такие провайдеры попадали в каталог как живые.
+- Проба: `POST /api/providers/{id}/probe` (ключ оператора), результат пишется в
+  `provider_probes` (миграция `004`). При старте шлюза автоматически
+  простукиваются keyless-площадки (пул 8, таймаут 10 с).
+- `GET /api/providers`: старый список `providers` (для формы ключа) сохранён;
+  полный реестр — в новом ключе `matrix` (обратная совместимость).
+- Отчёт: `scripts/provider_matrix.py` (проба всех площадок, 8 потоков,
+  markdown + JSON) — пример прогона `docs/research/provider-matrix-2026-11-16.md`.
+  Матрица воспроизводима: пробу и классификацию делает сам шлюз, скрипт лишь
+  собирает отчёт, поэтому расхождение с админ-API невозможно.
 
 ## Веб-исполнители (ADR-025)
 

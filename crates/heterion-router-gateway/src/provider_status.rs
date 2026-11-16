@@ -240,10 +240,13 @@ pub fn is_keyless(auth_type: Option<&str>) -> bool {
 /// Responses dialects want a token), so a keyless provider of those kinds
 /// would be a declaration nobody can honour.
 ///
-/// A **web executor** never qualifies. Its "endpoint" is a chat page: it
-/// answers `200` to any POST, so a probe there measures nothing, and the
-/// answer still comes from the browser driver — which needs an adapter
-/// (ADR-025). Such a provider is served by the web pass or by nobody.
+/// A **named executor** never qualifies — only the plain `default`
+/// transport does. A named executor means the provider speaks something of
+/// its own: a chat page (`duckduckgo-web`, `uc`, `chipotle`), a CLI over
+/// stdio (`auggie`, `zcode`), a websocket. A chat page answers `200` to any
+/// POST, so a probe there measures nothing; the answer still comes from the
+/// browser driver, which needs an adapter (ADR-025). Such a provider is
+/// served by its own pass or by nobody.
 pub fn keyless_candidate(
     format: Option<&str>,
     auth_type: Option<&str>,
@@ -254,7 +257,7 @@ pub fn keyless_candidate(
     if has_connection || !is_keyless(auth_type) {
         return false;
     }
-    if executor == Some("web") {
+    if executor != Some("default") {
         return false;
     }
     let Some(base_url) = base_url else {
@@ -515,7 +518,7 @@ mod tests {
             Some("openai"),
             Some("none"),
             Some("https://api.x/v1"),
-            None,
+            Some("default"),
             false
         ));
         // A provider that needs a key is not keyless.
@@ -523,7 +526,7 @@ mod tests {
             Some("openai"),
             Some("apikey"),
             Some("https://api.x/v1"),
-            None,
+            Some("default"),
             false
         ));
         // A connected provider is already built.
@@ -558,12 +561,19 @@ mod tests {
             None,
             false
         ));
-        // A web executor answers 200 to any POST: a probe there measures
-        // nothing, and the answer comes from the browser driver.
+        // A named executor answers for something of its own: a chat page
+        // answers 200 to any POST, so a probe there measures nothing.
         assert!(!keyless_candidate(
             Some("openai"),
             Some("none"),
             Some("https://duck.ai/duckchat/v1/chat"),
+            Some("duckduckgo-web"),
+            false
+        ));
+        assert!(!keyless_candidate(
+            Some("openai"),
+            Some("none"),
+            Some("https://app.blackbox.ai/api/chat"),
             Some("web"),
             false
         ));
