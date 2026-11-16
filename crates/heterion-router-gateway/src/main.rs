@@ -159,6 +159,9 @@ type Selected = (
     Arc<ProviderRegistry>,
     Vec<String>,
     Vec<String>,
+    // The router itself, when the gateway runs one — the admin API needs it
+    // to explain the `auto` plan.
+    Option<Arc<RoutingBackend>>,
 );
 
 /// Write a refreshed OAuth token pair back to `provider_connections`.
@@ -761,11 +764,13 @@ fn select_backend(
             std::env::var("HETERION_ROUTER_VISION_SAVING")
                 .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
         );
+    let routing = Arc::new(routing);
     Ok((
-        Arc::new(routing),
+        routing.clone() as Arc<dyn ChatBackend>,
         registry,
         names,
         supported.into_iter().collect(),
+        Some(routing),
     ))
 }
 
@@ -923,7 +928,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if probed > 0 {
         tracing::info!(probed, "keyless providers probed");
     }
-    let (backend, registry, backend_names, web_adapters) =
+    let (backend, registry, backend_names, web_adapters, router) =
         select_backend(db.clone(), &config.data_dir)?;
     let ui_dir = heterion_router_gateway::ui::ui_dir();
     match ui_dir.as_ref() {
@@ -934,6 +939,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_require_auth(config.require_auth)
         .with_max_body_bytes(config.max_body_bytes)
         .with_catalog(registry, backend_names)
+        .with_router_opt(router)
         .with_web_adapters(web_adapters)
         .with_ui_dir(ui_dir)
         .with_data_dir(config.data_dir.clone());

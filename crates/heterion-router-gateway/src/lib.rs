@@ -247,6 +247,12 @@ pub struct AppState {
     /// tokens and makes the 1M-context models unusable for a whole
     /// repository in one call.
     pub(crate) max_body_bytes: usize,
+    /// The router itself, when the gateway runs one.
+    ///
+    /// The admin API needs it to answer "why is this model not serving" —
+    /// only the router knows the scores and the reasons a candidate was
+    /// dropped from the `auto` plan.
+    pub(crate) router: Option<Arc<routing::RoutingBackend>>,
 }
 
 /// Seconds since the unix epoch, or 0 when the clock is unavailable.
@@ -272,6 +278,7 @@ impl AppState {
             ui_dir: None,
             started_unix: now_unix(),
             max_body_bytes: heterion_router_config::DEFAULT_MAX_BODY_BYTES,
+            router: None,
         }
     }
 
@@ -289,6 +296,7 @@ impl AppState {
             ui_dir: None,
             started_unix: now_unix(),
             max_body_bytes: heterion_router_config::DEFAULT_MAX_BODY_BYTES,
+            router: None,
         }
     }
 
@@ -301,6 +309,21 @@ impl AppState {
     ) -> Self {
         self.registry = Some(registry);
         self.backend_names = backend_names;
+        self
+    }
+
+    /// Attach the router, so the admin API can explain the `auto` plan.
+    pub fn with_router(mut self, router: Arc<routing::RoutingBackend>) -> Self {
+        self.router = Some(router);
+        self
+    }
+
+    /// Attach the router when there is one.
+    ///
+    /// A gateway without a router (tests, the echo backend) has no plan to
+    /// explain, and the admin API says so instead of pretending.
+    pub fn with_router_opt(mut self, router: Option<Arc<routing::RoutingBackend>>) -> Self {
+        self.router = router;
         self
     }
 
@@ -376,6 +399,7 @@ pub fn build_router_with(state: AppState, cache_layer: cache::CacheLayer) -> Rou
         .route("/api/connections/{id}", patch(admin::update_connection))
         .route("/api/providers", get(admin::providers))
         .route("/api/providers/{id}/probe", post(admin::probe_provider))
+        .route("/api/routing/plan", get(admin::routing_plan))
         .route("/api/usage", get(admin::usage))
         .route("/api/logs", get(admin::logs))
         .route("/api/logs/app", get(admin::logs_app))
@@ -961,6 +985,12 @@ struct StreamAccounting {
     /// Whether the upstream sent its own usage counts. A provider that did
     /// is never re-estimated, so nothing is ever double booked.
     usage_reported: bool,
+    /// The finish reason the upstream ended the stream with.
+    ///
+    /// `length` means the answer was cut short — the case that looks like a
+    /// success in the call log but leaves the caller with a half-written
+    /// answer. Without this field the cut is invisible in the journal.
+    finish: Option<String>,
 }
 
 /// What the stream accounting needs to know about the request besides the
@@ -999,6 +1029,7 @@ impl StreamAccounting {
             output_bytes: 0,
             reasoning_bytes: 0,
             usage_reported: false,
+            finish: None,
         }
     }
 
@@ -1059,20 +1090,22 @@ impl StreamAccounting {
         let latency_ms = millis_since(self.started);
         if self.success {
             tracing::info!(
-                "completion ok (stream) model={} pt={} ct={} ttft={}ms total={}ms",
+                "completion ok (stream) model={} pt={} ct={} ttft={}ms total={}ms finish={}",
                 self.requested_model,
                 self.usage.prompt_tokens,
                 self.usage.completion_tokens,
                 self.ttft_ms.unwrap_or(0),
                 latency_ms,
+                self.finish.as_deref().unwrap_or("-"),
             );
         } else {
             tracing::warn!(
-                "completion failed (stream) model={} status={} ttft={}ms total={}ms",
+                "completion failed (stream) model={} status={} ttft={}ms total={}ms finish={}",
                 self.requested_model,
                 self.status,
                 self.ttft_ms.unwrap_or(0),
                 latency_ms,
+                self.finish.as_deref().unwrap_or("-"),
             );
         }
         record_completion_usage(
@@ -1170,7 +1203,8 @@ fn stream_response(
                 let with_role = !role_emitted;
                 role_emitted = true;
                 let event = chunk_event(&id, created, &model, &chunk, with_role);
-                if chunk.finish_reason.is_some() {
+                if let Some(reason) = &chunk.finish_reason {
+                    books.finish = Some(reason.clone());
                     books.record();
                 }
                 event

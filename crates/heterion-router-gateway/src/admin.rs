@@ -22,6 +22,7 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
 };
+use heterion_router_core::ChatCompletionRequest;
 use heterion_router_crypto::{FieldCrypto, load_secret};
 use heterion_router_db::repos;
 use heterion_router_db::repos::ProviderProbeRow;
@@ -301,6 +302,113 @@ fn probe_payload(probe: Option<&ProviderProbeRow>) -> Value {
             "at": row.probed_at,
         }),
         None => Value::Null,
+    }
+}
+
+/// `GET /api/routing/plan?model=auto` — the `auto` plan with its reasons.
+///
+/// The plan says which models are tried and in which order. This says why a
+/// model the registry lists is *not* in it: every candidate of the pool
+/// carries its base priority, quality score, availability, soft cooldown and
+/// — when it was dropped — the reason (`no_backend`, `no_vision`,
+/// `no_tools`, `context`, `cooldown`, `breaker`, `zero_score`).
+pub async fn routing_plan(
+    State(state): State<AppState>,
+    _auth: ManageAuthenticated,
+    axum::extract::Query(query): axum::extract::Query<PlanQuery>,
+) -> Json<Value> {
+    let Some(router) = state.router.as_ref() else {
+        return Json(json!({ "error": "the gateway does not run a router" }));
+    };
+
+    let model = query.model.unwrap_or_else(|| "auto".to_string());
+    if model != "auto" && model != crate::routing::AUTO_COMBO_NAME {
+        return Json(json!({ "error": format!("only the auto plan is explained, got {model}") }));
+    }
+
+    // The plan is built for a request, so the filters that depend on the
+    // request (vision, tools, context) are decided for it. The caller says
+    // what the request looks like: an agent run carries tools, a chat does
+    // not, and the two plans differ.
+    let with_tools = PlanQuery::flag(query.tools.as_ref());
+    let with_images = PlanQuery::flag(query.images.as_ref());
+    let content = if with_images {
+        json!([
+            { "type": "text", "text": "plan" },
+            {
+                "type": "image_url",
+                "image_url": { "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==" }
+            }
+        ])
+    } else {
+        json!("plan")
+    };
+    let tools = with_tools.then(|| {
+        json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "probe",
+                    "description": "a tool, so the plan is built for a request that has one",
+                    "parameters": { "type": "object", "properties": {} }
+                }
+            }
+        ])
+    });
+    let request = ChatCompletionRequest {
+        model: model.clone(),
+        messages: vec![heterion_router_core::ChatMessage {
+            role: "user".to_string(),
+            content: Some(content),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }],
+        stream: false,
+        max_tokens: None,
+        temperature: None,
+        top_p: None,
+        tools,
+        tool_choice: None,
+        ..Default::default()
+    };
+
+    let candidates = router.auto_plan_debug(&request);
+    Json(json!({
+        "model": model,
+        "tools": with_tools,
+        "images": with_images,
+        "candidates": candidates,
+    }))
+}
+
+/// The query of `GET /api/routing/plan`.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct PlanQuery {
+    /// The model whose plan to explain; only `auto` is explained.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Whether the request carries tools (an agent run does).
+    ///
+    /// A string, not a bool: `?tools=1` is what an operator types, and axum's
+    /// bool deserializer rejects it.
+    #[serde(default)]
+    pub tools: Option<String>,
+    /// Whether the request carries an image.
+    #[serde(default)]
+    pub images: Option<String>,
+}
+
+impl PlanQuery {
+    /// Whether a flag was switched on: `1`, `true` and `yes` all mean yes.
+    fn flag(value: Option<&String>) -> bool {
+        value.is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
     }
 }
 

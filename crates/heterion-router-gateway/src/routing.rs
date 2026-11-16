@@ -69,6 +69,35 @@ pub struct AutoCandidate {
     pub base_priority: f64,
 }
 
+/// One candidate of the `auto` plan, with the numbers that decided it.
+///
+/// The plan says which models are tried and in which order; this says *why*.
+/// An operator who asks "why does this model never answer" gets the base
+/// priority, the quality score, the availability state, the soft cooldown
+/// factor and — when the candidate was dropped — the reason.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlanCandidate {
+    /// Provider id, as the backend map knows it.
+    pub provider: String,
+    /// Model id, as the provider knows it.
+    pub model: String,
+    /// The intrinsic priority of the model, after the stage weight.
+    pub base_priority: f64,
+    /// The quality score the tracker holds for the model.
+    pub quality_score: f64,
+    /// 1.0 when the model can serve right now, 0.0 in cooldown or breaker.
+    pub availability: f64,
+    /// The rotation factor: a model that just served ranks lower for a while.
+    pub soft_cooldown: f64,
+    /// The resulting effective priority — what the plan sorts by.
+    pub effective: f64,
+    /// Why the candidate is not in the plan; empty when it is.
+    ///
+    /// `no_backend`, `no_vision`, `no_tools`, `pseudo_tools`, `context`,
+    /// `cooldown`, `breaker`, `zero_score`.
+    pub excluded: String,
+}
+
 /// Canonical dynamic priority ladder table according to NVIDIA Switchyard specifications.
 pub const DEFAULT_AUTO_CANDIDATES: &[AutoCandidate] = &[
     // Tier 1: Flagships / Deep Reasoning & High Context
@@ -1107,93 +1136,9 @@ impl RoutingBackend {
         let mut scored_candidates: Vec<((String, String), f64)> = Vec::new();
 
         for candidate in self.auto_pool() {
-            // 1. Check if backend exists
-            if !self.backends.contains_key(&candidate.provider) {
-                continue;
-            }
-
-            // 2. Load model spec
-            let spec = self.spec_for(&candidate.provider, &candidate.model);
-
-            // 3. Vision constraint
-            if inspection.has_images && !spec.supports_vision {
-                continue;
-            }
-
-            // 4. Tool constraint & pseudo-tool check
-            if inspection.has_tools {
-                if spec.tool_support == ToolSupport::None {
-                    continue;
-                }
-                if candidate.web_executor {
-                    // The web executor has no tool head at all: its adapter
-                    // answers with page text and the backend hardcodes
-                    // `tool_calls: None`.
-                    continue;
-                }
-                if crate::model_spec::is_pseudo_tool_model(&candidate.provider, &candidate.model) {
-                    continue; // Exclude pseudo-tool models when tools are requested
-                }
-            }
-
-            // 5. Context filter vs JIT pruning feasibility
-            if inspection.estimated_tokens > spec.context_window
-                && !crate::context_pruner::can_prune_to_fit(request, spec.context_window)
-            {
-                tracing::debug!(
-                    model = candidate.model,
-                    tokens = inspection.estimated_tokens,
-                    limit = spec.context_window,
-                    "filtering out candidate: prompt exceeds context limit and cannot be pruned"
-                );
-                continue;
-            }
-
-            // 6. Factor in inspection.stage weighting if applicable
-            let stage_weight = match (inspection.stage, spec.tier) {
-                (
-                    crate::inspector::AgentStage::Planning,
-                    crate::model_spec::ModelTier::FrontierReasoning,
-                ) => 1.05,
-                (
-                    crate::inspector::AgentStage::ErrorRecovery,
-                    crate::model_spec::ModelTier::FrontierReasoning,
-                ) => 1.05,
-                (
-                    crate::inspector::AgentStage::MechanicalToolLoop,
-                    crate::model_spec::ModelTier::FastExecution,
-                ) => 1.05,
-                _ => 1.0,
-            };
-            let adjusted_base = candidate.base_priority * stage_weight;
-
-            // 7. Dynamic Priority Formula:
-            // Effective Priority = Base Priority * Quality Score * Availability State
-            let quality_score = self
-                .quality_tracker
-                .effective_score_at(&candidate.model, now);
-
-            // Availability State: 0.0 if in active cooldown or breaker is tripped; 1.0 if healthy.
-            let in_cooldown =
-                self.cooldowns
-                    .is_in_cooldown_at(&candidate.provider, Some(&candidate.model), now);
-            let breaker_open = !self.lock_breakers().allow(&candidate.provider, now);
-            let availability_state = if in_cooldown || breaker_open {
-                0.0
-            } else {
-                1.0
-            };
-
-            let effective = adjusted_base
-                * quality_score
-                * availability_state
-                * self.soft_cooldown_factor(&candidate.provider, &candidate.model, now);
-
-            if effective > 0.0 {
-                scored_candidates.push((
-                    (candidate.provider.clone(), candidate.model.clone()),
-                    effective,
-                ));
+            let row = self.evaluate_candidate(&candidate, request, &inspection, now);
+            if row.excluded.is_empty() && row.effective > 0.0 {
+                scored_candidates.push(((row.provider, row.model), row.effective));
             }
         }
 
@@ -1211,6 +1156,154 @@ impl RoutingBackend {
             steps,
             combo_name: Some(AUTO_COMBO_NAME.to_string()),
         }
+    }
+
+    /// The `auto` plan with the numbers that decided every candidate.
+    ///
+    /// The plan itself only says which models are tried and in which order —
+    /// it never says why a model that the registry lists is *not* in it. This
+    /// method answers that: for every candidate of the pool it reports the
+    /// base priority, the quality score, the availability state, the soft
+    /// cooldown factor, the resulting effective priority and, when the
+    /// candidate was dropped, the reason (`no_backend`, `no_vision`,
+    /// `no_tools`, `context`, `cooldown`, `breaker`, `zero_score`).
+    pub fn auto_plan_debug(&self, request: &ChatCompletionRequest) -> Vec<PlanCandidate> {
+        let inspection = crate::inspector::inspect_request(request);
+        let now = Instant::now();
+        let mut rows: Vec<PlanCandidate> = self
+            .auto_pool()
+            .iter()
+            .map(|candidate| self.evaluate_candidate(candidate, request, &inspection, now))
+            .collect();
+        rows.sort_by(|a, b| {
+            b.effective
+                .partial_cmp(&a.effective)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        rows
+    }
+
+    /// Score one candidate of the pool — or say why it cannot be scored.
+    ///
+    /// The plan and the debug view must never disagree, so both read the
+    /// numbers from here.
+    fn evaluate_candidate(
+        &self,
+        candidate: &PoolCandidate,
+        request: &ChatCompletionRequest,
+        inspection: &crate::inspector::RequestInspection,
+        now: Instant,
+    ) -> PlanCandidate {
+        let mut row = PlanCandidate {
+            provider: candidate.provider.clone(),
+            model: candidate.model.clone(),
+            base_priority: candidate.base_priority,
+            quality_score: 0.0,
+            availability: 0.0,
+            soft_cooldown: 0.0,
+            effective: 0.0,
+            excluded: String::new(),
+        };
+
+        // 1. Check if backend exists
+        if !self.backends.contains_key(&candidate.provider) {
+            row.excluded = "no_backend".to_string();
+            return row;
+        }
+
+        // 2. Load model spec
+        let spec = self.spec_for(&candidate.provider, &candidate.model);
+
+        // 3. Vision constraint
+        if inspection.has_images && !spec.supports_vision {
+            row.excluded = "no_vision".to_string();
+            return row;
+        }
+
+        // 4. Tool constraint & pseudo-tool check
+        if inspection.has_tools {
+            if spec.tool_support == ToolSupport::None {
+                row.excluded = "no_tools".to_string();
+                return row;
+            }
+            if candidate.web_executor {
+                // The web executor has no tool head at all: its adapter
+                // answers with page text and the backend hardcodes
+                // `tool_calls: None`.
+                row.excluded = "no_tools".to_string();
+                return row;
+            }
+            if crate::model_spec::is_pseudo_tool_model(&candidate.provider, &candidate.model) {
+                // Exclude pseudo-tool models when tools are requested
+                row.excluded = "pseudo_tools".to_string();
+                return row;
+            }
+        }
+
+        // 5. Context filter vs JIT pruning feasibility
+        if inspection.estimated_tokens > spec.context_window
+            && !crate::context_pruner::can_prune_to_fit(request, spec.context_window)
+        {
+            row.excluded = "context".to_string();
+            return row;
+        }
+
+        // 6. Factor in inspection.stage weighting if applicable
+        let stage_weight = match (inspection.stage, spec.tier) {
+            (
+                crate::inspector::AgentStage::Planning,
+                crate::model_spec::ModelTier::FrontierReasoning,
+            ) => 1.05,
+            (
+                crate::inspector::AgentStage::ErrorRecovery,
+                crate::model_spec::ModelTier::FrontierReasoning,
+            ) => 1.05,
+            (
+                crate::inspector::AgentStage::MechanicalToolLoop,
+                crate::model_spec::ModelTier::FastExecution,
+            ) => 1.05,
+            _ => 1.0,
+        };
+        let adjusted_base = candidate.base_priority * stage_weight;
+
+        // 7. Dynamic Priority Formula:
+        // Effective Priority = Base Priority * Quality Score * Availability State
+        let quality_score = self
+            .quality_tracker
+            .effective_score_at(&candidate.model, now);
+
+        // Availability State: 0.0 if in active cooldown or breaker is tripped; 1.0 if healthy.
+        let in_cooldown =
+            self.cooldowns
+                .is_in_cooldown_at(&candidate.provider, Some(&candidate.model), now);
+        let breaker_open = !self.lock_breakers().allow(&candidate.provider, now);
+        let availability_state = if in_cooldown || breaker_open {
+            0.0
+        } else {
+            1.0
+        };
+
+        let soft_cooldown = self.soft_cooldown_factor(&candidate.provider, &candidate.model, now);
+
+        let effective = adjusted_base * quality_score * availability_state * soft_cooldown;
+
+        row.base_priority = adjusted_base;
+        row.quality_score = quality_score;
+        row.availability = availability_state;
+        row.soft_cooldown = soft_cooldown;
+        row.effective = effective;
+
+        if effective <= 0.0 {
+            row.excluded = if in_cooldown {
+                "cooldown".to_string()
+            } else if breaker_open {
+                "breaker".to_string()
+            } else {
+                "zero_score".to_string()
+            };
+        }
+
+        row
     }
 }
 
@@ -1783,6 +1876,32 @@ mod tests {
             vec!["echo".to_string()],
         );
         RoutingBackend::with_breaker_settings(backends, router, 1, 3600)
+    }
+
+    #[test]
+    fn the_debug_plan_explains_every_candidate() {
+        // A candidate that is not in the plan must say why: an operator who
+        // asks "why is this model not answering" gets an answer, not a guess.
+        let mut backends: HashMap<String, std::sync::Arc<dyn ChatBackend>> = HashMap::new();
+        backends.insert("gemini".to_string(), std::sync::Arc::new(EchoBackend));
+        let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+
+        let plan = routing.auto_plan_debug(&request("heterion-router/auto"));
+
+        assert!(!plan.is_empty(), "the plan must list candidates");
+        assert_eq!(plan[0].provider, "gemini", "the curated head comes first");
+        assert!(plan[0].effective > 0.0, "the head must be selectable");
+
+        for row in &plan {
+            if row.effective <= 0.0 {
+                assert!(
+                    !row.excluded.is_empty(),
+                    "excluded candidate without a reason: {}/{}",
+                    row.provider,
+                    row.model
+                );
+            }
+        }
     }
 
     #[test]
