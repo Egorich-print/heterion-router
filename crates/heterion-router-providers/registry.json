@@ -11106,6 +11106,36 @@
     ]
   },
   {
+    "id": "rate-cloud",
+    "alias": "ratecloud",
+    "format": "openai",
+    "executor": "default",
+    "auth_type": "apikey",
+    "base_url": "https://llm.rate-cloud.com/v1",
+    "models": [
+      {
+        "id": "glm-5.3",
+        "target_format": null
+      },
+      {
+        "id": "glm-5.3-flash",
+        "target_format": null
+      },
+      {
+        "id": "deepseek-v4.1-flash",
+        "target_format": null
+      },
+      {
+        "id": "deepseek-v4-pro",
+        "target_format": null
+      },
+      {
+        "id": "qwen-3.8-max",
+        "target_format": null
+      }
+    ]
+  },
+  {
     "id": "regolo",
     "alias": "regolo",
     "format": "openai",
