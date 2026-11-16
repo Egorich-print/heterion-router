@@ -50,6 +50,51 @@ pub const MIGRATIONS: &[Migration] = &[
                 AND json_valid(data) \
                 AND COALESCE(json_array_length(data, '$.models'), 0) = 0;",
     },
+    Migration {
+        version: "003",
+        name: "model_capabilities",
+        sql: "CREATE TABLE IF NOT EXISTS model_capabilities (
+                provider TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                tool_call BOOLEAN,
+                reasoning BOOLEAN,
+                attachment BOOLEAN,
+                structured_output BOOLEAN,
+                temperature BOOLEAN,
+                modalities_input TEXT,
+                modalities_output TEXT,
+                knowledge_cutoff TEXT,
+                release_date TEXT,
+                last_updated TEXT,
+                status TEXT,
+                family TEXT,
+                open_weights BOOLEAN,
+                limit_context INTEGER,
+                limit_input INTEGER,
+                limit_output INTEGER,
+                interleaved_field TEXT,
+                last_synced TEXT,
+                PRIMARY KEY (provider, model_id)
+            );
+            CREATE TABLE IF NOT EXISTS model_capability_overrides (
+                provider TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                override_key TEXT NOT NULL,
+                override_value TEXT NOT NULL,
+                refreshed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (provider, model_id, override_key)
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS idx_model_capability_overrides_key
+                ON model_capability_overrides (override_key);
+            CREATE TABLE IF NOT EXISTS model_context_overrides (
+                provider TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                real_context INTEGER NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual',
+                refreshed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (provider, model_id)
+            );",
+    },
 ];
 
 /// Columns the combo archive feature (ADR-015) needs on `combos` that
@@ -208,7 +253,10 @@ mod tests {
         let mut guard = db.connection();
 
         let first = migrate(&mut guard).unwrap();
-        assert_eq!(first, vec!["001".to_string(), "002".to_string()]);
+        assert_eq!(
+            first,
+            vec!["001".to_string(), "002".to_string(), "003".to_string()]
+        );
 
         let second = migrate(&mut guard).unwrap();
         assert!(second.is_empty());
@@ -220,8 +268,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // 17 base tables + the ledger.
-        assert_eq!(tables, 18);
+        // 17 base tables + the three capability tables + the ledger.
+        assert_eq!(tables, 21);
     }
 
     /// The exact schema a database created before ADR-015 has: ledger says
@@ -269,7 +317,7 @@ mod tests {
 
         let mut guard = db.connection();
         let applied = migrate(&mut guard).unwrap();
-        assert_eq!(applied, vec!["002".to_string()]);
+        assert_eq!(applied, vec!["002".to_string(), "003".to_string()]);
 
         let columns: HashSet<String> = {
             let mut statement = guard.prepare("PRAGMA table_info(combos)").unwrap();
@@ -338,10 +386,10 @@ mod tests {
         let db = open_pre_adr015_db();
 
         // A database the Node server already migrated must not have its base
-        // schema re-run — only the new 002 backfill applies on top.
+        // schema re-run — only the later migrations apply on top.
         let mut guard = db.connection();
         let applied = migrate(&mut guard).unwrap();
-        assert_eq!(applied, vec!["002".to_string()]);
+        assert_eq!(applied, vec!["002".to_string(), "003".to_string()]);
     }
 
     fn api_keys_columns(conn: &rusqlite::Connection) -> HashSet<String> {

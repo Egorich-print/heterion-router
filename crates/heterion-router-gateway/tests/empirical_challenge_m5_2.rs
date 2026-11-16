@@ -313,12 +313,17 @@ fn auto_request_with_tools() -> ChatCompletionRequest {
 }
 
 /// Build the backend map for the auto ladder providers used across the suite.
+///
+/// The rotation layer is switched off: this suite pins the *ladder* — which
+/// model is tried first, what happens to the head after a failure — and the
+/// rotation deliberately moves the head after every answer. The rotation has
+/// its own contract (`tests/model_ladder.rs`).
 fn ladder(backends: Vec<Arc<ScriptedBackend>>) -> RoutingBackend {
     let mut map: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
     for backend in backends {
         map.insert(backend.name.to_string(), backend);
     }
-    RoutingBackend::new(map, Router::new(vec![], vec![]))
+    RoutingBackend::new(map, Router::new(vec![], vec![])).with_rotation(false)
 }
 
 fn gemini() -> Arc<ScriptedBackend> {

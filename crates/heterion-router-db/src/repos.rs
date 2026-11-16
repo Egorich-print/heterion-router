@@ -545,6 +545,86 @@ fn parse_zone_offset(zone: &str) -> Option<i64> {
     Some(sign * (hours * 3600 + minutes * 60))
 }
 
+/// One model of the capability table, merged with its measured context.
+///
+/// `real_context` comes from `model_context_overrides` — a window the router
+/// measured on the platform itself. It wins over the declared `limit_context`
+/// because the platform is the authority on what it accepts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelCapabilityRow {
+    pub provider: String,
+    pub model_id: String,
+    /// Native tool calling.
+    pub tool_call: Option<bool>,
+    /// Reasoning / thinking mode.
+    pub reasoning: Option<bool>,
+    /// Takes images.
+    pub attachment: Option<bool>,
+    /// Declared context window.
+    pub limit_context: Option<i64>,
+    /// Declared output limit.
+    pub limit_output: Option<i64>,
+    /// Model family, when the platform names one.
+    pub family: Option<String>,
+    /// Measured context window.
+    pub real_context: Option<i64>,
+    /// Ladder class: `frontier`, `fast` or `fallback`.
+    pub tier: Option<String>,
+}
+
+impl ModelCapabilityRow {
+    /// `provider/model` — the key the capability store is indexed by.
+    pub fn key(&self) -> String {
+        format!("{}/{}", self.provider, self.model_id)
+    }
+}
+
+/// Read every model's capabilities, joined with the measured context.
+///
+/// A database that has no capability table (or an unreadable one) yields an
+/// empty list: the router then behaves exactly as it did before the table
+/// existed.
+pub fn list_model_capabilities(conn: &Connection) -> Vec<ModelCapabilityRow> {
+    let sql = "SELECT c.provider AS provider, \
+                      c.model_id AS model_id, \
+                      c.tool_call AS tool_call, \
+                      c.reasoning AS reasoning, \
+                      c.attachment AS attachment, \
+                      c.limit_context AS limit_context, \
+                      c.limit_output AS limit_output, \
+                      c.family AS family, \
+                      o.real_context AS real_context, \
+                      (SELECT t.override_value FROM model_capability_overrides t \
+                         WHERE t.provider = c.provider \
+                           AND t.model_id = c.model_id \
+                           AND t.override_key = 'tier') AS tier \
+               FROM model_capabilities c \
+               LEFT JOIN model_context_overrides o \
+                 ON o.provider = c.provider AND o.model_id = c.model_id";
+    let mut statement = match conn.prepare(sql) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = statement.query_map([], |row| {
+        Ok(ModelCapabilityRow {
+            provider: row.get("provider")?,
+            model_id: row.get("model_id")?,
+            tool_call: row.get("tool_call")?,
+            reasoning: row.get("reasoning")?,
+            attachment: row.get("attachment")?,
+            limit_context: row.get("limit_context")?,
+            limit_output: row.get("limit_output")?,
+            family: row.get("family")?,
+            real_context: row.get("real_context")?,
+            tier: row.get("tier")?,
+        })
+    });
+    match rows {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// A row in `combos`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComboRow {

@@ -521,7 +521,11 @@ async fn test_challenge_auto_model_serves_over_http_in_both_modes() {
         ..Default::default()
     }));
 
-    let routing = Arc::new(RoutingBackend::new(backends, Router::new(vec![], vec![])));
+    // The rotation layer is off: this contract pins the *ladder* — which model
+    // is the head and how a failure moves the head — and the rotation
+    // deliberately moves the head after every answer.
+    let routing =
+        Arc::new(RoutingBackend::new(backends, Router::new(vec![], vec![])).with_rotation(false));
     let router = build_router_with_state(AppState::with_db(routing, db.clone()));
 
     // --- plain mode -------------------------------------------------------
@@ -627,7 +631,9 @@ async fn test_challenge_auto_model_serves_over_http_in_both_modes() {
 async fn test_challenge_quality_demotion_changes_the_served_order() {
     let ledger = Ledger::default();
     let (backends, probes) = setup_backends(&ledger, &["gemini", "agentrouter"]);
-    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+    // The rotation layer is off: this contract pins the ladder order (the
+    // demoted model loses the head), not the rotation.
+    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![])).with_rotation(false);
 
     // The head of the ladder answers with a pseudo XML "tool call": the
     // post-flight validation must reject it and fail over.
@@ -831,7 +837,9 @@ async fn test_challenge_model_scoped_429_leaves_sibling_models_servable() {
     // One provider, several models: the siblings of the rate-limited model
     // live on the same backend.
     let (backends, probes) = setup_backends(&ledger, &["gemini"]);
-    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+    // The rotation layer is off: this contract pins the ladder order around a
+    // model-scoped cooldown, not the rotation.
+    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![])).with_rotation(false);
 
     probes["gemini"].push_response(Err(upstream_429(30)));
     probes["gemini"].push_response(Ok(text_response(

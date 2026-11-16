@@ -1,0 +1,5 @@
+provider=mistral
+  codestral-latest
+  devstral-latest
+  mistral-medium-3-5
+  mistral-small-latest

@@ -1,0 +1,88 @@
+provider=huggingface
+  Qwen/Qwen2.5-7B-Instruct
+  deepseek-ai/DeepSeek-V3
+  google/gemma-2-9b-it
+  meta-llama/llama-3.1-8b-instruct
+  meta-llama/llama-3.2-11b-instruct
+  mistralai/mistral-7b-instruct
+provider=aion
+  aion-labs/aion-2.0
+  aion-labs/aion-2.5
+  aion-labs/aion-3.0
+  aion-labs/aion-3.0-mini
+  aion-labs/aion-rp-llama-3.1-8b
+provider=sealion
+  aisingapore/Gemma-SEA-LION-v4-27B-IT
+  aisingapore/Llama-SEA-LION-v3-70B-IT
+  aisingapore/Llama-SEA-LION-v3.5-70B-R
+  aisingapore/Qwen-SEA-LION-v4-32B-IT
+  aisingapore/Qwen-SEA-LION-v4.5-27B-IT
+provider=aihorde
+  aphrodite/TheDrummer/Cydonia-24B-v4.3
+  aphrodite/TheDrummer/Skyfall-31B-v4.2
+  google/gemma-4-31b
+provider=ovhcloud
+  Meta-Llama-3_3-70B-Instruct
+  Mistral-Small-3.2-24B-Instruct-2506
+  Qwen2.5-Coder-32B-Instruct
+provider=sambanova
+  DeepSeek-V3.2
+  Llama-4-Maverick-17B-128E-Instruct
+  Meta-Llama-3.3-70B-Instruct
+  MiniMax-M2.7
+  gpt-oss-120b
+provider=api-airforce
+  anthropic/claude-3.7-sonnet
+  deepseek/deepseek-v3
+  gemma3-270m:free
+  google/gemini-2.5-flash
+  moonshot/kimi-k2.6
+  qwen/qwen3-32b
+  x-ai/grok-2-1212
+  x-ai/grok-3
+provider=llm7
+  deepseek-r1-0528
+  gpt-4.1-nano-2025-04-14
+  gpt-4o-mini-2024-07-18
+  qwen2.5-coder-32b-instruct
+provider=mixlayer
+  qwen/qwen3.5-4b-free
+provider=oneminai
+  gpt-4o-mini
+provider=typhoon
+  typhoon-v2.5-30b-a3b-instruct
+provider=aihubmix
+  crouton-alpha-free
+provider=morph
+  morph-dsv4flash
+  morph-glm52-744b
+  morph-minimax3-428b
+  morph-qwen35-397b
+  morph-qwen36-27b
+  morph-v3-fast
+  morph-v3-large
+provider=cloudflare-ai
+  @cf/aisingapore/gemma-sea-lion-v4-27b-it
+  @cf/daily-co/phonellm-mini-alpha-2
+  @cf/deepseek-ai/deepseek-r1-distill-qwen-32b
+  @cf/google/gemma-2b-it-lora
+  @cf/google/gemma-4-26b-a4b-it
+  @cf/google/gemma-7b-it-lora
+  @cf/ibm-granite/granite-4.0-h-micro
+  @cf/meta-llama/llama-2-7b-chat-hf-lora
+  @cf/meta/llama-3.1-8b-instruct-fp8
+  @cf/meta/llama-3.2-1b-instruct
+  @cf/meta/llama-3.2-3b-instruct
+  @cf/meta/llama-3.3-70b-instruct-fp8-fast
+  @cf/meta/llama-4-scout-17b-16e-instruct
+  @cf/meta/llama-guard-3-8b
+  @cf/mistral/mistral-7b-instruct-v0.2-lora
+  @cf/mistralai/mistral-small-3.1-24b-instruct
+  @cf/nvidia/nemotron-3-120b-a12b
+  @cf/openai/gpt-oss-120b
+  @cf/openai/gpt-oss-20b
+  @cf/qwen/qwen2.5-coder-32b-instruct
+  @cf/qwen/qwen3-30b-a3b-fp8
+  @cf/qwen/qwen3.8-27b
+  @cf/qwen/qwq-32b
+  @cf/zai-org/glm-4.7-flash

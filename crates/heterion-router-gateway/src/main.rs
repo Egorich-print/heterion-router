@@ -581,8 +581,29 @@ fn select_backend(
     // Same registry as the backend loop above: `registry.json` is parsed once
     // per startup, not once per consumer.
     let names: Vec<String> = backends.keys().cloned().collect();
+    // What each model can do — the ladder's intrinsic input. A table that is
+    // missing or empty leaves the router exactly as it was: the static
+    // catalogue is the fallback.
+    let capabilities = {
+        let guard = db.connection();
+        heterion_router_gateway::capabilities::CapabilityStore::load(&guard)
+    };
+    tracing::info!(
+        models = capabilities.len(),
+        "model capabilities loaded for the ladder"
+    );
+    // Which models the router has actually talked to: a platform may *list* a
+    // model whose id answers `404`, so research alone must not push a model
+    // we know works out of the head of the ladder.
+    let trust = {
+        let guard = db.connection();
+        heterion_router_gateway::trust::TrustStore::load(&guard)
+    };
+    tracing::info!(models = trust.len(), "trusted models loaded for the ladder");
     let routing = RoutingBackend::new(backends, Router::new(rules, default))
-        .with_combo_source(db, registry.clone());
+        .with_combo_source(db, registry.clone())
+        .with_capabilities(Arc::new(capabilities))
+        .with_trust(Arc::new(trust));
     Ok((Arc::new(routing), registry, names))
 }
 

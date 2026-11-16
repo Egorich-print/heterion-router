@@ -1,0 +1,88 @@
+provider=gemini
+  gemini-2.5-flash
+  gemini-2.5-flash-lite
+  gemini-2.5-pro
+  gemini-3-flash-preview
+  gemini-3.1-flash-lite
+  gemini-3.1-flash-lite-preview
+  gemini-3.1-flash-tts-preview
+  gemini-3.1-pro-preview
+  gemini-3.5-flash
+  gemini-3.5-flash-lite
+  gemini-3.6-flash
+  gemini-3.7-flash
+  gemini-flash-lite-latest
+  gemma-4-26b-a4b-it
+provider=gemini-web
+  gemini-3.1-flash-lite
+  gemini-3.1-pro
+  gemini-3.7-flash
+provider=pollinations
+  claude
+  claude-fast
+  claude-large
+  deepseek
+  gemini
+  gemini-fast
+  gemini-flash-lite-3.1
+  gemini-large
+  gemini-search
+  glm
+  grok
+  grok-large
+  kimi
+  midijourney
+  midijourney-large
+  minimax
+  mistral
+  mistral-large
+  nova
+  nova-fast
+  openai
+  openai-fast
+  openai-large
+  perplexity-fast
+  perplexity-reasoning
+  polly
+  qwen-coder
+  qwen-coder-large
+  qwen-large
+  qwen-safety
+  qwen-vision
+provider=groq
+  allam-2-7b
+  groq/compound
+  llama-3.3-70b-versatile
+  meta-llama/llama-4-scout-17b-16e-instruct
+  openai/gpt-oss-120b
+  openai/gpt-oss-20b
+  openai/gpt-oss-safeguard-20b
+  qwen/qwen3-32b
+  qwen/qwen3.6-27b
+  qwen/qwen3.8-27b
+provider=chatgpt-web
+  gpt-5-5-instant
+  gpt-5-5-pro
+  gpt-5-5-thinking
+  gpt-5-6
+  gpt-5-6-pro
+  gpt-5-6-thinking
+  gpt-5.6-luna-free
+  gpt-5.6-luna-free-thinking
+provider=claude-web
+  claude-fable-5
+  claude-fable-5-1
+  claude-haiku-4-5-20251001
+  claude-opus-4-6
+  claude-opus-4-7
+  claude-opus-4-8
+  claude-opus-5
+  claude-sonnet-4-6
+  claude-sonnet-5
+provider=grok-web
+  expert
+  fast
+  grok-420-computer-use-sa
+  heavy
+provider=exa-search
+  exa-search

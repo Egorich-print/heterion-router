@@ -10,9 +10,10 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use futures::StreamExt;
 use heterion_router_core::{ChatCompletionRequest, ChatCompletionResponse, GatewayError};
 use heterion_router_db::Db;
@@ -22,9 +23,11 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{ATTRIBUTION_TOKEN, Attribution, ChatBackend, ChunkStream, request_token};
+use crate::capabilities::{CapabilityStore, ModelCapabilities, ladder_priority};
 use crate::combos::{ComboConfig, load_combos, plan_steps};
-use crate::model_spec::ToolSupport;
+use crate::model_spec::{ModelSpec, ToolSupport};
 use crate::resilience::{ModelQualityTracker, ProviderCooldownSet};
+use crate::trust::TrustStore;
 use crate::upstream_status_or_recovered;
 
 /// How many finished requests keep an attribution for. Bounded so a request
@@ -120,6 +123,30 @@ pub const AUTO_COMBO_NAME: &str = "heterion-router/auto";
 /// ranked last and demoted by the quality tracker the moment it misbehaves.
 pub const AUTO_TAIL_BASE_PRIORITY: f64 = 50.0;
 
+/// How long a model keeps a reduced priority after it served a request.
+///
+/// The soft cooldown is the rotation: the best model answers, cools down for
+/// a moment, and the next one in the ladder takes the next request. Nothing
+/// about the model changes — its class, context and capabilities stay — it is
+/// only temporarily pushed down, so it comes back exactly where it was.
+pub const AUTO_SOFT_COOLDOWN_SECS: u64 = 45;
+
+/// How long a model that failed keeps its demotion.
+///
+/// Twice the rotation window: a model whose id the provider does not serve
+/// (or whose answers are broken) stays down long enough that the next
+/// requests do not start with it — but it comes back, with all its
+/// properties, when the window is over.
+pub const AUTO_FAILURE_COOLDOWN_SECS: u64 = 120;
+
+/// How much of its priority a failed model keeps on its first failure.
+///
+/// A tenth: enough to put the model below everything else in the pool — the
+/// plain tail sits at 50, so a failed candidate of 300 points lands at 30.
+/// The model is not thrown out of the pool: it comes back when the window is
+/// over, with all its properties.
+pub const AUTO_FAILURE_FACTOR: f64 = 0.1;
+
 /// How many upstream calls one `auto` request may make.
 ///
 /// The pool is the whole live catalogue; the budget is what keeps a request
@@ -127,6 +154,19 @@ pub const AUTO_TAIL_BASE_PRIORITY: f64 = 50.0;
 /// in the quality tracker, so the next request starts further down the tail —
 /// the pool rotates instead of hammering the same head.
 pub const AUTO_MAX_ATTEMPTS: usize = 24;
+
+/// When a model served, and how often inside the cooldown window.
+#[derive(Debug, Clone, Copy)]
+struct ServeRecord {
+    /// When it served last.
+    last: Instant,
+    /// How many times it served inside the current window.
+    count: u32,
+    /// How many times it failed inside the failure window.
+    fails: u32,
+    /// When it failed last.
+    last_fail: Instant,
+}
 
 /// One entry of the unified Switchyard pool.
 #[derive(Debug, Clone, PartialEq)]
@@ -150,6 +190,24 @@ pub struct RoutingBackend {
     breakers: Arc<Mutex<BreakerSet>>,
     db: Option<Arc<Db>>,
     registry: Option<Arc<ProviderRegistry>>,
+    /// What each model can do — the ladder's intrinsic input.
+    capabilities: Option<Arc<CapabilityStore>>,
+    /// Which models the router has actually talked to.
+    ///
+    /// A model the platform merely *lists* may answer `404`; the trust store
+    /// keeps such an unverified model from pushing a model we know works out
+    /// of the head of the ladder.
+    trust: Option<Arc<TrustStore>>,
+    /// Whether the rotation layer is on: a model that just served drops down
+    /// softly, so the next request goes to the next rung of the ladder.
+    ///
+    /// The layer is orthogonal to the ladder itself: the ladder says which
+    /// model is *best suited*, the rotation says who answers *now*. Contracts
+    /// that pin the ladder order switch the rotation off explicitly; the
+    /// running gateway always has it on.
+    rotation: bool,
+    /// When each model served and how often (`provider/model` → record).
+    served_at: Arc<DashMap<String, ServeRecord>>,
     /// Who served which request: `request token -> Attribution`.
     ///
     /// Keyed rather than a single "last served" slot, because concurrent
@@ -312,6 +370,10 @@ impl RoutingBackend {
             breakers: Arc::new(Mutex::new(BreakerSet::new(threshold, cooldown_secs))),
             db: None,
             registry: None,
+            capabilities: None,
+            trust: None,
+            rotation: true,
+            served_at: Arc::new(DashMap::new()),
             attributions: Arc::new(Mutex::new(Vec::new())),
             cooldowns: Arc::new(ProviderCooldownSet::new()),
             quality_tracker: Arc::new(ModelQualityTracker::new()),
@@ -322,6 +384,38 @@ impl RoutingBackend {
     pub fn with_combo_source(mut self, db: Arc<Db>, registry: Arc<ProviderRegistry>) -> Self {
         self.db = Some(db);
         self.registry = Some(registry);
+        self
+    }
+
+    /// Attach the capability table: the ladder's intrinsic priorities and the
+    /// capability filters read from it.
+    pub fn with_capabilities(mut self, capabilities: Arc<CapabilityStore>) -> Self {
+        self.capabilities = Some(capabilities);
+        self
+    }
+
+    /// Attach the trust store: the evidence that a provider really serves a
+    /// model.
+    ///
+    /// Without it the router trusts everything — the capability table then
+    /// decides the ladder alone, which is what a router without a database
+    /// (tests, tools) can honestly do.
+    pub fn with_trust(mut self, trust: Arc<TrustStore>) -> Self {
+        self.trust = Some(trust);
+        self
+    }
+
+    /// Switch the rotation layer on or off.
+    ///
+    /// On (the default, and what the running gateway uses): a model that
+    /// answered cools down softly, so the next request walks down the ladder
+    /// and every available model takes part in the traffic. Off: the ladder
+    /// order is stable — the best-suited model keeps the head until quality,
+    /// quota or a breaker says otherwise. The ladder contracts pin the order
+    /// and therefore switch the rotation off; the rotation contract
+    /// (`tests/model_ladder.rs`) switches it on.
+    pub fn with_rotation(mut self, enabled: bool) -> Self {
+        self.rotation = enabled;
         self
     }
 
@@ -541,7 +635,12 @@ impl RoutingBackend {
             .map(|candidate| PoolCandidate {
                 provider: candidate.provider.to_string(),
                 model: candidate.model.to_string(),
-                base_priority: candidate.base_priority,
+                base_priority: self.base_priority_for(
+                    candidate.provider,
+                    candidate.model,
+                    candidate.base_priority,
+                    true,
+                ),
                 web_executor: self.is_web_executor(candidate.provider),
             })
             .collect();
@@ -565,7 +664,12 @@ impl RoutingBackend {
                 tail.push(PoolCandidate {
                     provider: entry.id.clone(),
                     model: model.id.clone(),
-                    base_priority: AUTO_TAIL_BASE_PRIORITY,
+                    base_priority: self.base_priority_for(
+                        &entry.id,
+                        &model.id,
+                        AUTO_TAIL_BASE_PRIORITY,
+                        false,
+                    ),
                     web_executor,
                 });
             }
@@ -579,6 +683,205 @@ impl RoutingBackend {
         });
         pool.extend(tail);
         pool
+    }
+
+    /// Intrinsic priority of a model: what its capabilities are worth, or the
+    /// fallback when the capability table does not know the model.
+    ///
+    /// The intrinsic priority never changes at runtime — an unstable model
+    /// sinks through the dynamic part (quality score, cooldown), not through
+    /// this number.
+    ///
+    /// An **untrusted** model is discounted: research says what a model is,
+    /// but not whether this provider serves it, and a model that answers
+    /// `404` must not push a model we have talked to out of the head of the
+    /// ladder. The curated candidates are hand-verified and keep their
+    /// priority as they are.
+    fn base_priority_for(&self, provider: &str, model: &str, fallback: f64, curated: bool) -> f64 {
+        match self.capabilities_of(provider, model) {
+            Some(capabilities) => {
+                let computed = ladder_priority(&capabilities);
+                if curated || self.is_trusted(provider, model) {
+                    return computed;
+                }
+                // Unverified research: the model may be described accurately
+                // and still not be served by this provider. It keeps its place
+                // in the pool — behind every model we have evidence for — and
+                // climbs out of the discount the moment it answers once.
+                if self.trust_evidence_exists() {
+                    computed * crate::trust::UNTRUSTED_DISCOUNT
+                } else {
+                    computed
+                }
+            }
+            // No research claim about this model: the hand-set priority is all
+            // there is, and there is nothing to discount.
+            None => fallback,
+        }
+    }
+
+    /// Whether the router has any trust evidence at all.
+    ///
+    /// Without a single proven model there is nothing to be distrustful
+    /// *relative to*: the capabilities decide alone.
+    fn trust_evidence_exists(&self) -> bool {
+        self.trust.as_ref().is_some_and(|trust| !trust.is_empty())
+    }
+
+    /// Whether the router has evidence that this provider serves this model.
+    fn is_trusted(&self, provider: &str, model: &str) -> bool {
+        self.trust
+            .as_ref()
+            .is_some_and(|trust| trust.is_trusted(provider, model))
+    }
+
+    /// Capabilities of one model, if the capability table knows it.
+    fn capabilities_of(&self, provider: &str, model: &str) -> Option<ModelCapabilities> {
+        self.capabilities
+            .as_ref()
+            .and_then(|store| store.get(provider, model))
+    }
+
+    /// The spec the capability filters use: the capability table when it
+    /// knows the model, the static catalogue otherwise.
+    fn spec_for(&self, provider: &str, model: &str) -> ModelSpec {
+        match self.capabilities_of(provider, model) {
+            Some(capabilities) => ModelSpec {
+                context_window: if capabilities.context_window > 0 {
+                    capabilities.context_window
+                } else {
+                    crate::model_spec::model_spec(model).context_window
+                },
+                supports_vision: capabilities.supports_vision,
+                tool_support: capabilities.tool_support,
+                tier: capabilities.tier,
+            },
+            None => crate::model_spec::model_spec(model),
+        }
+    }
+
+    /// Context window of a model: the measured one when the table knows it.
+    fn context_limit_for(&self, provider: &str, model: &str) -> u32 {
+        match self.capabilities_of(provider, model) {
+            Some(capabilities) if capabilities.context_window > 0 => capabilities.context_window,
+            _ => crate::context_pruner::model_context_limit(model),
+        }
+    }
+
+    /// Remember that a model answered us: it is trusted from now on.
+    ///
+    /// Trust grows with use: the first successful answer is the evidence that
+    /// this provider really serves this model, and from that moment the
+    /// model competes on its capabilities alone.
+    fn note_trusted(&self, provider: &str, model: &str) {
+        if let Some(trust) = self.trust.as_ref() {
+            trust.mark_trusted(provider, model);
+        }
+    }
+
+    /// Remember that a model served a request: it cools down softly.
+    ///
+    /// With the rotation layer off the ladder order is pinned, so there is
+    /// nothing to record: the served model keeps the head until quality,
+    /// quota or a breaker moves it.
+    fn note_served(&self, provider: &str, model: &str) {
+        if !self.rotation {
+            return;
+        }
+        let key = format!("{provider}/{model}");
+        let now = Instant::now();
+        self.served_at
+            .entry(key)
+            .and_modify(|record| {
+                if now.saturating_duration_since(record.last)
+                    < Duration::from_secs(AUTO_SOFT_COOLDOWN_SECS)
+                {
+                    record.count += 1;
+                } else {
+                    // The window is over: the model starts a fresh count.
+                    record.count = 1;
+                }
+                record.last = now;
+            })
+            .or_insert(ServeRecord {
+                last: now,
+                count: 1,
+                fails: 0,
+                last_fail: now,
+            });
+    }
+
+    /// Remember that a model failed: it goes down for a while.
+    ///
+    /// This is the owner's "unstable model goes down the ladder temporarily,
+    /// keeping its intelligence and its properties": the model stays in the
+    /// pool with all its capabilities, it is only pushed below its neighbours
+    /// until the failure window is over.
+    ///
+    /// It is deliberately *not* the quality tracker's penalty: a 4xx must not
+    /// put a model into the 15-minute probation (contract I-12) — it must not
+    /// take the model out of the ladder at all.
+    fn note_failed(&self, provider: &str, model: &str) {
+        if !self.rotation {
+            return;
+        }
+        let key = format!("{provider}/{model}");
+        let now = Instant::now();
+        self.served_at
+            .entry(key)
+            .and_modify(|record| {
+                if now.saturating_duration_since(record.last_fail)
+                    < Duration::from_secs(AUTO_FAILURE_COOLDOWN_SECS)
+                {
+                    record.fails += 1;
+                } else {
+                    record.fails = 1;
+                }
+                record.last_fail = now;
+            })
+            .or_insert(ServeRecord {
+                last: now,
+                count: 0,
+                fails: 1,
+                last_fail: now,
+            });
+    }
+
+    /// The soft-cooldown factor of a model.
+    ///
+    /// 1.0 while the model has not served inside the cooldown window; the
+    /// more it served inside it, the lower it ranks — one serving halves its
+    /// priority, two servings cut it to a third. The ladder therefore walks
+    /// down one rung per request and comes back to the head once the window
+    /// is over: a rotation, not a ban.
+    ///
+    /// A model that *failed* sinks further and for longer: the failure window
+    /// is twice the rotation window, and the factor is a quarter of the
+    /// remaining priority on the first failure. A model whose id the provider
+    /// does not serve must not be the first candidate of every request.
+    ///
+    /// With the rotation layer off the factor is always 1.0: the ladder order
+    /// is then decided by the capabilities alone.
+    fn soft_cooldown_factor(&self, provider: &str, model: &str, now: Instant) -> f64 {
+        if !self.rotation {
+            return 1.0;
+        }
+        let key = format!("{provider}/{model}");
+        let Some(record) = self.served_at.get(&key) else {
+            return 1.0;
+        };
+        let mut factor = 1.0;
+        if now.saturating_duration_since(record.last) < Duration::from_secs(AUTO_SOFT_COOLDOWN_SECS)
+        {
+            factor *= 1.0 / (1.0 + record.count as f64);
+        }
+        if record.fails > 0
+            && now.saturating_duration_since(record.last_fail)
+                < Duration::from_secs(AUTO_FAILURE_COOLDOWN_SECS)
+        {
+            factor *= AUTO_FAILURE_FACTOR / (1.0 + record.fails.saturating_sub(1) as f64);
+        }
+        factor
     }
 
     /// Whether a provider is served by the web executor (a browser session
@@ -604,7 +907,7 @@ impl RoutingBackend {
             }
 
             // 2. Load model spec
-            let spec = crate::model_spec::model_spec(&candidate.model);
+            let spec = self.spec_for(&candidate.provider, &candidate.model);
 
             // 3. Vision constraint
             if inspection.has_images && !spec.supports_vision {
@@ -675,7 +978,10 @@ impl RoutingBackend {
                 1.0
             };
 
-            let effective = adjusted_base * quality_score * availability_state;
+            let effective = adjusted_base
+                * quality_score
+                * availability_state
+                * self.soft_cooldown_factor(&candidate.provider, &candidate.model, now);
 
             if effective > 0.0 {
                 scored_candidates.push((
@@ -777,7 +1083,7 @@ impl ChatBackend for RoutingBackend {
                 }
             }
 
-            let target_limit = crate::context_pruner::model_context_limit(target_model);
+            let target_limit = self.context_limit_for(name, target_model);
             let budget =
                 (target_limit as f64 * crate::context_pruner::TOKEN_BUDGET_SAFETY_FACTOR) as u32;
             let prompt_tokens = crate::context_pruner::fast_estimate_tokens(&request);
@@ -843,6 +1149,8 @@ impl ChatBackend for RoutingBackend {
                             break;
                         }
                         self.quality_tracker.record_success(target_model);
+                        self.note_trusted(name, target_model);
+                        self.note_served(name, target_model);
                         self.attribute(
                             token.as_deref(),
                             name,
@@ -888,6 +1196,20 @@ impl ChatBackend for RoutingBackend {
                                 }
                                 Some(s) if s >= 500 => {
                                     self.quality_tracker.record_failure(target_model);
+                                    self.note_failed(name, target_model);
+                                }
+                                Some(400) | Some(401) | Some(404) | Some(422) => {
+                                    // The candidate itself is the problem: this
+                                    // id is not served, or the platform refuses
+                                    // it. The model goes down for a while — the
+                                    // owner's "an unstable model sinks
+                                    // temporarily, keeping its intelligence and
+                                    // its properties". Deliberately *not* the
+                                    // quality tracker's penalty: a 4xx must not
+                                    // put the model into the 15-minute
+                                    // probation (contract I-12), and it must
+                                    // not take the model out of the ladder.
+                                    self.note_failed(name, target_model);
                                 }
                                 _ => {}
                             }
@@ -990,7 +1312,7 @@ impl ChatBackend for RoutingBackend {
                     }
                 }
 
-                let target_limit = crate::context_pruner::model_context_limit(target_model);
+                let target_limit = this.context_limit_for(name, target_model);
                 let budget = (target_limit as f64
                     * crate::context_pruner::TOKEN_BUDGET_SAFETY_FACTOR)
                     as u32;
@@ -1037,6 +1359,8 @@ impl ChatBackend for RoutingBackend {
                         Some(Ok(first)) => {
                             this.lock_breakers().record_success(name);
                             this.quality_tracker.record_success(target_model);
+                            this.note_trusted(name, target_model);
+                            this.note_served(name, target_model);
                             this.attribute(
                                 token.as_deref(),
                                 name,
@@ -1082,6 +1406,17 @@ impl ChatBackend for RoutingBackend {
                                     }
                                     Some(s) if s >= 500 => {
                                         this.quality_tracker.record_failure(target_model);
+                                        this.note_failed(name, target_model);
+                                    }
+                                    Some(400) | Some(401) | Some(404) | Some(422) => {
+                                        // Model-scoped demotion, as in the
+                                        // non-streaming path: the id is not
+                                        // served or the platform refuses it, so
+                                        // the model goes down for a while —
+                                        // without the quality penalty that
+                                        // would put it into the 15-minute
+                                        // probation (contract I-12).
+                                        this.note_failed(name, target_model);
                                     }
                                     _ => {}
                                 }
@@ -1117,6 +1452,8 @@ impl ChatBackend for RoutingBackend {
                         None => {
                             this.lock_breakers().record_success(name);
                             this.quality_tracker.record_success(target_model);
+                            this.note_trusted(name, target_model);
+                            this.note_served(name, target_model);
                             this.attribute(
                                 token.as_deref(),
                                 name,

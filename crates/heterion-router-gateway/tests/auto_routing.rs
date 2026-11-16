@@ -431,12 +431,19 @@ async fn test_alias_resolution_equivalence() {
         Some("heterion-router/auto")
     );
 
-    // B. Request using alias "auto"
-    gemini.push_response(Ok(ChatCompletionResponse {
+    // B. Request using alias "auto".
+    //
+    // The alias and the canonical name address the *same virtual model*:
+    // the same pool, booked under the canonical name. Which candidate of
+    // that pool answers is a per-request choice — the soft rotation
+    // (ADR-029) pushes the model that just served down for a moment — so
+    // the equivalence is about the pool and the booking, not about one
+    // candidate.
+    agentrouter.push_response(Ok(ChatCompletionResponse {
         id: "resp-alias".into(),
         object: "chat.completion",
         created: 2,
-        model: "gemini-3-flash-preview".into(),
+        model: "gpt-5.6-sol".into(),
         usage: Usage::default(),
         choices: vec![ChatChoice {
             index: 0,
@@ -455,11 +462,15 @@ async fn test_alias_resolution_equivalence() {
     let res_alias = routing.complete(req_alias).await.unwrap();
     assert_eq!(res_alias.choices[0].message.text(), "Response via alias");
     let attr_alias = routing.attribution(&token_alias);
-    assert_eq!(attr_alias.provider.as_deref(), Some("gemini"));
-    assert_eq!(attr_alias.model.as_deref(), Some("gemini-3-flash-preview"));
+    assert!(
+        ["gemini", "agentrouter"].contains(&attr_alias.provider.as_deref().unwrap_or("")),
+        "the alias serves from the same pool, got: {:?}",
+        attr_alias.provider
+    );
     assert_eq!(
         attr_alias.combo_name.as_deref(),
-        Some("heterion-router/auto")
+        Some("heterion-router/auto"),
+        "the alias is booked under the canonical name"
     );
 
     // C. Symmetric Auth pattern matching equivalence

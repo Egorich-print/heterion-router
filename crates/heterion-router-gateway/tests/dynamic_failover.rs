@@ -745,7 +745,14 @@ async fn test_challenge_429_exponential_backoff_and_recovery() {
         .unwrap();
     assert!(rem1.as_secs() >= 29 && rem1.as_secs() <= 30);
 
-    // 2. While in cooldown, subsequent requests immediately bypass gemini
+    // 2. While in cooldown, subsequent requests immediately bypass the
+    //    rate-limited *model*.
+    //
+    //    Which candidate serves is a per-request choice — the soft rotation
+    //    (ADR-029) pushes the model that just served down for a moment — and
+    //    a sibling model of the same provider may serve: the 429 cooldown is
+    //    model-scoped on purpose, so one model hitting its rate limit must
+    //    not switch its siblings off.
     for i in 2..=4 {
         agentrouter.push_response(Ok(ChatCompletionResponse {
             id: format!("resp-agentrouter-{i}"),
@@ -766,11 +773,23 @@ async fn test_challenge_429_exponential_backoff_and_recovery() {
             .complete(req)
             .await
             .expect("bypass call should succeed");
-        assert_eq!(res.choices[0].message.text(), format!("AgentRouter {i}"));
-        // gemini was never called again!
-        assert_eq!(gemini.calls(), 1);
+        assert!(
+            !res.choices[0].message.text().is_empty(),
+            "the bypass call must be answered"
+        );
+        // The rate-limited model was never called again: it was asked once
+        // (the request that got the 429) and never since.
+        let asked = gemini
+            .received_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.model == "gemini-3-flash-preview")
+            .count();
+        assert_eq!(asked, 1, "the rate-limited model must not be called again");
     }
-    assert_eq!(agentrouter.calls(), 4);
+    // Every request was answered by exactly one candidate.
+    assert_eq!(gemini.calls() + agentrouter.calls(), 5);
 
     // 3. Test backoff progression in ProviderCooldownSet directly:
     // Streak 2 at t0 + 1s -> 60s. Model-scoped, the same scope the router
@@ -838,6 +857,18 @@ async fn test_challenge_429_exponential_backoff_and_recovery() {
         raw: None,
     }));
 
+    // How often the rate-limited model was asked so far: once, for the
+    // request that got the 429. A sibling model of the same provider may
+    // have served the bypass calls — that is what a model-scoped cooldown
+    // means.
+    let asked_before = gemini
+        .received_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.model == "gemini-3-flash-preview")
+        .count();
+
     let mut req_restored = auto_request();
     let token_restored = stamp_attribution(&mut req_restored);
     let res_restored = routing
@@ -849,7 +880,15 @@ async fn test_challenge_429_exponential_backoff_and_recovery() {
         routing.attribution(&token_restored).provider.as_deref(),
         Some("gemini")
     );
-    assert_eq!(gemini.calls(), 2);
+    // The restored model is back in the ladder and serves again.
+    let asked_after = gemini
+        .received_requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.model == "gemini-3-flash-preview")
+        .count();
+    assert_eq!(asked_after, asked_before + 1);
 }
 
 #[tokio::test]
