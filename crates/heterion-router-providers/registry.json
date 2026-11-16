@@ -7174,22 +7174,6 @@
       {
         "id": "MiniMax-M3",
         "target_format": null
-      },
-      {
-        "id": "MiniMax-M2.7",
-        "target_format": null
-      },
-      {
-        "id": "MiniMax-M2.7-highspeed",
-        "target_format": null
-      },
-      {
-        "id": "MiniMax-M2.5",
-        "target_format": null
-      },
-      {
-        "id": "MiniMax-M2.5-highspeed",
-        "target_format": null
       }
     ]
   },
@@ -7975,10 +7959,6 @@
       },
       {
         "id": "mistral-large-3:675b",
-        "target_format": null
-      },
-      {
-        "id": "nemotron-3-nano:30b",
         "target_format": null
       },
       {

@@ -540,6 +540,25 @@ drag-головоломку перед OAuth; это шаг оператора (
     (`openai-fast` + псевдоним `openai`); 29 id отвечали `404 NOT_FOUND:
     Model "…" isn't on the Classic API` при нуле успехов (было 31, осталось 2).
   Итог после волны: 276 провайдеров, 2262 модели (было 2329).
+- **Пятая волна чистки — модели, снятые самой площадкой:**
+  - `minimax` — четыре id отвечают `404 not_found_error: The model "…" is no
+    longer available. (2069)` (28–30 отказов на каждый): `MiniMax-M2.5`,
+    `MiniMax-M2.5-highspeed`, `MiniMax-M2.7`, `MiniMax-M2.7-highspeed`.
+    Остался `MiniMax-M3`; соединение провайдера и так отключено;
+  - `ollama-cloud/nemotron-3-nano:30b` — `410 Gone: nemotron-3-nano:30b was
+    retired on November 9, 2026. Try glm-5.3-flash:cloud` (площадка сама
+    называет замену).
+  Итог после волны: 276 провайдеров, 2257 моделей.
+
+**Отказ соединения — не отказ модели.** `sambanova` отвечает `401 Incorrect
+API key provided` (все пять соединений отключены: ключи мертвы), поэтому её
+`404 «model … does not exist or you do not have access to it»` — следствие
+мёртвого ключа, а не смерти модели: из реестра эти id не вычеркиваются.
+`blackbox` и `command-code` отвечают `404` на **все** модели площадки —
+у `command-code` прямо сказано, что маршрут не зарегистрирован
+(`POST https://api.commandcode.ai/chat/completions is not a registered API
+route`), то есть адрес неверный, а не модели мёртвые. Оба соединения
+отключены; чинить нужно ключ/адрес, а не реестр.
 
 **`base_url` может нести плейсхолдер `{env:ИМЯ}`** — например Cloudflare
 Workers AI требует `account_id` в пути, а он принадлежит аккаунту оператора,
