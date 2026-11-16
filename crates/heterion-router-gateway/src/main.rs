@@ -603,7 +603,14 @@ fn select_backend(
     let routing = RoutingBackend::new(backends, Router::new(rules, default))
         .with_combo_source(db, registry.clone())
         .with_capabilities(Arc::new(capabilities))
-        .with_trust(Arc::new(trust));
+        .with_trust(Arc::new(trust))
+        // The relay itself is on; the token-saving variant is the operator's
+        // call, because it costs the target model the picture itself.
+        .with_vision_relay(true)
+        .with_vision_saving(
+            std::env::var("HETERION_ROUTER_VISION_SAVING")
+                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "yes")),
+        );
     Ok((Arc::new(routing), registry, names))
 }
 

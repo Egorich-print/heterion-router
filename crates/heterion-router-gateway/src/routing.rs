@@ -25,7 +25,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::backend::{ATTRIBUTION_TOKEN, Attribution, ChatBackend, ChunkStream, request_token};
 use crate::capabilities::{CapabilityStore, ModelCapabilities, ladder_priority};
 use crate::combos::{ComboConfig, load_combos, plan_steps};
-use crate::model_spec::{ModelSpec, ToolSupport};
+use crate::model_spec::{ModelSpec, ModelTier, ToolSupport};
 use crate::resilience::{ModelQualityTracker, ProviderCooldownSet};
 use crate::trust::TrustStore;
 use crate::upstream_status_or_recovered;
@@ -206,6 +206,16 @@ pub struct RoutingBackend {
     /// that pin the ladder order switch the rotation off explicitly; the
     /// running gateway always has it on.
     rotation: bool,
+    /// Whether the vision relay is on: a request with images that lands on a
+    /// model which cannot see them is served through a borrowed description.
+    vision_relay: bool,
+    /// Whether the relay may also *save* tokens: a model that can see the
+    /// picture hands it to a cheaper vision model first and receives the
+    /// description instead of the image.
+    ///
+    /// Off by default — the target then loses the picture's detail, which is
+    /// a trade the operator has to opt into.
+    vision_saving: bool,
     /// When each model served and how often (`provider/model` → record).
     served_at: Arc<DashMap<String, ServeRecord>>,
     /// Who served which request: `request token -> Attribution`.
@@ -216,6 +226,27 @@ pub struct RoutingBackend {
     cooldowns: Arc<ProviderCooldownSet>,
     quality_tracker: Arc<ModelQualityTracker>,
 }
+
+/// The ladder's class as a number: the lower the class, the cheaper the model.
+fn class_rank(tier: ModelTier) -> u8 {
+    match tier {
+        ModelTier::Fallback => 0,
+        ModelTier::FastExecution => 1,
+        ModelTier::FrontierReasoning => 2,
+    }
+}
+
+/// The smallest window a model may have and still be a model.
+///
+/// Below it the id is a router alias (`auto`, `auto:free`), not a model: the
+/// platform picks a model per request, and for some of them an image is
+/// refused outright.
+const MIN_MODEL_WINDOW: u32 = 4096;
+
+/// How many models the relay may ask to describe a picture.
+///
+/// One failure must not cost the relay: the next candidate gets the picture.
+const VISION_RELAY_DESCRIBERS: usize = 3;
 
 /// Whether a failure means the backend itself is unhealthy.
 ///
@@ -373,6 +404,8 @@ impl RoutingBackend {
             capabilities: None,
             trust: None,
             rotation: true,
+            vision_relay: true,
+            vision_saving: false,
             served_at: Arc::new(DashMap::new()),
             attributions: Arc::new(Mutex::new(Vec::new())),
             cooldowns: Arc::new(ProviderCooldownSet::new()),
@@ -416,6 +449,29 @@ impl RoutingBackend {
     /// (`tests/model_ladder.rs`) switches it on.
     pub fn with_rotation(mut self, enabled: bool) -> Self {
         self.rotation = enabled;
+        self
+    }
+
+    /// Switch the vision relay on or off.
+    ///
+    /// On (the default): a request that carries images and lands on a model
+    /// that cannot see them is served through a borrowed description instead
+    /// of dying on the upstream's `400`. Off: such a request keeps failing
+    /// the way it did before the relay existed.
+    pub fn with_vision_relay(mut self, enabled: bool) -> Self {
+        self.vision_relay = enabled;
+        self
+    }
+
+    /// Switch the token-saving variant of the relay on or off.
+    ///
+    /// Off (the default): only a model that *cannot* see the picture gets a
+    /// borrowed description. On: a model that can see it hands the picture to
+    /// a cheaper vision model first and receives the description instead —
+    /// cheaper in image tokens, but the target no longer sees the picture
+    /// itself. That trade is the operator's to make.
+    pub fn with_vision_saving(mut self, enabled: bool) -> Self {
+        self.vision_saving = enabled;
         self
     }
 
@@ -760,6 +816,156 @@ impl RoutingBackend {
         }
     }
 
+    /// The models that can look at a picture, cheapest first.
+    ///
+    /// "Cheapest" is the ladder's own currency: the lower class first, the
+    /// lower priority inside the class. A model the router has never talked
+    /// to comes after every proven one — a description from a model that
+    /// answers `404` is no description at all.
+    ///
+    /// A candidate must look like a model: a window of a few thousand tokens
+    /// at least. The virtual aliases (`auto`, `auto:free`) are routers that
+    /// pick a model per request, and the platform refuses an image for some
+    /// of them — they are not describers.
+    fn vision_describers(&self, exclude: Option<(&str, &str)>) -> Vec<(String, String)> {
+        let mut proven: Vec<((String, String), (u8, f64))> = Vec::new();
+        let mut unproven: Vec<((String, String), (u8, f64))> = Vec::new();
+        for candidate in self.auto_pool() {
+            if !self.backends.contains_key(&candidate.provider) {
+                continue;
+            }
+            if let Some((provider, model)) = exclude
+                && candidate.provider == provider
+                && candidate.model == model
+            {
+                continue;
+            }
+            let spec = self.spec_for(&candidate.provider, &candidate.model);
+            if !spec.supports_vision || spec.context_window < MIN_MODEL_WINDOW {
+                continue;
+            }
+            if !self
+                .cooldowns
+                .is_available(&candidate.provider, Some(&candidate.model))
+            {
+                continue;
+            }
+            let rank = (class_rank(spec.tier), candidate.base_priority);
+            let entry = ((candidate.provider.clone(), candidate.model.clone()), rank);
+            if self.is_trusted(&candidate.provider, &candidate.model) {
+                proven.push(entry);
+            } else {
+                unproven.push(entry);
+            }
+        }
+        proven.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        unproven.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        tracing::debug!(
+            proven = proven.len(),
+            unproven = unproven.len(),
+            "vision relay: models in the pool that can look at a picture"
+        );
+        proven
+            .into_iter()
+            .chain(unproven)
+            .map(|((provider, model), _)| (provider, model))
+            .collect()
+    }
+
+    /// Borrow eyes for a target that cannot see the picture.
+    ///
+    /// Returns the request the target should actually receive: the same
+    /// request with the images replaced by a description another model wrote.
+    /// `None` means "send the original request" — the relay never makes a
+    /// failing request worse.
+    async fn relay_vision(
+        &self,
+        request: &ChatCompletionRequest,
+        plan: &[(String, String)],
+    ) -> Option<ChatCompletionRequest> {
+        let (target_provider, target_model) = plan.first()?;
+        if !crate::inspector::inspect_request(request).has_images {
+            return None;
+        }
+        let target_spec = self.spec_for(target_provider, target_model);
+        // A target that cannot see the picture gets a borrowed description —
+        // otherwise the upstream refuses the image. A target that *can* see
+        // it only does so when the operator asked for the token-saving
+        // variant.
+        let blind = !target_spec.supports_vision;
+        if !blind && !self.vision_saving {
+            return None;
+        }
+        let describers =
+            self.vision_describers(Some((target_provider.as_str(), target_model.as_str())));
+        if describers.is_empty() {
+            tracing::debug!(
+                target = %target_model,
+                "vision relay: no model in the pool can look at the picture"
+            );
+            return None;
+        }
+        for (provider, model) in describers.into_iter().take(VISION_RELAY_DESCRIBERS) {
+            if !blind {
+                // The borrowed description must not cost more than the picture
+                // it replaces: only a strictly cheaper class may do the
+                // looking.
+                let describer_spec = self.spec_for(&provider, &model);
+                if class_rank(describer_spec.tier) >= class_rank(target_spec.tier) {
+                    continue;
+                }
+            }
+            let describer_request = crate::vision_relay::describer_request(request, &model)?;
+            let Some(backend) = self.backends.get(&provider) else {
+                continue;
+            };
+            let response = match backend.complete(attempt(&describer_request, &model)).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %provider,
+                        model = %model,
+                        error = %error,
+                        "vision relay: the describer failed, trying the next one"
+                    );
+                    continue;
+                }
+            };
+            let description = response
+                .choices
+                .first()
+                .map(|choice| choice.message.text())
+                .unwrap_or_default();
+            if description.trim().is_empty() {
+                tracing::warn!(
+                    provider = %provider,
+                    model = %model,
+                    "vision relay: the describer answered with nothing, trying the next one"
+                );
+                continue;
+            }
+            // The describer answered — the platform really serves that model.
+            self.note_trusted(&provider, &model);
+            self.note_served(&provider, &model);
+            tracing::info!(
+                provider = %provider,
+                model = %model,
+                target = %target_model,
+                "vision relay: the picture was described by a borrowed model"
+            );
+            return Some(crate::vision_relay::with_description(
+                request,
+                &description,
+                &format!("{provider}/{model}"),
+            ));
+        }
+        tracing::warn!(
+            target = %target_model,
+            "vision relay: nobody could describe the picture, the request goes out unchanged"
+        );
+        None
+    }
+
     /// Context window of a model: the measured one when the table knows it.
     fn context_limit_for(&self, provider: &str, model: &str) -> u32 {
         match self.capabilities_of(provider, model) {
@@ -1042,6 +1248,16 @@ impl ChatBackend for RoutingBackend {
             steps: plan,
             combo_name,
         } = self.resolve(&model, &request)?;
+        // A model that cannot see the picture is served through a borrowed
+        // description of it. The relay borrows one backend directly, so it
+        // cannot recurse into the ladder, and a relay that fails leaves the
+        // request exactly as it was.
+        let relayed = if self.vision_relay {
+            self.relay_vision(&request, &plan).await
+        } else {
+            None
+        };
+        let request = relayed.unwrap_or(request);
         let mut last_error: Option<GatewayError> = None;
         let mut tripped = false;
 

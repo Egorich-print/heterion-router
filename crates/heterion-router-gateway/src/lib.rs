@@ -39,6 +39,7 @@ pub mod routing;
 pub mod trust;
 pub mod ui;
 pub mod usage_estimate;
+pub mod vision_relay;
 pub mod web;
 pub mod web_driver;
 

@@ -69,12 +69,21 @@ impl CapabilityStore {
     pub fn from_rows(rows: &[ModelCapabilityRow]) -> Self {
         let mut map = HashMap::with_capacity(rows.len());
         for row in rows {
+            let context_window = row
+                .real_context
+                .or(row.limit_context)
+                .filter(|value| *value > 0)
+                .unwrap_or(0);
+            // A window of one token is the research placeholder for a virtual
+            // alias (`auto`, `auto:free`, `kilo-auto/*`): the platform serves
+            // a router there, not a model with a window. Such a row claims
+            // nothing — no vision, no tools, no class — because the alias
+            // inherits them from whatever the router picks per request.
+            if context_window <= 1 {
+                continue;
+            }
             let capabilities = ModelCapabilities {
-                context_window: row
-                    .real_context
-                    .or(row.limit_context)
-                    .filter(|value| *value > 0)
-                    .unwrap_or(0) as u32,
+                context_window: context_window as u32,
                 supports_vision: row.attachment.unwrap_or(false),
                 tool_support: match row.tool_call {
                     Some(true) => ToolSupport::Native,
@@ -267,5 +276,28 @@ mod tests {
         let store = CapabilityStore::empty();
         assert!(store.is_empty());
         assert!(store.get("gemini", "gemini-3-flash-preview").is_none());
+    }
+
+    /// A window of one token is the research placeholder for a virtual alias
+    /// (`auto`, `auto:free`): the platform serves a router there, not a model.
+    #[test]
+    fn a_virtual_alias_claims_nothing() {
+        let rows = vec![ModelCapabilityRow {
+            provider: "openrouter".to_string(),
+            model_id: "auto".to_string(),
+            tool_call: Some(true),
+            reasoning: Some(true),
+            attachment: Some(true),
+            limit_context: Some(1),
+            limit_output: None,
+            family: None,
+            real_context: None,
+            tier: Some("fast".to_string()),
+        }];
+        let store = CapabilityStore::from_rows(&rows);
+        assert!(
+            store.get("openrouter", "auto").is_none(),
+            "a router alias must not enter the ladder as a model"
+        );
     }
 }
