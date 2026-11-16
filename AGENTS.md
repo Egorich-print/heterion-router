@@ -219,7 +219,11 @@ Toolchain закреплён `1.99.1` в `rust-toolchain.toml`, `rust-version = 
 - **Sidecar:** release-сборка поднимает `heterion-router-gateway` из каталога
   рядом со своим бинарём на порту 20129 (`HETERION_ROUTER_SIDECAR_PORT` /
   `OMNIROUTE_SIDECAR_PORT`) с `HETERION_ROUTER_PARENT_PID`; debug-сборка
-  говорит с уже запущенным шлюзом (20128).
+  говорит с уже запущенным шлюзом (20128) — **но только если задан
+  `HETERION_ROUTER_PORT=20128`**: без переменной debug-сборка берёт
+  `GATEWAY_DEFAULT_PORT` = 20129 и показывает «gateway unreachable».
+  Запуск для визуальной проверки:
+  `HETERION_ROUTER_PORT=20128 desktop/gpui/tools/screenshot.sh launch`.
 - **Факты по API gpui** — `docs/port/GPUI-API-NOTES.md`, контракт порта —
   `docs/port/GPUI-PORT-SPEC.md`. Не выдумывать имена API: исходники крейта в
   `~/.cargo/registry/src/index.crates.io-*/gpui-0.2.2/src/`.
