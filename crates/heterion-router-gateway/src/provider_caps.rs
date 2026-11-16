@@ -62,11 +62,13 @@ pub fn rejects_reasoning_content(provider: &str) -> bool {
 /// The limit can be a property of the model rather than of the platform:
 /// sealion's 32B model answers `400 max_completion_tokens=65536 cannot be
 /// greater than max_model_len=32000` while its 27B model takes the same
-/// budget happily. Such a model is named here, and the cap applies to that
-/// model only.
+/// budget happily, and oneminai's `gpt-4o-mini` answers `400 Output limit
+/// exceeds the model maximum of 16384` — a lower ceiling than the platform's
+/// own. Such a model is named here, and the cap applies to that model only.
 pub fn max_output_tokens(provider: &str, model: &str) -> Option<u32> {
     match provider {
         "typhoon" => Some(16_384),
+        "oneminai" if model == "gpt-4o-mini" => Some(16_384),
         "oneminai" => Some(32_768),
         "sealion" if model.contains("SEA-LION-v4-32B") => Some(32_000),
         _ => None,
@@ -213,7 +215,9 @@ mod tests {
             max_output_tokens("typhoon", "typhoon-v2.5-30b-a3b-instruct"),
             Some(16_384)
         );
-        assert_eq!(max_output_tokens("oneminai", "gpt-4o-mini"), Some(32_768));
+        // gpt-4o-mini has its own, lower ceiling than the platform's.
+        assert_eq!(max_output_tokens("oneminai", "gpt-4o-mini"), Some(16_384));
+        assert_eq!(max_output_tokens("oneminai", "other-model"), Some(32_768));
         assert_eq!(max_output_tokens("gemini", "gemini-3.5-flash"), None);
     }
 
