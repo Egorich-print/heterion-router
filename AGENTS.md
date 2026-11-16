@@ -535,6 +535,11 @@ drag-головоломку перед OAuth; это шаг оператора (
     `api-airforce` — `x-ai/grok-3`, `moonshot/kimi-k2.6`,
     `openrouter/auto`.
   Итог: 276 провайдеров, 2291 модель (было 2329).
+- **Четвёртая волна чистки — тот же прогон, журнал до 22:40 UTC:**
+  - `pollinations` — Classic API площадки обслуживает ровно одну модель
+    (`openai-fast` + псевдоним `openai`); 29 id отвечали `404 NOT_FOUND:
+    Model "…" isn't on the Classic API` при нуле успехов (было 31, осталось 2).
+  Итог после волны: 276 провайдеров, 2262 модели (было 2329).
 
 **`base_url` может нести плейсхолдер `{env:ИМЯ}`** — например Cloudflare
 Workers AI требует `account_id` в пути, а он принадлежит аккаунту оператора,
@@ -548,6 +553,15 @@ Workers AI требует `account_id` в пути, а он принадлежи
 принимает (`Authentication error`). Бесплатный тариф — 10 000 нейронов в сутки;
 из 40 текстовых моделей каталога площадки на Free отвечают 24 — в реестре
 именно они, перечень проверен живым вызовом.
+
+**Classic API pollinations обслуживает ровно одну модель.** Каталог площадки
+(`GET https://text.pollinations.ai/models`, проверено 2026-11-16) отдаёт один
+элемент: `openai-fast` (GPT-OSS 20B Reasoning, OVH) с псевдонимами `openai`,
+`gpt-oss`, `gpt-oss-20b`, `ovh-reasoning`. Остальные id площадка отвергает
+`404 NOT_FOUND: Model "claude" isn't on the Classic API` — и в реестре их
+больше нет (было 31, осталось 2: `openai-fast`, `openai`; успехи в журнале
+покрывают оба). Остальные модели pollinations живут на платном
+`enter.pollinations.ai` — это другой API, а не этот.
 
 ## Единый пул Switchyard (ADR-027)
 
