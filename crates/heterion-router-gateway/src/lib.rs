@@ -627,6 +627,10 @@ async fn chat_completions(
     let summary = request_summary(&request);
     let started = std::time::Instant::now();
     let prompt_estimate = usage_estimate::estimate_prompt_tokens(&request);
+    // Read before the request moves into the backend: the journal needs to
+    // know whether tools were offered, to tell a text-only answer from a
+    // turn that was asked to act.
+    let had_tools = request_had_tools(&request);
     tracing::info!("completion model={model} stream=false");
     match state.backend.complete(request).await {
         Ok(mut response) => {
@@ -683,6 +687,15 @@ async fn chat_completions(
                     error_code: None,
                     request_type: "chat",
                     summary: &summary,
+                    finish_reason: response
+                        .choices
+                        .first()
+                        .map(|choice| choice.finish_reason.as_str()),
+                    tool_called: response
+                        .choices
+                        .first()
+                        .map(|choice| choice.message.has_tool_calls()),
+                    had_tools,
                 },
             );
 
@@ -721,6 +734,9 @@ async fn chat_completions(
                     error_code: Some("upstream_error"),
                     request_type: "chat",
                     summary: &summary,
+                    finish_reason: None,
+                    tool_called: None,
+                    had_tools,
                 },
             );
             error_response(error)
@@ -797,6 +813,17 @@ struct CompletionUsage<'a> {
     request_type: &'a str,
     /// Counts-only description of the request; never its content.
     summary: &'a str,
+    /// Why the upstream ended the turn (`stop`, `length`, `tool_calls`, …).
+    finish_reason: Option<&'a str>,
+    /// Whether the answer carried a tool call.
+    tool_called: Option<bool>,
+    /// Whether the client asked for tools in this request.
+    ///
+    /// Together with `finish_reason = "stop"` and `tool_called = false` this is
+    /// the shape of a turn that ends with plain text where the agent expected
+    /// an action — the run stops "for no reason". Both facts are needed, so
+    /// the request side is recorded too.
+    had_tools: bool,
 }
 
 /// Call-log status for a stream the client abandoned: HTTP 499, the
@@ -820,6 +847,9 @@ fn record_completion_usage(state: &AppState, auth: &Authenticated, context: Comp
         error_code,
         request_type,
         summary,
+        finish_reason,
+        tool_called,
+        had_tools,
     } = context;
     let Some(db) = state.db.as_ref() else {
         return;
@@ -828,6 +858,22 @@ fn record_completion_usage(state: &AppState, auth: &Authenticated, context: Comp
     // per-provider analytics.
     let attribution = state.backend.attribution(token);
     let served = resolved.or(attribution.model.as_deref()).unwrap_or(model);
+    // An agent turn that was given tools, ended with `stop` and carried no
+    // tool call is the shape that ends a run without a reason: the journal
+    // shows a 200 and a normal-looking answer, and only this line says the
+    // model answered with text where an action was expected.
+    //
+    // It is logged, not scored: a final text answer is legal (the agent
+    // decided it was done), so downgrading a model for it would be a
+    // judgement the router has no grounds for. The owner sees the facts and
+    // decides what the ladder should do.
+    if had_tools && finish_reason == Some("stop") && tool_called == Some(false) {
+        tracing::warn!(
+            "agent turn ended with text instead of a tool call provider={} model={} finish=stop",
+            attribution.provider.as_deref().unwrap_or("-"),
+            served,
+        );
+    }
     let guard = db.connection();
     let record = UsageRecord {
         provider: attribution.provider.clone(),
@@ -938,10 +984,39 @@ fn record_completion_usage(state: &AppState, auth: &Authenticated, context: Comp
         // complaint finds the row itself. No second identifier is invented:
         // it is the same `ids::call_id()` the attribution token is minted from.
         correlation_id: Some(id),
+        finish_reason: finish_reason.map(str::to_string),
+        tool_called,
+        had_tools: Some(had_tools),
     };
     if let Err(error) = record_call_log(&guard, &call) {
         tracing::warn!("call log record failed: {error}");
     }
+}
+
+/// Whether the request offered tools to the upstream.
+///
+/// The array is the normal shape; anything else non-null counts as an offer,
+/// because the question is "did the client expect an action", and even a
+/// malformed array means it expected one.
+fn request_had_tools(request: &ChatCompletionRequest) -> bool {
+    match request.tools.as_ref() {
+        Some(Value::Array(tools)) => !tools.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    }
+}
+
+/// Whether a stream chunk carried a tool call.
+///
+/// The delta is an OpenAI-shaped array, but a provider that sends an empty
+/// array must not count as a call: the journal answers "did the agent get an
+/// action to run", and an empty array is not one.
+fn chunk_has_tool_calls(chunk: &StreamChunk) -> bool {
+    chunk
+        .tool_calls
+        .as_ref()
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
 }
 
 /// Books a streaming request exactly once: on the terminal chunk, on an
@@ -991,6 +1066,14 @@ struct StreamAccounting {
     /// success in the call log but leaves the caller with a half-written
     /// answer. Without this field the cut is invisible in the journal.
     finish: Option<String>,
+    /// Whether the client asked for tools in this request.
+    had_tools: bool,
+    /// Whether any chunk of this stream carried a tool call.
+    ///
+    /// Latched across the whole stream: the call can arrive in one delta or
+    /// be split over many, and only the accumulated answer says whether the
+    /// agent got an action to run.
+    saw_tool_call: bool,
 }
 
 /// What the stream accounting needs to know about the request besides the
@@ -1000,6 +1083,8 @@ struct StreamRequest {
     request_type: &'static str,
     summary: String,
     prompt_estimate: u32,
+    /// Whether the client asked for tools in this request.
+    had_tools: bool,
 }
 
 impl StreamAccounting {
@@ -1030,6 +1115,8 @@ impl StreamAccounting {
             reasoning_bytes: 0,
             usage_reported: false,
             finish: None,
+            had_tools: request.had_tools,
+            saw_tool_call: false,
         }
     }
 
@@ -1088,6 +1175,17 @@ impl StreamAccounting {
         self.recorded = true;
         self.synthesize_missing_usage();
         let latency_ms = millis_since(self.started);
+        // A stream that ran to its end was seen in full, so "no tool call
+        // arrived" is a fact, not a guess. A stream that broke mid-flight
+        // only knows what it saw before the break — that is `Some(true)` when
+        // a call had already arrived and `None` otherwise.
+        let tool_called = if self.saw_tool_call {
+            Some(true)
+        } else if self.success {
+            Some(false)
+        } else {
+            None
+        };
         if self.success {
             tracing::info!(
                 "completion ok (stream) model={} pt={} ct={} ttft={}ms total={}ms finish={}",
@@ -1128,6 +1226,9 @@ impl StreamAccounting {
                 error_code: (!self.success).then_some("stream_error"),
                 request_type: self.request_type,
                 summary: &self.summary,
+                finish_reason: self.finish.as_deref(),
+                tool_called,
+                had_tools: self.had_tools,
             },
         );
     }
@@ -1169,6 +1270,10 @@ fn stream_response(
     let started = std::time::Instant::now();
     let token = backend::request_token(&request).unwrap_or_default();
     let prompt_estimate = usage_estimate::estimate_prompt_tokens(&request);
+    // Read before the request moves into the backend: the journal needs to
+    // know whether tools were offered, to tell a text-only answer from a
+    // turn that was asked to act.
+    let had_tools = request_had_tools(&request);
     let stream = state.backend.stream(request);
     // A model that degenerates repeats itself until the token cap; the guard
     // stops the stream there instead of passing the loop on.
@@ -1183,6 +1288,7 @@ fn stream_response(
             request_type: "chat",
             summary,
             prompt_estimate,
+            had_tools,
         },
     );
     let mut role_emitted = false;
@@ -1193,6 +1299,9 @@ fn stream_response(
                 // client's wait for the first token, not just the pump's.
                 books.first_token();
                 books.count_output(&chunk);
+                if chunk_has_tool_calls(&chunk) {
+                    books.saw_tool_call = true;
+                }
                 if let Some(usage) = chunk.usage {
                     books.usage = usage;
                     books.usage_reported = true;
@@ -1980,6 +2089,10 @@ async fn responses(
     let summary = request_summary(&request);
     let started = std::time::Instant::now();
     let prompt_estimate = usage_estimate::estimate_prompt_tokens(&request);
+    // Read before the request moves into the backend: the journal needs to
+    // know whether tools were offered, to tell a text-only answer from a
+    // turn that was asked to act.
+    let had_tools = request_had_tools(&request);
     tracing::info!("responses model={model} stream=false");
     match state.backend.complete(request).await {
         Ok(mut response) => {
@@ -2020,6 +2133,15 @@ async fn responses(
                     error_code: None,
                     request_type: "responses",
                     summary: &summary,
+                    finish_reason: response
+                        .choices
+                        .first()
+                        .map(|choice| choice.finish_reason.as_str()),
+                    tool_called: response
+                        .choices
+                        .first()
+                        .map(|choice| choice.message.has_tool_calls()),
+                    had_tools,
                 },
             );
             let mut response_object = chat_to_responses_object(&response);
@@ -2059,6 +2181,9 @@ async fn responses(
                     error_code: Some("upstream_error"),
                     request_type: "responses",
                     summary: &summary,
+                    finish_reason: None,
+                    tool_called: None,
+                    had_tools,
                 },
             );
             error_response(error)
@@ -2351,6 +2476,10 @@ fn responses_stream(
     let started = std::time::Instant::now();
     let token = backend::request_token(&request).unwrap_or_default();
     let prompt_estimate = usage_estimate::estimate_prompt_tokens(&request);
+    // Read before the request moves into the backend: the journal needs to
+    // know whether tools were offered, to tell a text-only answer from a
+    // turn that was asked to act.
+    let had_tools = request_had_tools(&request);
     let stream = state.backend.stream(request);
     // A model that degenerates repeats itself until the token cap; the guard
     // stops the stream there instead of passing the loop on.
@@ -2365,6 +2494,7 @@ fn responses_stream(
             request_type: "responses",
             summary,
             prompt_estimate,
+            had_tools,
         },
     );
 
@@ -2374,6 +2504,9 @@ fn responses_stream(
             Ok(chunk) => {
                 books.first_token();
                 books.count_output(&chunk);
+                if chunk_has_tool_calls(&chunk) {
+                    books.saw_tool_call = true;
+                }
                 if let Some(usage) = chunk.usage {
                     books.usage = usage;
                     books.usage_reported = true;
@@ -4379,6 +4512,182 @@ mod tests {
         assert_eq!(row[6].as_deref(), None, "{calls:?}");
         assert_eq!(row[7].as_deref(), Some("0"), "{calls:?}");
         assert_eq!(row[8].as_deref(), Some("0"), "{calls:?}");
+    }
+
+    /// A backend whose answer carries a tool call — the other half of the
+    /// turn outcome the journal records.
+    struct ToolCallBackend;
+
+    #[async_trait::async_trait]
+    impl ChatBackend for ToolCallBackend {
+        fn name(&self) -> &'static str {
+            "toolcall"
+        }
+
+        async fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                id: ids::completion_id(),
+                object: "chat.completion",
+                created: ids::unix_seconds(),
+                model: request.model.clone(),
+                choices: vec![heterion_router_core::ChatChoice {
+                    index: 0,
+                    message: ChatMessage {
+                        role: "assistant".to_string(),
+                        content: None,
+                        reasoning_content: None,
+                        tool_calls: Some(tool_call_payload()),
+                        tool_call_id: None,
+                        name: None,
+                    },
+                    finish_reason: "tool_calls".to_string(),
+                }],
+                usage: heterion_router_core::Usage {
+                    prompt_tokens: 7,
+                    completion_tokens: 4,
+                    total_tokens: 11,
+                },
+                raw: None,
+            })
+        }
+
+        fn stream(&self, _request: ChatCompletionRequest) -> backend::ChunkStream {
+            Box::pin(futures::stream::once(async {
+                Ok(StreamChunk {
+                    content: None,
+                    reasoning: None,
+                    tool_calls: Some(tool_call_payload()),
+                    finish_reason: Some("tool_calls".to_string()),
+                    usage: None,
+                    usage_detail: None,
+                })
+            }))
+        }
+    }
+
+    /// One OpenAI-shaped tool call, as an upstream would send it.
+    fn tool_call_payload() -> Value {
+        json!([{
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "get_time", "arguments": "{}"},
+        }])
+    }
+
+    /// A turn that was given tools and answered with plain text is the shape
+    /// an agent run stops on. The journal has to be able to say so: a 200
+    /// alone cannot tell it from a turn that did its job.
+    #[tokio::test]
+    async fn a_text_only_answer_on_a_tool_request_is_journalled() {
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        let router = build_router_with_state(AppState::with_db(
+            Arc::new(backend::EchoBackend),
+            db.clone(),
+        ));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "grok-4.6",
+                            "messages": [{"role": "user", "content": "go"}],
+                            "tools": [{"type": "function", "function": {"name": "get_time"}}],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let guard = db.connection();
+        let calls = rows(&guard, "SELECT finish_reason, tool_called FROM call_logs");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0][0].as_deref(), Some("stop"), "{calls:?}");
+        assert_eq!(calls[0][1].as_deref(), Some("0"), "{calls:?}");
+    }
+
+    /// The same fact, on the streaming path: the call may arrive in one delta
+    /// or be split over many, and only the accumulated stream says whether
+    /// the agent got an action to run.
+    #[tokio::test]
+    async fn a_streamed_text_only_answer_on_a_tool_request_is_journalled() {
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        let router = build_router_with_state(AppState::with_db(
+            Arc::new(backend::EchoBackend),
+            db.clone(),
+        ));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "grok-4.6",
+                            "messages": [{"role": "user", "content": "go"}],
+                            "tools": [{"type": "function", "function": {"name": "get_time"}}],
+                            "stream": true,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let guard = db.connection();
+        let calls = rows(&guard, "SELECT finish_reason, tool_called FROM call_logs");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0][0].as_deref(), Some("stop"), "{calls:?}");
+        assert_eq!(calls[0][1].as_deref(), Some("0"), "{calls:?}");
+    }
+
+    /// A turn that did call the tool is not the failure case: the journal
+    /// must say so, or the share of text-only turns cannot be measured.
+    #[tokio::test]
+    async fn a_turn_that_called_a_tool_is_journalled_as_such() {
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        let router =
+            build_router_with_state(AppState::with_db(Arc::new(ToolCallBackend), db.clone()));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "grok-4.6",
+                            "messages": [{"role": "user", "content": "go"}],
+                            "tools": [{"type": "function", "function": {"name": "get_time"}}],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let guard = db.connection();
+        let calls = rows(&guard, "SELECT finish_reason, tool_called FROM call_logs");
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0][0].as_deref(), Some("tool_calls"), "{calls:?}");
+        assert_eq!(calls[0][1].as_deref(), Some("1"), "{calls:?}");
     }
 
     /// `target_format` is read out of the registry, not re-derived.

@@ -164,6 +164,53 @@ fn applied_versions(conn: &Connection) -> Result<HashSet<String>> {
     Ok(versions)
 }
 
+/// Columns the call journal needs on `call_logs` that postdate the 001 base
+/// schema: how the upstream ended the turn (`finish_reason`), whether the
+/// answer carried a tool call (`tool_called`) and whether the request offered
+/// tools at all (`had_tools`).
+///
+/// They are additive and nullable, and they arrive the same way the `combos`
+/// and `api_keys` columns do — as a boot-time convergence step rather than a
+/// ledger migration. A ledger migration cannot do the job: `ALTER TABLE` is
+/// not idempotent in SQLite, and a database that predates `call_logs`
+/// entirely (the Node server never created one) has nothing to alter, so the
+/// statement would abort the whole boot.
+const CALL_LOG_COMPAT_COLUMNS: &[(&str, &str)] = &[
+    ("finish_reason", "TEXT"),
+    ("tool_called", "INTEGER"),
+    ("had_tools", "INTEGER"),
+];
+
+/// Add any [`CALL_LOG_COMPAT_COLUMNS`] the database lacks.
+///
+/// Skips silently when the `call_logs` table does not exist yet (a fresh
+/// database creates it via migration 001). The journal writes both columns on
+/// every row, so the step must run before the first write — it does, on every
+/// boot, before the gateway starts serving.
+fn ensure_call_logs_columns(conn: &Connection) -> Result<()> {
+    let table: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'call_logs'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(DbError::from)?;
+    if table.is_none() {
+        return Ok(());
+    }
+    let mut statement = conn.prepare("PRAGMA table_info(call_logs)")?;
+    let present: HashSet<String> = statement
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<_, _>>()?;
+    for (column, ddl) in CALL_LOG_COMPAT_COLUMNS {
+        if !present.contains(*column) {
+            conn.execute_batch(&format!("ALTER TABLE call_logs ADD COLUMN {column} {ddl}"))?;
+        }
+    }
+    Ok(())
+}
+
 /// Columns the admin API needs on `api_keys` that postdate the 001 base
 /// schema. The JS server adds them through its own migrations; a fresh Rust
 /// database needs them too. All nullable or constant-defaulted, so the
@@ -251,6 +298,7 @@ pub fn migrate(conn: &mut Connection) -> Result<Vec<String>> {
         newly_applied.push(migration.version.to_string());
     }
     ensure_api_keys_columns(conn)?;
+    ensure_call_logs_columns(conn)?;
     Ok(newly_applied)
 }
 
@@ -422,6 +470,53 @@ mod tests {
             .unwrap()
             .collect::<std::result::Result<_, _>>()
             .unwrap()
+    }
+
+    fn call_logs_columns(conn: &rusqlite::Connection) -> HashSet<String> {
+        let mut statement = conn.prepare("PRAGMA table_info(call_logs)").unwrap();
+        statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn fresh_db_gains_call_log_turn_columns() {
+        let db = Db::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let guard = db.connection();
+
+        let columns = call_logs_columns(&guard);
+        assert!(columns.contains("finish_reason"), "finish_reason missing");
+        assert!(columns.contains("tool_called"), "tool_called missing");
+        assert!(columns.contains("had_tools"), "had_tools missing");
+    }
+
+    #[test]
+    fn a_journal_without_the_turn_columns_gains_them_on_boot() {
+        // A database that already keeps a journal but predates the turn
+        // columns: the boot step must add them, or every later write of a
+        // journal row fails on an unknown column.
+        let db = open_pre_adr015_db();
+        {
+            let guard = db.connection();
+            guard
+                .execute_batch("CREATE TABLE call_logs (id TEXT PRIMARY KEY, timestamp TEXT);")
+                .unwrap();
+        }
+
+        let mut guard = db.connection();
+        migrate(&mut guard).unwrap();
+        let columns = call_logs_columns(&guard);
+        assert!(columns.contains("finish_reason"), "finish_reason missing");
+        assert!(columns.contains("tool_called"), "tool_called missing");
+        assert!(columns.contains("had_tools"), "had_tools missing");
+        // The rows that were already there survive the ALTER.
+        let rows: i64 = guard
+            .query_row("SELECT COUNT(*) FROM call_logs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]

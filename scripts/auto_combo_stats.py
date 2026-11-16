@@ -51,19 +51,33 @@ def _where(since: datetime | None, combo_only: bool) -> tuple[str, list]:
     return " AND ".join(clauses), params
 
 
+def _columns(connection: sqlite3.Connection) -> set[str]:
+    """Колонки журнала: у части баз их ещё нет (старый бинарь шлюза)."""
+    return {
+        row[1]
+        for row in connection.execute("PRAGMA table_info(call_logs)").fetchall()
+    }
+
+
 def fetch(since: datetime | None, combo_only: bool) -> list[sqlite3.Row]:
     if not os.path.exists(DB):
         raise SystemExit(f"журнал не найден: {DB}")
     where, params = _where(since, combo_only)
-    sql = (
-        "SELECT timestamp, status, provider, model, requested_model, combo_name, "
-        "combo_step_id, duration, tokens_in, tokens_out, error_summary, error_type, "
-        "detail_state, api_key_name "
-        f"FROM call_logs WHERE {where} ORDER BY timestamp"
-    )
     connection = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     connection.row_factory = sqlite3.Row
     try:
+        # Колонки исхода хода появились не сразу: у базы, которую писал старый
+        # бинарь, их нет — тогда отчёт говорит, что данных нет, а не падает.
+        available = _columns(connection)
+        outcome = [c for c in ("finish_reason", "tool_called", "had_tools") if c in available]
+        outcome_sql = ", " + ", ".join(outcome) if outcome else ""
+        sql = (
+            "SELECT timestamp, status, provider, model, requested_model, combo_name, "
+            "combo_step_id, duration, tokens_in, tokens_out, error_summary, error_type, "
+            "detail_state, api_key_name"
+            f"{outcome_sql} "
+            f"FROM call_logs WHERE {where} ORDER BY timestamp"
+        )
         return connection.execute(sql, params).fetchall()
     finally:
         connection.close()
@@ -107,6 +121,32 @@ def build(rows: list[sqlite3.Row]) -> dict:
         stamp = (row["timestamp"] or "")[:16]
         per_minute[stamp] += 1
 
+    # Исход агентского хода: клиент дал инструменты, модель либо вызвала
+    # инструмент, либо закрыла ход текстом. Текстовый ход на агентском
+    # запросе — это «прогон встал без причины»: именно его доля по моделям
+    # решает, кого понижать в лестнице.
+    turns: dict[str, dict[str, int]] = defaultdict(
+        lambda: {"agent_turns": 0, "tool_called": 0, "text_only": 0, "cut": 0}
+    )
+    for row in rows:
+        keys = row.keys()
+        if "had_tools" not in keys or not row["had_tools"]:
+            continue
+        model = row["model"] or "?"
+        entry = turns[model]
+        entry["agent_turns"] += 1
+        if "tool_called" in keys and row["tool_called"]:
+            entry["tool_called"] += 1
+        elif "finish_reason" in keys and row["finish_reason"] == "length":
+            entry["cut"] += 1
+        else:
+            entry["text_only"] += 1
+    text_only_share = {
+        model: round(100.0 * entry["text_only"] / entry["agent_turns"], 1)
+        for model, entry in turns.items()
+        if entry["agent_turns"]
+    }
+
     # Пиковый параллелизм: сколько вызовов старнули в пределами одной секунды
     # (грубая, но полезная мера «сколько агентов одновременно»).
     per_second = Counter((row["timestamp"] or "")[:19] for row in rows)
@@ -136,6 +176,8 @@ def build(rows: list[sqlite3.Row]) -> dict:
         "error_by_provider": dict(error_by_provider.most_common()),
         "per_minute": dict(sorted(per_minute.items())),
         "peak_calls_per_second": peak_per_second,
+        "turn_outcome": {model: dict(entry) for model, entry in turns.items()},
+        "text_only_share": text_only_share,
     }
 
 
@@ -189,6 +231,30 @@ def render(stats: dict, window_minutes: int) -> str:
         for name, count in stats["by_combo_step"].items():
             add(f"| {name} | {count} |")
         add("")
+
+    add("## Ходы агента: вызов инструмента или текст")
+    add("")
+    if not stats["turn_outcome"]:
+        add(
+            "В журнале нет колонок исхода хода — сборка шлюза старше той, "
+            "которая их пишет."
+        )
+    else:
+        add(
+            "Считаются только ходы, где клиент дал инструменты. "
+            "«Текстом» — ход закрылся ответом без вызова инструмента."
+        )
+        add("")
+        add("| модель | агентских ходов | с вызовом инструмента | текстом | доля текстовых, % |")
+        add("| --- | --- | --- | --- | --- |")
+        for model, entry in sorted(
+            stats["turn_outcome"].items(), key=lambda item: -item[1]["agent_turns"]
+        ):
+            add(
+                f"| {model} | {entry['agent_turns']} | {entry['tool_called']} | "
+                f"{entry['text_only']} | {stats['text_only_share'].get(model, 0.0)} |"
+            )
+    add("")
 
     add("## Ошибки")
     add("")

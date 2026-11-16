@@ -109,6 +109,20 @@ pub struct CallLogRecord {
     pub request_summary: Option<String>,
     /// Ties this row to the log line or trace it came from.
     pub correlation_id: Option<String>,
+    /// Why the upstream ended the turn: `stop`, `length`, `tool_calls`, …
+    ///
+    /// `length` means the answer was cut short; `stop` on a request that
+    /// carried tools means the turn ended with plain text instead of a tool
+    /// call — the shape an agent run stops on.
+    pub finish_reason: Option<String>,
+    /// Whether the answer carried a tool call.
+    pub tool_called: Option<bool>,
+    /// Whether the request offered tools to the upstream.
+    ///
+    /// Without this fact a text-only answer cannot be told apart from an
+    /// ordinary question: `tool_called = 0` alone is what every non-agent
+    /// request looks like.
+    pub had_tools: Option<bool>,
 }
 
 pub fn record_call_log(conn: &Connection, record: &CallLogRecord) -> Result<()> {
@@ -122,13 +136,13 @@ pub fn record_call_log(conn: &Connection, record: &CallLogRecord) -> Result<()> 
             combo_execution_key, error_summary, detail_state, artifact_relpath,
             artifact_size_bytes, artifact_sha256, has_request_body,
             has_response_body, has_pipeline_details, request_summary,
-            correlation_id
+            correlation_id, finish_reason, tool_called, had_tools
         ) VALUES (
             ?1, datetime('now'), ?2, ?3, ?4, ?5, ?6,
             ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
             ?16, COALESCE(?17, 'upstream'), ?18, ?19, ?20, ?21, ?22,
             ?23, ?24, ?25, ?26, COALESCE(?27, 'none'), ?28, ?29,
-            ?30, ?31, ?32, ?33, ?34, ?35
+            ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38
         )",
         params![
             record.id,
@@ -166,6 +180,9 @@ pub fn record_call_log(conn: &Connection, record: &CallLogRecord) -> Result<()> 
             i64::from(record.has_pipeline_details),
             record.request_summary,
             record.correlation_id,
+            record.finish_reason,
+            record.tool_called.map(i64::from),
+            record.had_tools.map(i64::from),
         ],
     )?;
     Ok(())
@@ -497,6 +514,39 @@ mod tests {
                 },
             )
             .unwrap();
+    }
+
+    /// The turn outcome must survive the write: without it the journal cannot
+    /// tell a cut-off answer (`length`) from a text-only turn (`stop`) on a
+    /// request that carried tools.
+    #[test]
+    fn call_log_row_carries_the_turn_outcome() {
+        let db = Db::open_in_memory().unwrap();
+        db.migrate().unwrap();
+        let guard = db.connection();
+
+        record_call_log(
+            &guard,
+            &CallLogRecord {
+                id: "call-turn".to_string(),
+                finish_reason: Some("stop".to_string()),
+                tool_called: Some(false),
+                had_tools: Some(true),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let (finish_reason, tool_called, had_tools): (Option<String>, Option<i64>, Option<i64>) = guard
+            .query_row(
+                "SELECT finish_reason, tool_called, had_tools FROM call_logs WHERE id = 'call-turn'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(finish_reason.as_deref(), Some("stop"));
+        assert_eq!(tool_called, Some(0));
+        assert_eq!(had_tools, Some(1));
     }
 
     /// A zeroed record must still be insertable, and must not paper over the

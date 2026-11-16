@@ -75,6 +75,10 @@ pub async fn messages(
     let summary = request_summary(&request);
     let started = std::time::Instant::now();
     let prompt_estimate = crate::usage_estimate::estimate_prompt_tokens(&request);
+    // Read before the request moves into the backend: the journal needs to
+    // know whether tools were offered, to tell a text-only answer from a
+    // turn that was asked to act.
+    let had_tools = crate::request_had_tools(&request);
     tracing::info!("claude messages model={model} stream=false");
     // A completion the dialect cannot render is an upstream fault, not an
     // answer: it must be booked and reported as a failure, never as an empty
@@ -121,6 +125,15 @@ pub async fn messages(
                     error_code: None,
                     request_type: "messages",
                     summary: &summary,
+                    finish_reason: response
+                        .choices
+                        .first()
+                        .map(|choice| choice.finish_reason.as_str()),
+                    tool_called: response
+                        .choices
+                        .first()
+                        .map(|choice| choice.message.tool_calls.is_some()),
+                    had_tools,
                 },
             );
 
@@ -158,6 +171,9 @@ pub async fn messages(
                     error_code: Some("upstream_error"),
                     request_type: "messages",
                     summary: &summary,
+                    finish_reason: None,
+                    tool_called: None,
+                    had_tools,
                 },
             );
             error_response(error)
@@ -522,6 +538,10 @@ fn claude_stream(
     let token = backend::request_token(&request).unwrap_or_default();
     let started = std::time::Instant::now();
     let prompt_estimate = crate::usage_estimate::estimate_prompt_tokens(&request);
+    // Read before the request moves into the backend: the journal needs to
+    // know whether tools were offered, to tell a text-only answer from a
+    // turn that was asked to act.
+    let had_tools = crate::request_had_tools(&request);
     let stream = state.backend.stream(request);
     // A model that degenerates repeats itself until the token cap; the guard
     // stops the stream there instead of passing the loop on.
@@ -536,6 +556,7 @@ fn claude_stream(
             request_type: "messages",
             summary,
             prompt_estimate,
+            had_tools,
         },
     );
     let mut dialect = ClaudeDialect::new(&model);
@@ -552,6 +573,9 @@ fn claude_stream(
             Step::Chunk(Ok(chunk)) => {
                 books.first_token();
                 books.count_output(&chunk);
+                if crate::chunk_has_tool_calls(&chunk) {
+                    books.saw_tool_call = true;
+                }
                 if let Some(usage) = chunk.usage {
                     books.usage = usage;
                     books.usage_reported = true;
