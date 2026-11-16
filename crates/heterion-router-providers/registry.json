@@ -290,10 +290,6 @@
         "target_format": null
       },
       {
-        "id": "aion-labs/aion-2.5",
-        "target_format": null
-      },
-      {
         "id": "aion-labs/aion-2.0",
         "target_format": null
       },
@@ -579,10 +575,6 @@
     "base_url": "https://api.airforce/v1/chat/completions",
     "models": [
       {
-        "id": "x-ai/grok-3",
-        "target_format": null
-      },
-      {
         "id": "x-ai/grok-2-1212",
         "target_format": null
       },
@@ -592,10 +584,6 @@
       },
       {
         "id": "qwen/qwen3-32b",
-        "target_format": null
-      },
-      {
-        "id": "moonshot/kimi-k2.6",
         "target_format": null
       },
       {
@@ -6118,32 +6106,7 @@
     "executor": "default",
     "auth_type": "apikey",
     "base_url": "https://router.huggingface.co/v1/chat/completions",
-    "models": [
-      {
-        "id": "meta-llama/llama-3.1-8b-instruct",
-        "target_format": null
-      },
-      {
-        "id": "meta-llama/llama-3.2-11b-instruct",
-        "target_format": null
-      },
-      {
-        "id": "mistralai/mistral-7b-instruct",
-        "target_format": null
-      },
-      {
-        "id": "google/gemma-2-9b-it",
-        "target_format": null
-      },
-      {
-        "id": "Qwen/Qwen2.5-7B-Instruct",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-ai/DeepSeek-V3",
-        "target_format": null
-      }
-    ]
+    "models": []
   },
   {
     "id": "hyperagent",
@@ -6536,14 +6499,6 @@
       },
       {
         "id": "openai/gpt-5.6-luna",
-        "target_format": null
-      },
-      {
-        "id": "anthropic/claude-opus-5",
-        "target_format": null
-      },
-      {
-        "id": "anthropic/claude-sonnet-5",
         "target_format": null
       },
       {
@@ -7963,10 +7918,6 @@
     "base_url": "https://ollama.com/v1/chat/completions",
     "models": [
       {
-        "id": "beam",
-        "target_format": null
-      },
-      {
         "id": "glm-5.3",
         "target_format": null
       },
@@ -8024,14 +7975,6 @@
       },
       {
         "id": "mistral-large-3:675b",
-        "target_format": null
-      },
-      {
-        "id": "nemotron-3-ultra",
-        "target_format": null
-      },
-      {
-        "id": "nemotron-3-super",
         "target_format": null
       },
       {
@@ -8644,10 +8587,6 @@
     "auth_type": "apikey",
     "base_url": "https://openrouter.ai/api/v1/chat/completions",
     "models": [
-      {
-        "id": "auto",
-        "target_format": null
-      },
       {
         "id": "stealth/crouton-alpha",
         "target_format": null

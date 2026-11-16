@@ -15,6 +15,30 @@
 use heterion_router_core::content_text;
 use serde_json::{Map, Value, json};
 
+/// Does this value carry a `$ref` key anywhere inside it?
+///
+/// Gemini refuses a tool result that holds one, because it tries to resolve
+/// the pointer against its own declarations and finds no match:
+///
+/// ```text
+/// The referenced name `#/$defs/__schema5` in function_response.response does
+/// not match to a display_name in the function_response.parts.
+/// ```
+///
+/// The pointers come from the tools themselves — an MCP server hands out its
+/// schemas with `$ref`/`$defs` inside — so the tool result often quotes one
+/// back (measured live 2026-11-16, 21 refusals on the Gemini models).
+///
+/// The value of the key does not matter, only its presence: a `$ref` whose
+/// value is plain text is refused the same way (probed live 2026-11-16).
+fn holds_ref(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map.contains_key("$ref") || map.values().any(holds_ref),
+        Value::Array(items) => items.iter().any(holds_ref),
+        _ => false,
+    }
+}
+
 /// Convert an OpenAI chat body into a Gemini `generateContent` body.
 pub fn openai_to_gemini(body: &Value) -> Value {
     let mut contents: Vec<Value> = Vec::new();
@@ -81,7 +105,7 @@ pub fn openai_to_gemini(body: &Value) -> Value {
                         .unwrap_or_else(|| "tool".to_string());
                     let text = content_text(message.get("content"));
                     let response = match serde_json::from_str::<Value>(&text) {
-                        Ok(Value::Object(_)) => serde_json::from_str(&text).unwrap_or(json!(text)),
+                        Ok(value @ Value::Object(_)) if !holds_ref(&value) => value,
                         _ => json!({ "result": text }),
                     };
                     push_turn(
@@ -790,5 +814,86 @@ mod tests {
         let out = openai_to_gemini(&body);
         assert_eq!(out["contents"].as_array().unwrap().len(), 1);
         assert_eq!(out["contents"][0]["parts"].as_array().unwrap().len(), 2);
+    }
+
+    /// A tool result that quotes a `$ref` is passed as text, not as an object:
+    /// Gemini tries to resolve the pointer against its own declarations and
+    /// refuses the request ("The referenced name `#/$defs/__schema5` in
+    /// function_response.response does not match to a display_name in the
+    /// function_response.parts." — measured live 2026-11-16).
+    #[test]
+    fn a_tool_result_with_a_ref_pointer_travels_as_text() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "call"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "t", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1",
+                 "content": "{\"$ref\":\"#/$defs/__schema5\"}"}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "t", "description": "d",
+                "parameters": {"type": "object", "properties": {}}
+            }}]
+        });
+        let out = openai_to_gemini(&body);
+        let response = &out["contents"][2]["parts"][0]["functionResponse"]["response"];
+        // The payload is the text of the tool result, not an object with a
+        // `$ref` key in it.
+        assert!(response.get("$ref").is_none());
+        assert_eq!(
+            response["result"].as_str().unwrap(),
+            "{\"$ref\":\"#/$defs/__schema5\"}"
+        );
+    }
+
+    /// The same refusal happens for a nested pointer and for a `$ref` whose
+    /// value is plain text — the key itself is what Gemini rejects.
+    #[test]
+    fn a_nested_ref_pointer_also_travels_as_text() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "call"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "t", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1",
+                 "content": "{\"outer\":{\"$ref\":\"plain text\"}}"}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "t", "description": "d",
+                "parameters": {"type": "object", "properties": {}}
+            }}]
+        });
+        let out = openai_to_gemini(&body);
+        let response = &out["contents"][2]["parts"][0]["functionResponse"]["response"];
+        assert!(response.get("outer").is_none());
+        assert!(response["result"].is_string());
+    }
+
+    /// A tool result without a pointer keeps its object shape — the fix must
+    /// not flatten every result into text.
+    #[test]
+    fn a_tool_result_without_a_ref_keeps_its_object_shape() {
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "call"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "t", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "{\"ok\":true}"}
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "t", "description": "d",
+                "parameters": {"type": "object", "properties": {}}
+            }}]
+        });
+        let out = openai_to_gemini(&body);
+        let response = &out["contents"][2]["parts"][0]["functionResponse"]["response"];
+        assert_eq!(response["ok"], json!(true));
     }
 }

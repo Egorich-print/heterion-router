@@ -25,6 +25,11 @@ pub fn allowed_efforts(provider: &str) -> Option<&'static [&'static str]> {
         // 2026-11-16: "Invalid option: expected one of none|minimal|low|
         // medium|high|xhigh").
         "oneminai" => Some(&["none", "minimal", "low", "medium", "high", "xhigh"]),
+        // pollinations passes the body to an OpenAI-shaped deserializer that
+        // knows five levels only (measured live 2026-11-16: "reasoning_effort:
+        // unknown variant `max`, expected one of `none`, `high`, `medium`,
+        // `low`, `minimal`" — 114 refusals).
+        "pollinations" => Some(&["none", "minimal", "low", "medium", "high"]),
         _ => None,
     }
 }
@@ -101,6 +106,40 @@ pub fn max_prompt_tokens(provider: &str) -> Option<u32> {
     }
 }
 
+/// The largest number of messages a provider's API accepts in one request.
+///
+/// typhoon answers `422 {"detail":[{"type":"too_long","loc":["body",
+/// "messages"],"msg":"List should have at most 50 items after validation, not
+/// 69"}]}` — the platform validates the history length itself and refuses the
+/// whole request (measured live 2026-11-16, 7 refusals in ten minutes of the
+/// agent run).
+///
+/// The history is cut, not the request refused: the conversation keeps its
+/// oldest turn and the platform gets a list it can validate. A cut history is
+/// a smaller ask than a failed request.
+pub fn max_messages(provider: &str) -> Option<usize> {
+    match provider {
+        "typhoon" => Some(50),
+        _ => None,
+    }
+}
+
+/// Whether the platform's schema wants the message content as plain text.
+///
+/// Cloudflare Workers AI validates the body against its own schema before the
+/// model sees it, and answers `400 AiError: Bad input: Error: oneOf at '/' not
+/// met, 0 matches: ... Type mismatch of '/messages/0/content', 'array' not in
+/// 'string'` — a content array of parts is not a string there, and the schema
+/// wants one shape for the whole list (measured live 2026-11-16, 326 refusals
+/// across the `@cf/*` models).
+///
+/// The same answer names the second half of the rule: `required properties at
+/// '/messages/5' are 'role,content'` — a turn without content (an assistant
+/// turn that carries only tool calls) must still have the field.
+pub fn wants_string_content(provider: &str) -> bool {
+    provider == "cloudflare-ai"
+}
+
 /// The reasoning levels OpenAI's surface knows, from the weakest to the
 /// strongest.
 ///
@@ -150,10 +189,12 @@ pub fn clamp_effort(requested: Option<&str>, allowed: &[&str]) -> Option<String>
 mod tests {
     use super::allowed_efforts;
     use super::clamp_effort;
+    use super::max_messages;
     use super::max_output_tokens;
     use super::max_prompt_tokens;
     use super::rejects_reasoning_content;
     use super::rejects_reasoning_effort_field;
+    use super::wants_string_content;
 
     /// groq accepts three levels; a stronger request is pulled down to the
     /// strongest of them.
@@ -204,7 +245,36 @@ mod tests {
     #[test]
     fn a_provider_without_a_set_is_not_touched() {
         assert!(allowed_efforts("gemini").is_none());
-        assert!(allowed_efforts("pollinations").is_none());
+        assert!(allowed_efforts("kilocode").is_none());
+    }
+
+    /// pollinations knows five levels: none, minimal, low, medium, high.
+    /// A stronger request is pulled down to the strongest of them.
+    #[test]
+    fn pollinations_knows_five_levels() {
+        let allowed = allowed_efforts("pollinations").expect("pollinations has its own set");
+        assert_eq!(clamp_effort(Some("max"), allowed).as_deref(), Some("high"));
+        assert_eq!(
+            clamp_effort(Some("xhigh"), allowed).as_deref(),
+            Some("high")
+        );
+        assert_eq!(clamp_effort(Some("low"), allowed).as_deref(), Some("low"));
+        assert_eq!(clamp_effort(Some("none"), allowed).as_deref(), Some("none"));
+    }
+
+    /// typhoon validates the length of the history itself.
+    #[test]
+    fn typhoon_takes_at_most_fifty_messages() {
+        assert_eq!(max_messages("typhoon"), Some(50));
+        assert_eq!(max_messages("gemini"), None);
+    }
+
+    /// Cloudflare's schema wants plain text in the content field.
+    #[test]
+    fn cloudflare_wants_plain_text() {
+        assert!(wants_string_content("cloudflare-ai"));
+        assert!(!wants_string_content("gemini"));
+        assert!(!wants_string_content("pollinations"));
     }
 
     /// groq refuses the field outright for its Qwen3.8 models.

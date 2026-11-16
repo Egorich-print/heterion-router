@@ -420,6 +420,39 @@ fn attempt(
             message.reasoning_content = None;
         }
     }
+    // Cloudflare Workers AI validates the body against its own schema: a
+    // content array of parts is not a string there ("Type mismatch of
+    // '/messages/0/content', 'array' not in 'string'"), and a turn without
+    // content is refused outright ("required properties at '/messages/5' are
+    // 'role,content'" — probed live 2026-11-16, 326 refusals).
+    //
+    // The parts are joined into the text they carry, and a turn that has no
+    // text at all (an assistant turn with tool calls only) gets an empty
+    // string — the field has to be there.
+    if crate::provider_caps::wants_string_content(provider) {
+        for message in &mut attempt.messages {
+            let as_array = message
+                .content
+                .as_ref()
+                .is_some_and(|content| content.is_array());
+            if as_array {
+                let text = heterion_router_core::content_text(message.content.as_ref());
+                message.content = Some(serde_json::Value::String(text));
+            } else if message.content.is_none() {
+                message.content = Some(serde_json::Value::String(String::new()));
+            }
+        }
+    }
+    // Some platforms validate the length of the history themselves ("List
+    // should have at most 50 items after validation, not 69" — probed live
+    // 2026-11-16 on typhoon). The oldest turns go first: the recent context
+    // is what the model needs, and the request is served instead of refused.
+    if let Some(cap) = crate::provider_caps::max_messages(provider)
+        && attempt.messages.len() > cap
+    {
+        let cut = attempt.messages.len() - cap;
+        attempt.messages.drain(0..cut);
+    }
     // The output budget the platform publishes (probed live 2026-11-16 on
     // typhoon and oneminai).
     if let Some(cap) = crate::provider_caps::max_output_tokens(provider, model) {
@@ -643,6 +676,71 @@ mod attempt_tests {
         // A provider without a published cap keeps the client's budget.
         let gemini = attempt(&request, "gemini", "gemini-3.5-flash", None);
         assert_eq!(gemini.max_tokens, Some(64_000));
+    }
+
+    /// Cloudflare validates the body against its own schema: a content array
+    /// is not a string there, and a turn without content is refused outright
+    /// (probed live 2026-11-16).
+    #[test]
+    fn attempt_writes_cloudflare_content_as_plain_text() {
+        let request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages: vec![
+                ChatMessage::plain("user", "hello"),
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: Some(serde_json::json!([
+                        {"type": "text", "text": "part one"},
+                        {"type": "text", "text": "part two"}
+                    ])),
+                    reasoning_content: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                },
+                ChatMessage {
+                    role: "assistant".into(),
+                    content: None,
+                    reasoning_content: None,
+                    tool_calls: Some(serde_json::json!([{"id": "c1"}])),
+                    tool_call_id: None,
+                    name: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let out = attempt(&request, "cloudflare-ai", "@cf/openai/gpt-oss-120b", None);
+        // The parts are joined into the text they carry.
+        assert_eq!(
+            out.messages[1].content,
+            Some(serde_json::json!("part onepart two"))
+        );
+        // A turn without content still has the field — the schema wants it.
+        assert_eq!(out.messages[2].content, Some(serde_json::json!("")));
+        // Another provider keeps the parts as they were sent.
+        let gemini = attempt(&request, "gemini", "gemini-3.5-flash", None);
+        assert!(gemini.messages[1].content.as_ref().unwrap().is_array());
+    }
+
+    /// typhoon validates the length of the history itself ("List should have
+    /// at most 50 items after validation, not 69" — probed live 2026-11-16).
+    #[test]
+    fn attempt_cuts_the_history_to_what_the_provider_accepts() {
+        let messages: Vec<ChatMessage> = (0..69)
+            .map(|index| ChatMessage::plain("user", format!("turn {index}")))
+            .collect();
+        let request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages,
+            ..Default::default()
+        };
+        let out = attempt(&request, "typhoon", "typhoon-v2.5-30b-a3b-instruct", None);
+        assert_eq!(out.messages.len(), 50);
+        // The oldest turns go first: the recent context stays.
+        assert_eq!(out.messages[49].content, Some(serde_json::json!("turn 68")));
+        // A provider without a limit keeps the whole history.
+        let gemini = attempt(&request, "gemini", "gemini-3.5-flash", None);
+        assert_eq!(gemini.messages.len(), 69);
     }
 }
 

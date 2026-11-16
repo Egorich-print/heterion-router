@@ -120,6 +120,9 @@ Toolchain закреплён `1.99.1` в `rust-toolchain.toml`, `rust-version = 
     `low`/`medium`/`high` (400 «must be one of …») — сильный запрос
     (`xhigh`, `max`) опускается до сильнейшего допустимого, слабый
     поднимается до слабейшего, незнакомое значение — поле убирается;
+    oneminai знает всё до `xhigh`, но не `max`; pollinations — только
+    `none`/`minimal`/`low`/`medium`/`high» (400 «unknown variant `max`»,
+    114 отказов);
   - `reasoning_effort` **убирается совсем**, если площадка не принимает
     поле: groq для Qwen3.8 (400 «invalid Qwen3.8 reasoning_effort»);
   - `reasoning_content` в истории **вычищается**: groq (400 «property
@@ -130,12 +133,32 @@ Toolchain закреплён `1.99.1` в `rust-toolchain.toml`, `rust-version = 
     16384 (400 «must be at most 16384»), oneminai 32768, а у
     `sealion/aisingapore/Qwen-SEA-LION-v4-32B-IT` — 32000 (400 «cannot be
     greater than max_model_len=32000»); у соседней 27B-модели тот же
-    бюджет проходит;
+    бюджет проходит; у groq/Qwen3.8 — свой потолок 16384;
+  - **потолок промпта**: groq (413 «Request too large … TPM: Limit 8000») —
+    кандидат с промптом выше потолка площадки **не вызывается вовсе**,
+    лестница идёт дальше: отказ заведомый, платить за него незачем;
+  - **потолок числа сообщений**: typhoon (422 «List should have at most 50
+    items after validation, not 69») — самые старые ходы уходят, запрос
+    обслуживается вместо отказа;
+  - **форма тела** по площадке: cloudflare-ai валидирует тело по своей
+    схеме — `content` должен быть строкой, а не массивом частей (400
+    «Type mismatch of '/messages/0/content', 'array' not in 'string'»), и
+    у каждого хода должно быть поле `content` (400 «required properties
+    at '/messages/5' are 'role,content'»);
   - роль `developer` переименовывается в `system` для провайдеров, которые
     её отвергают (`developer_role.rs`): Mistral (422 `union_tag_invalid`),
     mixlayer (400 «unknown variant 'developer'»).
   Правило «только по измеренным отказам»: новый провайдер в списки не
   добавляется без живого замера.
+- **Результат инструмента с `$ref` уходит в Gemini текстом, а не объектом**
+  (`gemini_request.rs`): Gemini резолвит указатель по своим объявлениям и
+  отказывает — «The referenced name `#/$defs/__schema5` in
+  function_response.response does not match to a display_name in the
+  function_response.parts» (21 отказ, 16.11.2026). Указатели приходят из
+  самих MCP-схем, поэтому результат инструмента их цитирует. Значение
+  `$ref` не важно — важен сам ключ (проверено: `$ref` с текстом вместо
+  ссылки отвергается так же). Остальные результаты сохраняют объектную
+  форму.
 - Картинка в запросе **не должна исчезать на переводе**: OpenAI→Gemini
   (`gemini_request.rs`) кладёт `image_url` c data-URL в `inlineData`. Gemini не
   умеет забирать картинку по URL — `fileData` с https отвергается («Cannot fetch
@@ -498,6 +521,20 @@ drag-головоломку перед OAuth; это шаг оператора (
     параллелизма), `aion`/`cloudflare-ai`/`gemini` (дневные квоты сбрасываются),
     `mistral`, `sealion/…-32B`, `typhoon`, `oneminai`, `mixlayer` — их отказы
     чинятся правкой параметров (ниже).
+- **Третья волна чистки — тот же прогон, журнал до 22:15 UTC:**
+  - модели, которых площадка не знает (404/400, успехов ноль): `aion` —
+    `aion-labs/aion-2.5` («Unknown model»); `huggingface` — пять id, которых
+    нет в каталоге площадки (`meta-llama/llama-3.1-8b-instruct` — в каталоге
+    `meta-llama/Llama-3.1-8B-Instruct`, регистр другой; `llama-3.2-11b-instruct`,
+    `mistral-7b-instruct`, `gemma-2-9b-it`, `Qwen2.5-7B-Instruct` — таких id
+    на площадке нет вовсе);
+  - модели, за которые платить нельзя (402, успехов ноль, ADR-026):
+    `huggingface/deepseek-ai/DeepSeek-V3` («Purchase pre-paid credits»),
+    `ollama-cloud` — `beam`, `nemotron-3-super`, `nemotron-3-ultra`,
+    `kilocode` — `anthropic/claude-opus-5`, `anthropic/claude-sonnet-5`,
+    `api-airforce` — `x-ai/grok-3`, `moonshot/kimi-k2.6`,
+    `openrouter/auto`.
+  Итог: 276 провайдеров, 2291 модель (было 2329).
 
 **`base_url` может нести плейсхолдер `{env:ИМЯ}`** — например Cloudflare
 Workers AI требует `account_id` в пути, а он принадлежит аккаунту оператора,
@@ -547,6 +584,16 @@ Workers AI требует `account_id` в пути, а он принадлежи
 из capability-таблицы (`model_capabilities` + `model_capability_overrides`),
 а измеренный контекст (`model_context_overrides.real_context`) побеждает
 объявленный.
+
+**Capability-таблица — снимок на старте шлюза** (`main.rs` → `CapabilityStore::load`):
+измеренное окно, записанное в `model_context_overrides` после старта процесса,
+лестница не увидит до рестарта. Пример из прогона 2026-11-16: у
+`sealion/aisingapore/Qwen-SEA-LION-v4-32B-IT` реальное окно 32000 токенов
+(`real_context`, `live:2026-11-16`), а в `model_capabilities.limit_context`
+стояло 32768 — и пока шлюз работал со старым снимком, запрос уходил с
+`max_completion_tokens=32000` при промпте в 110 761 символ и площадка отвечала
+`400 ContextWindowExceededError`. Запись в override сделали в 20:10 UTC, шлюз
+подняли в 20:04 UTC — окно подхватилось бы только с рестартом.
 
 - **Класс лестницы** (`frontier` / `fast` / `fallback`) лежит в
   `model_capability_overrides` под ключом `tier`: площадка не сообщает, насколько
