@@ -988,8 +988,53 @@ fn record_completion_usage(state: &AppState, auth: &Authenticated, context: Comp
         tool_called,
         had_tools: Some(had_tools),
     };
-    if let Err(error) = record_call_log(&guard, &call) {
-        tracing::warn!("call log record failed: {error}");
+    // One row per upstream call. A request that failed inside a failover
+    // plan leaves a row for every call that refused — the request-outcome row
+    // names only the last attempt, so the earlier refusals would be invisible.
+    // A request that succeeded keeps the row for the winner as well: that
+    // call happened too.
+    let failed = state.backend.failed_attempts(token);
+    let mut rows: Vec<CallLogRecord> = failed
+        .iter()
+        .map(|attempt| {
+            let mut row = call.clone();
+            row.id = ids::call_id();
+            row.correlation_id = Some(row.id.clone());
+            row.status = i64::from(attempt.status);
+            row.model = Some(attempt.model.clone());
+            row.provider = Some(attempt.provider.clone());
+            // The connection the refused call went through, not the one that
+            // answered the request.
+            row.connection_id = attempt.connection_id.clone();
+            row.duration = attempt.duration_ms;
+            // The failed call reported no tokens of its own.
+            row.tokens_in = 0;
+            row.tokens_out = 0;
+            row.tokens_cache_read = Some(0);
+            row.tokens_cache_creation = Some(0);
+            row.tokens_reasoning = Some(0);
+            // A call that never produced an answer has no turn outcome.
+            row.finish_reason = None;
+            row.tool_called = None;
+            // What the refusal said, verbatim.
+            row.error_summary = attempt.error.clone();
+            // The format of the provider that refused, not of the one that
+            // answered the request.
+            let mut attempt_attribution = attribution.clone();
+            attempt_attribution.provider = Some(attempt.provider.clone());
+            row.target_format = target_format(state, &attempt_attribution, &attempt.model);
+            row
+        })
+        .collect();
+    // The winner's row, or the summary of a failure that never reached an
+    // upstream (unknown model, every candidate in cooldown).
+    if success || failed.is_empty() {
+        rows.push(call);
+    }
+    for row in rows {
+        if let Err(error) = record_call_log(&guard, &row) {
+            tracing::warn!("call log record failed: {error}");
+        }
     }
 }
 
@@ -3649,6 +3694,461 @@ mod tests {
         assert_eq!(calls[0][1].as_deref(), Some("dual"), "{calls:?}");
         assert_eq!(calls[0][2].as_deref(), Some("dual"), "{calls:?}");
         assert_eq!(calls[0][3].as_deref(), Some("grok-4.6"), "{calls:?}");
+    }
+
+    /// A provider that refuses every request with a 429.
+    ///
+    /// The shape of a platform that runs out of quota: the request must move
+    /// on to the next candidate, and the refusal must leave a trace.
+    #[derive(Clone)]
+    struct RefusingBackend {
+        provider: &'static str,
+        connection: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl backend::ChatBackend for RefusingBackend {
+        fn name(&self) -> &'static str {
+            "provider"
+        }
+
+        fn attribution(&self, _token: &str) -> backend::Attribution {
+            backend::Attribution {
+                provider: Some(self.provider.to_string()),
+                connection_id: Some(self.connection.to_string()),
+                combo_name: None,
+                tokens_compressed: None,
+                model: None,
+            }
+        }
+
+        async fn complete(
+            &self,
+            _request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Err(GatewayError::Upstream(
+                "upstream status 429: rate limited".to_string(),
+            ))
+        }
+
+        fn stream(&self, _request: ChatCompletionRequest) -> backend::ChunkStream {
+            Box::pin(futures::stream::once(async {
+                Err(GatewayError::Upstream(
+                    "upstream status 429: rate limited".to_string(),
+                ))
+            }))
+        }
+    }
+
+    /// A failover over a refusing provider leaves a row for the refusal.
+    ///
+    /// The request-outcome row names only the winner, so without a row of
+    /// its own the refusal would be invisible in the journal — and "which
+    /// provider ran out of quota" is exactly the question the journal exists
+    /// to answer.
+    #[tokio::test]
+    async fn a_refused_candidate_leaves_its_own_journal_row() {
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        {
+            let guard = db.connection();
+            heterion_router_db::repos::upsert_combo(
+                &guard,
+                &heterion_router_db::repos::ComboRow {
+                    id: "c-fail".to_string(),
+                    name: "dual-fail".to_string(),
+                    data: json!({
+                        "strategy": "priority",
+                        "models": [
+                            {"kind": "model", "model": "refuser/grok-4.6",
+                             "providerId": "refuser"},
+                            {"kind": "model", "model": "heterion-local/grok-4.6",
+                             "providerId": "heterion-local"},
+                        ],
+                    })
+                    .to_string(),
+                    sort_order: 0,
+                    active: true,
+                },
+            )
+            .unwrap();
+        }
+        let mut backends: HashMap<String, Arc<dyn backend::ChatBackend>> = HashMap::new();
+        backends.insert(
+            "refuser".to_string(),
+            Arc::new(RefusingBackend {
+                provider: "refuser",
+                connection: "conn-refuser",
+            }),
+        );
+        backends.insert(
+            "heterion-local".to_string(),
+            Arc::new(AttributedBackend {
+                provider: "heterion-local",
+                connection: "conn-heterion-local",
+            }),
+        );
+        let routing = Arc::new(
+            routing::RoutingBackend::new(backends, Planner::new(vec![], vec![]))
+                .with_combo_source(db.clone(), Arc::new(ProviderRegistry::load())),
+        );
+        let router = build_router_with_state(AppState::with_db(routing, db.clone()));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "dual-fail",
+                               "messages": [{"role": "user", "content": "hi"}]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let guard = db.connection();
+        let calls = rows(
+            &guard,
+            "SELECT provider, model, status, combo_name FROM call_logs ORDER BY rowid",
+        );
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        // The refusal first, with the status the upstream gave.
+        assert_eq!(calls[0][0].as_deref(), Some("refuser"), "{calls:?}");
+        assert_eq!(calls[0][1].as_deref(), Some("grok-4.6"), "{calls:?}");
+        assert_eq!(calls[0][2].as_deref(), Some("429"), "{calls:?}");
+        assert_eq!(calls[0][3].as_deref(), Some("dual-fail"), "{calls:?}");
+        // And the call that answered.
+        assert_eq!(calls[1][0].as_deref(), Some("heterion-local"), "{calls:?}");
+        assert_eq!(calls[1][2].as_deref(), Some("200"), "{calls:?}");
+    }
+
+    /// A provider that answers 200 with a tool call it never made.
+    ///
+    /// The post-flight tool validation rejects the answer and the router
+    /// moves on — the upstream call happened, so the journal has to show it.
+    #[derive(Clone)]
+    struct EmptyToolCallBackend {
+        provider: &'static str,
+        connection: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl backend::ChatBackend for EmptyToolCallBackend {
+        fn name(&self) -> &'static str {
+            "provider"
+        }
+
+        fn attribution(&self, _token: &str) -> backend::Attribution {
+            backend::Attribution {
+                provider: Some(self.provider.to_string()),
+                connection_id: Some(self.connection.to_string()),
+                combo_name: None,
+                tokens_compressed: None,
+                model: None,
+            }
+        }
+
+        async fn complete(
+            &self,
+            request: ChatCompletionRequest,
+        ) -> Result<ChatCompletionResponse, GatewayError> {
+            Ok(ChatCompletionResponse {
+                id: ids::completion_id(),
+                object: "chat.completion",
+                created: ids::unix_seconds(),
+                model: request.model.clone(),
+                choices: vec![heterion_router_core::ChatChoice {
+                    index: 0,
+                    message: ChatMessage::plain("assistant".to_string(), "ok".to_string()),
+                    finish_reason: "tool_calls".to_string(),
+                }],
+                usage: heterion_router_core::Usage {
+                    prompt_tokens: 7,
+                    completion_tokens: 4,
+                    total_tokens: 11,
+                },
+                raw: None,
+            })
+        }
+
+        fn stream(&self, _request: ChatCompletionRequest) -> backend::ChunkStream {
+            Box::pin(futures::stream::once(async {
+                Ok(StreamChunk::done("stop"))
+            }))
+        }
+    }
+
+    /// A request that fails everywhere leaves one row per refusal — and no
+    /// extra summary row.
+    ///
+    /// The summary row would name the last attempt again, so the journal
+    /// would count one upstream call twice.
+    #[tokio::test]
+    async fn a_request_that_fails_everywhere_leaves_one_row_per_refusal() {
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        {
+            let guard = db.connection();
+            heterion_router_db::repos::upsert_combo(
+                &guard,
+                &heterion_router_db::repos::ComboRow {
+                    id: "c-all-fail".to_string(),
+                    name: "all-fail".to_string(),
+                    data: json!({
+                        "strategy": "priority",
+                        "models": [
+                            {"kind": "model", "model": "refuser-a/grok-4.6",
+                             "providerId": "refuser-a"},
+                            {"kind": "model", "model": "refuser-b/grok-4.6",
+                             "providerId": "refuser-b"},
+                        ],
+                    })
+                    .to_string(),
+                    sort_order: 0,
+                    active: true,
+                },
+            )
+            .unwrap();
+        }
+        let mut backends: HashMap<String, Arc<dyn backend::ChatBackend>> = HashMap::new();
+        for provider in ["refuser-a", "refuser-b"] {
+            backends.insert(
+                provider.to_string(),
+                Arc::new(RefusingBackend {
+                    provider,
+                    connection: "conn-refuser",
+                }),
+            );
+        }
+        let routing = Arc::new(
+            routing::RoutingBackend::new(backends, Planner::new(vec![], vec![]))
+                .with_combo_source(db.clone(), Arc::new(ProviderRegistry::load())),
+        );
+        let router = build_router_with_state(AppState::with_db(routing, db.clone()));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "all-fail",
+                               "messages": [{"role": "user", "content": "hi"}]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(!response.status().is_success(), "{:?}", response.status());
+
+        let guard = db.connection();
+        let calls = rows(
+            &guard,
+            "SELECT provider, status, error_summary FROM call_logs ORDER BY rowid",
+        );
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0][0].as_deref(), Some("refuser-a"), "{calls:?}");
+        assert_eq!(calls[1][0].as_deref(), Some("refuser-b"), "{calls:?}");
+        // Each refusal says what it was.
+        assert!(
+            calls[0][2]
+                .as_deref()
+                .is_some_and(|summary| summary.contains("429")),
+            "{calls:?}"
+        );
+    }
+
+    /// A candidate rejected by the post-flight tool validation leaves a row
+    /// of its own.
+    ///
+    /// The upstream answered 200 and the router threw the answer away: the
+    /// call happened, and "which candidate kept promising a tool call and
+    /// never made one" is exactly what the journal must show.
+    #[tokio::test]
+    async fn a_candidate_failed_by_tool_validation_leaves_its_own_journal_row() {
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        {
+            let guard = db.connection();
+            heterion_router_db::repos::upsert_combo(
+                &guard,
+                &heterion_router_db::repos::ComboRow {
+                    id: "c-tool-fail".to_string(),
+                    name: "tool-fail".to_string(),
+                    data: json!({
+                        "strategy": "priority",
+                        "models": [
+                            {"kind": "model", "model": "empty-tools/grok-4.6",
+                             "providerId": "empty-tools"},
+                            {"kind": "model", "model": "heterion-local/grok-4.6",
+                             "providerId": "heterion-local"},
+                        ],
+                    })
+                    .to_string(),
+                    sort_order: 0,
+                    active: true,
+                },
+            )
+            .unwrap();
+        }
+        let mut backends: HashMap<String, Arc<dyn backend::ChatBackend>> = HashMap::new();
+        backends.insert(
+            "empty-tools".to_string(),
+            Arc::new(EmptyToolCallBackend {
+                provider: "empty-tools",
+                connection: "conn-empty-tools",
+            }),
+        );
+        backends.insert(
+            "heterion-local".to_string(),
+            Arc::new(AttributedBackend {
+                provider: "heterion-local",
+                connection: "conn-heterion-local",
+            }),
+        );
+        let routing = Arc::new(
+            routing::RoutingBackend::new(backends, Planner::new(vec![], vec![]))
+                .with_combo_source(db.clone(), Arc::new(ProviderRegistry::load())),
+        );
+        let router = build_router_with_state(AppState::with_db(routing, db.clone()));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "tool-fail",
+                            "messages": [{"role": "user", "content": "hi"}],
+                            "tools": [{"type": "function",
+                                       "function": {"name": "probe",
+                                                    "description": "probe",
+                                                    "parameters": {"type": "object",
+                                                                   "properties": {}}}}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let guard = db.connection();
+        let calls = rows(
+            &guard,
+            "SELECT provider, status, error_summary FROM call_logs ORDER BY rowid",
+        );
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0][0].as_deref(), Some("empty-tools"), "{calls:?}");
+        // The upstream answered 200, so the client-facing status of the
+        // rejected candidate is a gateway failure, not a success.
+        assert_eq!(calls[0][1].as_deref(), Some("502"), "{calls:?}");
+        assert!(
+            calls[0][2]
+                .as_deref()
+                .is_some_and(|summary| summary.contains("tool validation failed")),
+            "{calls:?}"
+        );
+        // And the call that answered.
+        assert_eq!(calls[1][0].as_deref(), Some("heterion-local"), "{calls:?}");
+        assert_eq!(calls[1][1].as_deref(), Some("200"), "{calls:?}");
+    }
+
+    /// A refused candidate in a streamed request leaves a row of its own.
+    ///
+    /// The streaming path is a separate code path with its own failover loop:
+    /// a rule that only holds for the non-streaming one would leave every
+    /// agent run (which streams) without the refusal it actually met.
+    #[tokio::test]
+    async fn a_refused_candidate_in_a_stream_leaves_its_own_journal_row() {
+        let db = Arc::new(heterion_router_db::Db::open_in_memory().unwrap());
+        db.migrate().unwrap();
+        {
+            let guard = db.connection();
+            heterion_router_db::repos::upsert_combo(
+                &guard,
+                &heterion_router_db::repos::ComboRow {
+                    id: "c-stream-fail".to_string(),
+                    name: "stream-fail".to_string(),
+                    data: json!({
+                        "strategy": "priority",
+                        "models": [
+                            {"kind": "model", "model": "refuser/grok-4.6",
+                             "providerId": "refuser"},
+                            {"kind": "model", "model": "heterion-local/grok-4.6",
+                             "providerId": "heterion-local"},
+                        ],
+                    })
+                    .to_string(),
+                    sort_order: 0,
+                    active: true,
+                },
+            )
+            .unwrap();
+        }
+        let mut backends: HashMap<String, Arc<dyn backend::ChatBackend>> = HashMap::new();
+        backends.insert(
+            "refuser".to_string(),
+            Arc::new(RefusingBackend {
+                provider: "refuser",
+                connection: "conn-refuser",
+            }),
+        );
+        backends.insert(
+            "heterion-local".to_string(),
+            Arc::new(AttributedBackend {
+                provider: "heterion-local",
+                connection: "conn-heterion-local",
+            }),
+        );
+        let routing = Arc::new(
+            routing::RoutingBackend::new(backends, Planner::new(vec![], vec![]))
+                .with_combo_source(db.clone(), Arc::new(ProviderRegistry::load())),
+        );
+        let router = build_router_with_state(AppState::with_db(routing, db.clone()));
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/chat/completions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"model": "stream-fail",
+                               "stream": true,
+                               "messages": [{"role": "user", "content": "hi"}]})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // The body is the stream; drain it so the handler reaches its end and
+        // books the calls.
+        let body = response.into_body();
+        let _ = axum::body::to_bytes(body, 1 << 20).await.unwrap();
+
+        let guard = db.connection();
+        let calls = rows(
+            &guard,
+            "SELECT provider, status FROM call_logs ORDER BY rowid",
+        );
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0][0].as_deref(), Some("refuser"), "{calls:?}");
+        assert_eq!(calls[0][1].as_deref(), Some("429"), "{calls:?}");
+        assert_eq!(calls[1][0].as_deref(), Some("heterion-local"), "{calls:?}");
+        assert_eq!(calls[1][1].as_deref(), Some("200"), "{calls:?}");
     }
 
     #[tokio::test]

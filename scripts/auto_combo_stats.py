@@ -59,7 +59,12 @@ def _columns(connection: sqlite3.Connection) -> set[str]:
     }
 
 
-def fetch(since: datetime | None, combo_only: bool) -> list[sqlite3.Row]:
+def fetch(since: datetime | None, combo_only: bool) -> tuple[list[sqlite3.Row], bool]:
+    """Строки журнала и признак «колонки исхода хода в базе есть».
+
+    Признак возвращается отдельно от строк: пустое окно не должно читаться
+    как «старый бинарь».
+    """
     if not os.path.exists(DB):
         raise SystemExit(f"журнал не найден: {DB}")
     where, params = _where(since, combo_only)
@@ -78,7 +83,7 @@ def fetch(since: datetime | None, combo_only: bool) -> list[sqlite3.Row]:
             f"{outcome_sql} "
             f"FROM call_logs WHERE {where} ORDER BY timestamp"
         )
-        return connection.execute(sql, params).fetchall()
+        return connection.execute(sql, params).fetchall(), bool(outcome)
     finally:
         connection.close()
 
@@ -91,7 +96,7 @@ def percentile(values: list[float], share: float) -> float:
     return float(ordered[index])
 
 
-def build(rows: list[sqlite3.Row]) -> dict:
+def build(rows: list[sqlite3.Row], outcome_columns: bool | None = None) -> dict:
     total = len(rows)
     ok = [r for r in rows if (r["status"] or 0) < 400]
     failed = [r for r in rows if (r["status"] or 0) >= 400]
@@ -147,6 +152,11 @@ def build(rows: list[sqlite3.Row]) -> dict:
         if entry["agent_turns"]
     }
 
+    # Есть ли в базе колонки исхода хода. Пустое окно и старый бинарь — разные
+    # причины, и отчёт обязан их различать.
+    if outcome_columns is None:
+        outcome_columns = any("had_tools" in row.keys() for row in rows)
+
     # Пиковый параллелизм: сколько вызовов старнули в пределами одной секунды
     # (грубая, но полезная мера «сколько агентов одновременно»).
     per_second = Counter((row["timestamp"] or "")[:19] for row in rows)
@@ -178,6 +188,7 @@ def build(rows: list[sqlite3.Row]) -> dict:
         "peak_calls_per_second": peak_per_second,
         "turn_outcome": {model: dict(entry) for model, entry in turns.items()},
         "text_only_share": text_only_share,
+        "outcome_columns": outcome_columns,
     }
 
 
@@ -234,11 +245,15 @@ def render(stats: dict, window_minutes: int) -> str:
 
     add("## Ходы агента: вызов инструмента или текст")
     add("")
-    if not stats["turn_outcome"]:
+    if not stats["outcome_columns"]:
         add(
             "В журнале нет колонок исхода хода — сборка шлюза старше той, "
             "которая их пишет."
         )
+    elif not stats["turn_outcome"]:
+        # Колонки есть, но в окне не было ни одного хода с инструментами:
+        # это не поломка сборки, и путать одно с другим нельзя.
+        add("В окне нет агентских ходов: ни один вызов не был с инструментами.")
     else:
         add(
             "Считаются только ходы, где клиент дал инструменты. "
@@ -303,8 +318,8 @@ def main() -> None:
             if args.all
             else datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=args.minutes)
         )
-        rows = fetch(since, combo_only=not args.all_calls)
-        return build(rows)
+        rows, outcome_columns = fetch(since, combo_only=not args.all_calls)
+        return build(rows, outcome_columns)
 
     if not args.watch:
         stats = snapshot()

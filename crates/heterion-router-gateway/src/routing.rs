@@ -22,7 +22,9 @@ use heterion_router_routing::{BreakerSet, Router};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::backend::{ATTRIBUTION_TOKEN, Attribution, ChatBackend, ChunkStream, request_token};
+use crate::backend::{
+    ATTRIBUTION_TOKEN, Attribution, ChatBackend, ChunkStream, FailedAttempt, request_token,
+};
 use crate::capabilities::{CapabilityStore, ModelCapabilities, ladder_priority};
 use crate::combos::{ComboConfig, load_combos, plan_steps};
 use crate::model_spec::{ModelSpec, ModelTier, ToolSupport};
@@ -252,6 +254,17 @@ pub struct RoutingBackend {
     /// Keyed rather than a single "last served" slot, because concurrent
     /// requests would otherwise read each other's provider.
     attributions: Arc<Mutex<Vec<(String, Attribution)>>>,
+    /// The upstream calls that failed inside a failover plan:
+    /// `request token -> the attempts, in the order they failed`.
+    ///
+    /// The journal writes one row per failed call, so "which provider refused
+    /// us and with what" is readable from `call_logs` alone. The request that
+    /// eventually succeeded keeps its own row; a request that failed entirely
+    /// is described by these rows instead of one summary row.
+    ///
+    /// Bounded like the attributions: a request that is never booked (a
+    /// `no_log` key) must not grow the ring without limit.
+    failed_attempts: Arc<Mutex<FailedAttempts>>,
     cooldowns: Arc<ProviderCooldownSet>,
     quality_tracker: Arc<ModelQualityTracker>,
 }
@@ -316,6 +329,31 @@ fn all_candidates_cooling(model: &str) -> GatewayError {
     GatewayError::Upstream(format!(
         "{model}: every candidate model is in rate-limit cooldown; retry shortly"
     ))
+}
+
+/// The upstream calls that failed inside a request, keyed by request token.
+type FailedAttempts = Vec<(String, Vec<FailedAttempt>)>;
+
+/// How one upstream call ended when it refused.
+///
+/// Kept apart from the call site so the facts travel together: the status,
+/// the time it cost and the text it answered with describe the same event.
+#[derive(Debug, Clone)]
+struct Refusal {
+    /// Status the client saw.
+    status: u16,
+    /// How long the call took, in milliseconds.
+    duration_ms: u32,
+    /// What the call answered with, verbatim.
+    error: Option<String>,
+}
+
+/// Milliseconds since `started`, capped at `u32::MAX`.
+///
+/// A call that outlives the cap is a call the operator wants to see as
+/// "very long", not as a wrapped number that reads like a fast one.
+fn elapsed_ms(started: std::time::Instant) -> u32 {
+    started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
 }
 
 /// One attempt against a named backend: the request leaves without the
@@ -437,6 +475,7 @@ impl RoutingBackend {
             vision_saving: false,
             served_at: Arc::new(DashMap::new()),
             attributions: Arc::new(Mutex::new(Vec::new())),
+            failed_attempts: Arc::new(Mutex::new(Vec::new())),
             cooldowns: Arc::new(ProviderCooldownSet::new()),
             quality_tracker: Arc::new(ModelQualityTracker::new()),
         }
@@ -529,6 +568,51 @@ impl RoutingBackend {
         self.attributions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn lock_failed_attempts(&self) -> std::sync::MutexGuard<'_, FailedAttempts> {
+        self.failed_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Remember one upstream call that failed inside the request stamped
+    /// `token`.
+    ///
+    /// The journal writes one row per failed call, so a provider that refused
+    /// the first three candidates and served the fourth is visible as three
+    /// refusals — instead of one row naming only the last attempt.
+    fn note_failed_attempt(
+        &self,
+        token: Option<&str>,
+        provider: &str,
+        backend: &dyn ChatBackend,
+        model: &str,
+        refusal: Refusal,
+    ) {
+        let Some(token) = token else {
+            return;
+        };
+        let connection_id = backend
+            .attribution(token)
+            .connection_id
+            .or_else(|| self.dispatch_head_connection_id(provider));
+        let mut entries = self.lock_failed_attempts();
+        if entries.len() >= ATTRIBUTION_SLOTS {
+            entries.remove(0);
+        }
+        let attempt = FailedAttempt {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            connection_id,
+            status: refusal.status,
+            duration_ms: refusal.duration_ms,
+            error: refusal.error,
+        };
+        match entries.iter_mut().find(|(key, _)| key == token) {
+            Some((_, attempts)) => attempts.push(attempt),
+            None => entries.push((token.to_string(), vec![attempt])),
+        }
     }
 
     /// Remember that `backend` handled the request stamped `token`.
@@ -1313,6 +1397,14 @@ impl ChatBackend for RoutingBackend {
         "routing"
     }
 
+    fn failed_attempts(&self, token: &str) -> Vec<FailedAttempt> {
+        self.lock_failed_attempts()
+            .iter()
+            .find(|(key, _)| key == token)
+            .map(|(_, attempts)| attempts.clone())
+            .unwrap_or_default()
+    }
+
     fn attribution(&self, token: &str) -> Attribution {
         self.lock_attributions()
             .iter()
@@ -1432,6 +1524,7 @@ impl ChatBackend for RoutingBackend {
                     break;
                 };
                 attempts += 1;
+                let attempt_started = std::time::Instant::now();
                 match backend
                     .complete(attempt(&candidate_req, target_model))
                     .await
@@ -1448,10 +1541,25 @@ impl ChatBackend for RoutingBackend {
                                 "auto: post-flight tool validation failed, penalising and failing over"
                             );
                             self.quality_tracker.record_failure(target_model);
-                            // Don't attribute — we're failing over.
-                            last_error = Some(GatewayError::Upstream(format!(
+                            // The upstream call happened and the answer was
+                            // rejected: it is a failed candidate, so it gets
+                            // its own journal row like any other refusal.
+                            let validation_error = GatewayError::Upstream(format!(
                                 "upstream status 200: tool validation failed ({e})"
-                            )));
+                            ));
+                            self.note_failed_attempt(
+                                token.as_deref(),
+                                name,
+                                backend.as_ref(),
+                                target_model,
+                                Refusal {
+                                    status: crate::error_status(&validation_error).as_u16(),
+                                    duration_ms: elapsed_ms(attempt_started),
+                                    error: Some(validation_error.to_string()),
+                                },
+                            );
+                            // Don't attribute — we're failing over.
+                            last_error = Some(validation_error);
                             if attempts >= attempt_budget {
                                 break 'candidates;
                             }
@@ -1530,6 +1638,20 @@ impl ChatBackend for RoutingBackend {
                             combo_name.as_deref(),
                             tokens_compressed,
                             Some(target_model),
+                        );
+                        // One failed upstream call, one journal row. The
+                        // request-outcome row names only the last attempt, so
+                        // without this the earlier refusals are invisible.
+                        self.note_failed_attempt(
+                            token.as_deref(),
+                            name,
+                            backend.as_ref(),
+                            target_model,
+                            Refusal {
+                                status: crate::error_status(&error).as_u16(),
+                                duration_ms: elapsed_ms(attempt_started),
+                                error: Some(error.to_string()),
+                            },
                         );
                         let transient = Self::is_transient(&error);
                         last_error = Some(error);
@@ -1662,6 +1784,7 @@ impl ChatBackend for RoutingBackend {
                         break;
                     };
                     attempts += 1;
+                    let attempt_started = std::time::Instant::now();
                     let mut stream = backend.stream(attempt(&candidate_req, target_model));
 
                     match stream.next().await {
@@ -1737,6 +1860,19 @@ impl ChatBackend for RoutingBackend {
                                 combo_name.as_deref(),
                                 tokens_compressed,
                                 Some(target_model),
+                            );
+                            // One failed upstream call, one journal row — the
+                            // same rule as the non-streaming path.
+                            this.note_failed_attempt(
+                                token.as_deref(),
+                                name,
+                                backend.as_ref(),
+                                target_model,
+                                Refusal {
+                                    status: crate::error_status(&error).as_u16(),
+                                    duration_ms: elapsed_ms(attempt_started),
+                                    error: Some(error.to_string()),
+                                },
                             );
                             let transient = Self::is_transient(&error);
                             last_error = Some(error);

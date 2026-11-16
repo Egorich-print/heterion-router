@@ -111,11 +111,48 @@ pub(crate) fn next_token<'a>(
     tokens.get(index).map(String::as_str)
 }
 
+/// One upstream call that failed inside a failover plan.
+///
+/// The request-outcome row names only the **last** attempt, so every earlier
+/// refusal is invisible in the journal: a provider that answers `429` to the
+/// first three candidates and serves the fourth looks like it never refused
+/// anything. These facts are what the journal writes a row per.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailedAttempt {
+    /// Provider the attempt went to.
+    pub provider: String,
+    /// Model the attempt asked for.
+    pub model: String,
+    /// Connection row the attempt went through.
+    ///
+    /// `None` when the executor could not name one — the row stays honest
+    /// instead of borrowing the winner's connection.
+    pub connection_id: Option<String>,
+    /// Status the attempt ended with, as the client saw it.
+    pub status: u16,
+    /// How long the attempt took, in milliseconds.
+    pub duration_ms: u32,
+    /// What the attempt answered with, verbatim.
+    ///
+    /// The upstream status and its body live here, so a refusal is readable
+    /// without the request-outcome row.
+    pub error: Option<String>,
+}
+
 /// Anything that can serve a chat completion.
 #[async_trait]
 pub trait ChatBackend: Send + Sync + 'static {
     /// Human-readable backend name, used in logs and health output.
     fn name(&self) -> &'static str;
+
+    /// The upstream calls that failed inside the request stamped with `token`.
+    ///
+    /// Empty for a backend that serves one attempt per request: only a
+    /// failover plan has more than one call, and only the router knows how
+    /// many of them failed.
+    fn failed_attempts(&self, _token: &str) -> Vec<FailedAttempt> {
+        Vec::new()
+    }
 
     /// Attribution for the request stamped with `token`.
     ///
