@@ -362,7 +362,13 @@ fn elapsed_ms(started: std::time::Instant) -> u32 {
 /// conversation retention) is the known offender: OpenCode sends it on every
 /// completion and Mistral's strict validation rejects the whole request with
 /// `extra_forbidden` 422, while every other provider merely ignores it.
-fn attempt(request: &ChatCompletionRequest, model: &str) -> ChatCompletionRequest {
+///
+/// The attempt is also where the request is brought inside what the *named
+/// provider* accepts: a platform with a narrower set of levels, a smaller
+/// output budget or no place for the thinking sidecar kills the whole
+/// request otherwise. The provider id is part of the decision on purpose: the
+/// same model id behind two providers is served by two different APIs.
+fn attempt(request: &ChatCompletionRequest, provider: &str, model: &str) -> ChatCompletionRequest {
     const OPENAI_ONLY_FIELDS: [&str; 1] = ["store"];
     let mut attempt = request.clone();
     attempt.model = model.to_string();
@@ -378,6 +384,49 @@ fn attempt(request: &ChatCompletionRequest, model: &str) -> ChatCompletionReques
     // (probed live 2026-11-15) — the field cannot ride along.
     if crate::reasoning::rejects_temperature(model) {
         attempt.temperature = None;
+    }
+    // A provider whose set of levels is narrower than the client's: the
+    // request is pulled down to the strongest level it accepts (probed live
+    // 2026-11-16 on groq, which takes `low`, `medium` and `high` only).
+    if let Some(allowed) = crate::provider_caps::allowed_efforts(provider) {
+        let clamped =
+            crate::provider_caps::clamp_effort(attempt.reasoning_effort.as_deref(), allowed);
+        if attempt.reasoning_effort.is_some() && clamped != attempt.reasoning_effort {
+            tracing::debug!(
+                provider = %provider,
+                model = %model,
+                requested = %attempt.reasoning_effort.as_deref().unwrap_or("-"),
+                sent = %clamped.as_deref().unwrap_or("-"),
+                "provider caps: reasoning effort clamped to the platform's set"
+            );
+        }
+        attempt.reasoning_effort = clamped;
+    }
+    // A model whose platform refuses the field outright (probed live
+    // 2026-11-16 on groq's Qwen3.8 models).
+    if crate::provider_caps::rejects_reasoning_effort_field(provider, model) {
+        attempt.reasoning_effort = None;
+    }
+    // The thinking sidecar of an earlier assistant turn has no place in the
+    // history of some platforms (probed live 2026-11-16 on groq and
+    // oneminai). The visible text of the turn stays untouched.
+    if crate::provider_caps::rejects_reasoning_content(provider) {
+        for message in &mut attempt.messages {
+            message.reasoning_content = None;
+        }
+    }
+    // The output budget the platform publishes (probed live 2026-11-16 on
+    // typhoon and oneminai).
+    if let Some(cap) = crate::provider_caps::max_output_tokens(provider, model) {
+        if attempt.max_tokens.is_some_and(|tokens| tokens > cap) {
+            attempt.max_tokens = Some(cap);
+        }
+        if attempt
+            .max_completion_tokens
+            .is_some_and(|tokens| tokens > cap)
+        {
+            attempt.max_completion_tokens = Some(cap);
+        }
     }
     attempt
 }
@@ -406,8 +455,8 @@ mod attempt_tests {
             .extra
             .insert("logprobs".into(), serde_json::json!(true));
 
-        let out = attempt(&request, "mistral/codestral-latest");
-        assert_eq!(out.model, "mistral/codestral-latest");
+        let out = attempt(&request, "mistral", "codestral-latest");
+        assert_eq!(out.model, "codestral-latest");
         assert!(!out.extra.contains_key("_heterion_router_attribution"));
         assert!(!out.extra.contains_key("store"));
         // Anything else the client sent still rides along.
@@ -423,11 +472,11 @@ mod attempt_tests {
             ..Default::default()
         };
         // The client's field survives dispatch to a family that accepts it.
-        let glm = attempt(&request, "zai/glm-5.3-flash");
+        let glm = attempt(&request, "zai", "glm-5.3-flash");
         assert_eq!(glm.reasoning_effort.as_deref(), Some("high"));
         // Mistral 400s on the field, so the attempt must not carry it.
         request.reasoning_effort = Some("medium".into());
-        let codestral = attempt(&request, "mistral/codestral-latest");
+        let codestral = attempt(&request, "mistral", "codestral-latest");
         assert_eq!(codestral.reasoning_effort, None);
     }
 
@@ -441,11 +490,103 @@ mod attempt_tests {
             temperature: Some(0.2),
             ..Default::default()
         };
-        let sol = attempt(&request, "agentrouter/gpt-5.6-sol");
+        let sol = attempt(&request, "agentrouter", "gpt-5.6-sol");
         assert_eq!(sol.temperature, None);
         // A family that accepts sampling parameters keeps the client's value.
-        let codestral = attempt(&request, "mistral/codestral-latest");
+        let codestral = attempt(&request, "mistral", "codestral-latest");
         assert_eq!(codestral.temperature, Some(0.2));
+    }
+
+    /// A provider with a narrower set of levels gets the strongest level it
+    /// accepts (probed live 2026-11-16: groq takes `low`, `medium`, `high`).
+    #[test]
+    fn attempt_clamps_reasoning_effort_to_what_the_provider_accepts() {
+        let request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages: vec![ChatMessage::plain("user", "hi")],
+            reasoning_effort: Some("max".into()),
+            ..Default::default()
+        };
+        let groq = attempt(&request, "groq", "openai/gpt-oss-120b");
+        assert_eq!(groq.reasoning_effort.as_deref(), Some("high"));
+        // Another provider keeps the client's value: groq's set is groq's.
+        let gemini = attempt(&request, "gemini", "gemini-3.5-flash");
+        assert_eq!(gemini.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    /// A model whose platform refuses the field outright must not see it
+    /// (probed live 2026-11-16: groq's Qwen3.8 models).
+    #[test]
+    fn attempt_drops_reasoning_effort_for_a_model_that_refuses_the_field() {
+        let request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages: vec![ChatMessage::plain("user", "hi")],
+            reasoning_effort: Some("high".into()),
+            ..Default::default()
+        };
+        let qwen = attempt(&request, "groq", "qwen/qwen3.8-27b");
+        assert_eq!(qwen.reasoning_effort, None);
+        // The same field is fine for another model of the same provider.
+        let oss = attempt(&request, "groq", "openai/gpt-oss-120b");
+        assert_eq!(oss.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    /// The thinking sidecar of an earlier assistant turn has no place in the
+    /// history of some platforms (probed live 2026-11-16: groq, oneminai).
+    #[test]
+    fn attempt_strips_reasoning_content_where_the_platform_refuses_it() {
+        let mut assistant = ChatMessage::plain("assistant", "the answer");
+        assistant.reasoning_content = Some("the thinking".to_string());
+        let request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages: vec![ChatMessage::plain("user", "hi"), assistant],
+            ..Default::default()
+        };
+        let groq = attempt(&request, "groq", "openai/gpt-oss-120b");
+        assert_eq!(groq.messages[1].reasoning_content, None);
+        // The visible text of the turn is untouched.
+        assert_eq!(
+            groq.messages[1].content,
+            Some(serde_json::json!("the answer")),
+            "{:?}",
+            groq.messages[1]
+        );
+        // A provider that takes the sidecar keeps it.
+        let gemini = attempt(&request, "gemini", "gemini-3.5-flash");
+        assert_eq!(
+            gemini.messages[1].reasoning_content.as_deref(),
+            Some("the thinking")
+        );
+    }
+
+    /// The output budget the platform publishes is a cap, not a policy
+    /// (probed live 2026-11-16: typhoon 16384, oneminai 32768).
+    #[test]
+    fn attempt_caps_the_output_budget_to_what_the_provider_accepts() {
+        let request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages: vec![ChatMessage::plain("user", "hi")],
+            max_tokens: Some(64_000),
+            max_completion_tokens: Some(64_000),
+            ..Default::default()
+        };
+        let typhoon = attempt(&request, "typhoon", "typhoon-v2.5-30b-a3b-instruct");
+        assert_eq!(typhoon.max_tokens, Some(16_384));
+        assert_eq!(typhoon.max_completion_tokens, Some(16_384));
+        // A budget inside the cap rides along unchanged.
+        let small = attempt(
+            &ChatCompletionRequest {
+                max_tokens: Some(1_000),
+                max_completion_tokens: Some(1_000),
+                ..request.clone()
+            },
+            "typhoon",
+            "typhoon-v2.5-30b-a3b-instruct",
+        );
+        assert_eq!(small.max_tokens, Some(1_000));
+        // A provider without a published cap keeps the client's budget.
+        let gemini = attempt(&request, "gemini", "gemini-3.5-flash");
+        assert_eq!(gemini.max_tokens, Some(64_000));
     }
 }
 
@@ -1032,7 +1173,10 @@ impl RoutingBackend {
             let Some(backend) = self.backends.get(&provider) else {
                 continue;
             };
-            let response = match backend.complete(attempt(&describer_request, &model)).await {
+            let response = match backend
+                .complete(attempt(&describer_request, &provider, &model))
+                .await
+            {
                 Ok(response) => response,
                 Err(error) => {
                     tracing::warn!(
@@ -1526,7 +1670,7 @@ impl ChatBackend for RoutingBackend {
                 attempts += 1;
                 let attempt_started = std::time::Instant::now();
                 match backend
-                    .complete(attempt(&candidate_req, target_model))
+                    .complete(attempt(&candidate_req, name, target_model))
                     .await
                 {
                     Ok(response) => {
@@ -1785,7 +1929,7 @@ impl ChatBackend for RoutingBackend {
                     };
                     attempts += 1;
                     let attempt_started = std::time::Instant::now();
-                    let mut stream = backend.stream(attempt(&candidate_req, target_model));
+                    let mut stream = backend.stream(attempt(&candidate_req, name, target_model));
 
                     match stream.next().await {
                         Some(Ok(first)) => {

@@ -30,6 +30,7 @@ pub mod ids;
 pub mod inspector;
 pub mod model_spec;
 pub mod openai;
+pub mod provider_caps;
 pub mod provider_status;
 pub mod reasoning;
 pub mod repetition_guard;

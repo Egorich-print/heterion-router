@@ -172,20 +172,6 @@
     ]
   },
   {
-    "id": "aihubmix",
-    "alias": "ahm",
-    "format": "openai",
-    "executor": "default",
-    "auth_type": "apikey",
-    "base_url": "https://aihubmix.com/v1/chat/completions",
-    "models": [
-      {
-        "id": "crouton-alpha-free",
-        "target_format": null
-      }
-    ]
-  },
-  {
     "id": "aihorde",
     "alias": null,
     "format": "openai",
@@ -4928,14 +4914,6 @@
         "target_format": null
       },
       {
-        "id": "gemini-2.5-flash",
-        "target_format": null
-      },
-      {
-        "id": "gemini-2.5-flash-lite",
-        "target_format": null
-      },
-      {
         "id": "gemini-3.5-flash",
         "target_format": null
       },
@@ -5889,18 +5867,6 @@
     "base_url": "https://api.groq.com/openai/v1/chat/completions",
     "models": [
       {
-        "id": "meta-llama/llama-4-scout-17b-16e-instruct",
-        "target_format": null
-      },
-      {
-        "id": "llama-3.3-70b-versatile",
-        "target_format": null
-      },
-      {
-        "id": "groq/compound",
-        "target_format": null
-      },
-      {
         "id": "allam-2-7b",
         "target_format": null
       },
@@ -5910,14 +5876,6 @@
       },
       {
         "id": "openai/gpt-oss-20b",
-        "target_format": null
-      },
-      {
-        "id": "qwen/qwen3-32b",
-        "target_format": null
-      },
-      {
-        "id": "qwen/qwen3.6-27b",
         "target_format": null
       },
       {
@@ -6544,18 +6502,6 @@
       },
       {
         "id": "kilo-auto/free",
-        "target_format": null
-      },
-      {
-        "id": "nvidia/nemotron-3-super-120b-a12b:free",
-        "target_format": null
-      },
-      {
-        "id": "minimax/minimax-m2.5:free",
-        "target_format": null
-      },
-      {
-        "id": "arcee-ai/trinity-large-preview:free",
         "target_format": null
       }
     ]
@@ -7962,14 +7908,6 @@
     "base_url": "https://integrate.api.nvidia.com/v1/chat/completions",
     "models": [
       {
-        "id": "moonshotai/kimi-k3",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-ai/deepseek-v4-pro-0813",
-        "target_format": null
-      },
-      {
         "id": "deepseek-ai/deepseek-v4-flash-0731",
         "target_format": null
       },
@@ -7983,10 +7921,6 @@
       },
       {
         "id": "google/gemma-4-31b-it",
-        "target_format": null
-      },
-      {
-        "id": "google/diffusiongemma-26b-a4b-it",
         "target_format": null
       },
       {
@@ -8827,10 +8761,6 @@
     "models": [
       {
         "id": "Meta-Llama-3_3-70B-Instruct",
-        "target_format": null
-      },
-      {
-        "id": "Qwen2.5-Coder-32B-Instruct",
         "target_format": null
       },
       {
@@ -11776,35 +11706,7 @@
     "base_url": "https://api.z.ai/api/anthropic/v1/messages",
     "models": [
       {
-        "id": "glm-5.3",
-        "target_format": "openai"
-      },
-      {
-        "id": "glm-5.3-flash",
-        "target_format": "openai"
-      },
-      {
-        "id": "glm-5.2",
-        "target_format": null
-      },
-      {
-        "id": "glm-5.1",
-        "target_format": null
-      },
-      {
-        "id": "glm-5",
-        "target_format": null
-      },
-      {
-        "id": "glm-5-turbo",
-        "target_format": null
-      },
-      {
         "id": "glm-4.7-flash",
-        "target_format": null
-      },
-      {
-        "id": "glm-4.7",
         "target_format": null
       }
     ]

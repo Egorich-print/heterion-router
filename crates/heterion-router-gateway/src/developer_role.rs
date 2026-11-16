@@ -38,12 +38,14 @@ use heterion_router_core::ChatMessage;
 /// decision is made per provider, not per model family.
 ///
 /// The list holds only providers whose refusal was measured live (2026-11-15:
-/// `mistral` → 422 `union_tag_invalid`). The registry's second Mistral-API
-/// provider (`codestral`, `codestral.mistral.ai`) speaks the same protocol and
-/// will refuse the role too, but it had no credential to check against — so it
+/// `mistral` → 422 `union_tag_invalid`; 2026-11-16: `mixlayer` → 400
+/// `messages[0].role: unknown variant 'developer', expected one of 'system',
+/// 'user', 'assistant', 'tool'`). The registry's second Mistral-API provider
+/// (`codestral`, `codestral.mistral.ai`) speaks the same protocol and will
+/// refuse the role too, but it had no credential to check against — so it
 /// joins the list only after its own refusal is measured, not before.
 pub(crate) fn provider_rejects_developer_role(provider: &str) -> bool {
-    matches!(provider, "mistral")
+    matches!(provider, "mistral" | "mixlayer")
 }
 
 /// Rename every `developer` turn to a `system` turn.
@@ -104,8 +106,11 @@ mod tests {
     }
 
     #[test]
-    fn only_the_mistral_provider_is_adapted() {
+    fn only_the_measured_providers_are_adapted() {
         assert!(provider_rejects_developer_role("mistral"));
+        // mixlayer answers 400 "unknown variant `developer`" (measured live
+        // 2026-11-16).
+        assert!(provider_rejects_developer_role("mixlayer"));
         assert!(!provider_rejects_developer_role("openrouter"));
         assert!(!provider_rejects_developer_role("gemini"));
         assert!(!provider_rejects_developer_role("agentrouter"));

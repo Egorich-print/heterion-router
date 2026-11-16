@@ -111,6 +111,31 @@ Toolchain закреплён `1.99.1` в `rust-toolchain.toml`, `rust-version = 
   `a_provider_that_serves_prefills_keeps_the_verbatim_turn`). Assistant-ход с
   `tool_calls` не адаптируется: переписка без результата инструмента
   невалидна для любого провайдера (OpenAI тоже её отвергает).
+- **Запрос приводится к тому, что провайдер способен принять** — правила в
+  `provider_caps.rs`, применяются в `routing.rs::attempt()` (у провайдера
+  свой набор, у модели свой лимит; решение принимается по **провайдеру**,
+  потому что один и тот же id модели за разными площадками — это разные
+  API). Все правила — измеренные отказы прогона 16.11.2026:
+  - `reasoning_effort` **clamp** к набору площадки: groq принимает только
+    `low`/`medium`/`high` (400 «must be one of …») — сильный запрос
+    (`xhigh`, `max`) опускается до сильнейшего допустимого, слабый
+    поднимается до слабейшего, незнакомое значение — поле убирается;
+  - `reasoning_effort` **убирается совсем**, если площадка не принимает
+    поле: groq для Qwen3.8 (400 «invalid Qwen3.8 reasoning_effort»);
+  - `reasoning_content` в истории **вычищается**: groq (400 «property
+    'reasoning_content' is unsupported»), oneminai (400 «Unrecognized key»),
+    Mistral (422 `extra_forbidden`). Видимый текст assistant-хода не
+    трогается — убирается только sidecar размышления;
+  - `max_tokens`/`max_completion_tokens` **обрезаются до потолка**: typhoon
+    16384 (400 «must be at most 16384»), oneminai 32768, а у
+    `sealion/aisingapore/Qwen-SEA-LION-v4-32B-IT` — 32000 (400 «cannot be
+    greater than max_model_len=32000»); у соседней 27B-модели тот же
+    бюджет проходит;
+  - роль `developer` переименовывается в `system` для провайдеров, которые
+    её отвергают (`developer_role.rs`): Mistral (422 `union_tag_invalid`),
+    mixlayer (400 «unknown variant 'developer'»).
+  Правило «только по измеренным отказам»: новый провайдер в списки не
+  добавляется без живого замера.
 - Картинка в запросе **не должна исчезать на переводе**: OpenAI→Gemini
   (`gemini_request.rs`) кладёт `image_url` c data-URL в `inlineData`. Gemini не
   умеет забирать картинку по URL — `fileData` с https отвергается («Cannot fetch
@@ -449,6 +474,30 @@ drag-головоломку перед OAuth; это шаг оператора (
   - `morph` оставлен намеренно: `402 Monthly quota exceeded` — возможно,
     починится новым ключом; он стоит в голове лестницы и стоит одного
     отказа на запрос.
+- **Вторая волна чистки — по журналу отказов прогона 100 субагентов под
+  MiniMax M3.1 Flash Max (16.11.2026, 18:02 UTC):**
+  - соединения отключены (все модели провайдера отказывали): `blackbox`
+    (404 на все 9 моделей), `command-code` (404 «Check the docs for
+    available routes» — эндпоинта нет), `kimi-coding` (401 «API Key appears
+    to be invalid»), `sambanova` (401/404), `minimax` (402
+    `insufficient_balance_error` — баланса нет, ADR-026);
+  - модели убраны из реестра: `gemini/gemini-2.5-flash`,
+    `gemini/gemini-2.5-flash-lite` (404 сняты площадкой), `nvidia` —
+    `moonshotai/kimi-k3`, `deepseek-ai/deepseek-v4-pro-0813`,
+    `google/diffusiongemma-26b-a4b-it` (410 «reached its end of life»),
+    `groq` — `llama-3.3-70b-versatile`, `groq/compound`, `qwen/qwen3-32b`,
+    `qwen/qwen3.6-27b`, `meta-llama/llama-4-scout-17b-16e-instruct`
+    (404 «does not exist»), `kilo-gateway` — три `:free`-id, которых нет в
+    каталоге площадки, `ovhcloud/Qwen2.5-Coder-32B-Instruct` (404
+    `model_not_found`), `zai` — все, кроме `glm-4.7-flash` (429 «Insufficient
+    balance» — платить нельзя), провайдер `aihubmix` целиком (`crouton-alpha-free`
+    помечена площадкой как `model_retired`).
+  - **Не тронуты** те, чьи отказы — наша вина или временная квота: `llm7`
+    («Model … is currently unavailable» — агрегатор ротирует доступность),
+    `pollinations` (429 «Your previous request is still running» — лимит
+    параллелизма), `aion`/`cloudflare-ai`/`gemini` (дневные квоты сбрасываются),
+    `mistral`, `sealion/…-32B`, `typhoon`, `oneminai`, `mixlayer` — их отказы
+    чинятся правкой параметров (ниже).
 
 **`base_url` может нести плейсхолдер `{env:ИМЯ}`** — например Cloudflare
 Workers AI требует `account_id` в пути, а он принадлежит аккаунту оператора,
