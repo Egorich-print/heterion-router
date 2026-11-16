@@ -131,30 +131,43 @@ fn the_keyless_pass_takes_only_unconnected_keyless_http_providers() {
         Some("openai"),
         Some("none"),
         Some("https://api.x/v1"),
+        None,
         false
     ));
     assert!(!keyless_candidate(
         Some("openai"),
         Some("apikey"),
         Some("https://api.x/v1"),
+        None,
         false
     ));
     assert!(!keyless_candidate(
         Some("openai"),
         Some("none"),
         Some("https://api.x/v1"),
+        None,
         true
     ));
     assert!(!keyless_candidate(
         Some("cursor"),
         Some("none"),
         Some("https://api.x"),
+        None,
         false
     ));
     assert!(!keyless_candidate(
         Some("openai"),
         Some("none"),
         Some("auggie://cli/stdio"),
+        None,
+        false
+    ));
+    // A web executor is answered by the browser driver, not by HTTP.
+    assert!(!keyless_candidate(
+        Some("openai"),
+        Some("none"),
+        Some("https://duck.ai/duckchat/v1/chat"),
+        Some("web"),
         false
     ));
 

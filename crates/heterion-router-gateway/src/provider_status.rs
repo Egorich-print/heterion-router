@@ -239,13 +239,22 @@ pub fn is_keyless(auth_type: Option<&str>) -> bool {
 /// by construction (Gemini wants an API key in a header, the Anthropic and
 /// Responses dialects want a token), so a keyless provider of those kinds
 /// would be a declaration nobody can honour.
+///
+/// A **web executor** never qualifies. Its "endpoint" is a chat page: it
+/// answers `200` to any POST, so a probe there measures nothing, and the
+/// answer still comes from the browser driver — which needs an adapter
+/// (ADR-025). Such a provider is served by the web pass or by nobody.
 pub fn keyless_candidate(
     format: Option<&str>,
     auth_type: Option<&str>,
     base_url: Option<&str>,
+    executor: Option<&str>,
     has_connection: bool,
 ) -> bool {
     if has_connection || !is_keyless(auth_type) {
+        return false;
+    }
+    if executor == Some("web") {
         return false;
     }
     let Some(base_url) = base_url else {
@@ -506,6 +515,7 @@ mod tests {
             Some("openai"),
             Some("none"),
             Some("https://api.x/v1"),
+            None,
             false
         ));
         // A provider that needs a key is not keyless.
@@ -513,6 +523,7 @@ mod tests {
             Some("openai"),
             Some("apikey"),
             Some("https://api.x/v1"),
+            None,
             false
         ));
         // A connected provider is already built.
@@ -520,6 +531,7 @@ mod tests {
             Some("openai"),
             Some("none"),
             Some("https://api.x/v1"),
+            None,
             true
         ));
         // A format the gateway cannot speak is out.
@@ -527,6 +539,7 @@ mod tests {
             Some("cursor"),
             Some("none"),
             Some("https://api.x"),
+            None,
             false
         ));
         // A dialect that is credential-bound by construction is out too.
@@ -534,6 +547,7 @@ mod tests {
             Some("claude"),
             Some("none"),
             Some("https://api.x/v1/messages"),
+            None,
             false
         ));
         // A local CLI is not an HTTP provider.
@@ -541,6 +555,16 @@ mod tests {
             Some("openai"),
             Some("none"),
             Some("auggie://cli/stdio"),
+            None,
+            false
+        ));
+        // A web executor answers 200 to any POST: a probe there measures
+        // nothing, and the answer comes from the browser driver.
+        assert!(!keyless_candidate(
+            Some("openai"),
+            Some("none"),
+            Some("https://duck.ai/duckchat/v1/chat"),
+            Some("web"),
             false
         ));
     }

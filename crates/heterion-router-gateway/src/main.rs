@@ -58,6 +58,7 @@ async fn probe_keyless_providers(registry: &ProviderRegistry, db: &Arc<Db>) -> u
                 entry.format.as_deref(),
                 entry.auth_type.as_deref(),
                 entry.base_url.as_deref(),
+                entry.executor.as_deref(),
                 connected.contains(&entry.id),
             )
         })
@@ -671,6 +672,7 @@ fn select_backend(
             entry.format.as_deref(),
             entry.auth_type.as_deref(),
             Some(base_url.as_str()),
+            entry.executor.as_deref(),
             providers.contains_key(&entry.id),
         ) {
             continue;
