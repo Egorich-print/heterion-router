@@ -145,6 +145,26 @@ Toolchain закреплён `1.99.1` в `rust-toolchain.toml`, `rust-version = 
     «Type mismatch of '/messages/0/content', 'array' not in 'string'»), и
     у каждого хода должно быть поле `content` (400 «required properties
     at '/messages/5' are 'role,content'»);
+  - **набор уровней `reasoning_effort` бывает модельным, а не площадочным**:
+    за одним адресом cloudflare-ai сидят разные движки, и каждый называет
+    свои уровни — `gpt-oss` на Harmony берёт `high`, `medium`, `low` (400
+    «reasoning_effort='max' is not supported by Harmony. Supported values are:
+    high, medium, low», 54 отказа 17.11.2026), а `qwen3.8` берёт `xhigh`,
+    `medium`, `low` и отвергает `high` (400 «Unexpected reasoning effort
+    high. Supported types are xhigh (default), medium, and low», 60 отказов
+    тем же днём). Тот же движок Qwen3.8 за sealion отвечает тем же текстом
+    (8 отказов), поэтому правило называет **id модели**, а не площадку;
+  - **поле `reasoning_effort` убирается совсем**, когда его не знает модель:
+    `ovhcloud/Meta-Llama-3_3-70B-Instruct` — 400 «feature 'reasoning_effort
+    for this model' is not currently supported»;
+  - **потолок в символах, а не в токенах**: oneminai считает запрос
+    символами и складывает историю со схемами инструментов и форматом ответа
+    — 400 «Messages, tools and response format exceed the 100,000 character
+    limit» (2 отказа 17.11.2026; проба: ~110 000 символов одних схем
+    инструментов отвергнуты так же, а одно сообщение длиннее 100 000
+    символов даёт «Too big: expected string to have <=100000 characters»).
+    Старые ходы уходят (как у typhoon), а когда и этого мало — кандидат
+    **не вызывается вовсе**;
   - роль `developer` переименовывается в `system` для провайдеров, которые
     её отвергают (`developer_role.rs`): Mistral (422 `union_tag_invalid`),
     mixlayer (400 «unknown variant 'developer'»).
@@ -367,7 +387,7 @@ Plist — машинно-локальный (`~/Library/LaunchAgents`), не х�
 code path: в текущей рабочей БД нет активной строки `provider_connections`, и
 backend не поднимается. URL по умолчанию `http://127.0.0.1:8080/v1`, override —
 `HETERION_LOCAL_BASE_URL`. Model id — транзит на Heterion (там один загруженный
-вес). Registry содержит 276 providers / 2257 models; в каталог формы добавления
+вес). Registry содержит 274 providers / 2238 models; в каталог формы добавления
 ключа (`GET /api/providers`) проходят записи с поддерживаемой схемой. Перечень:
 `docs/PROVIDERS.md`; метод аудита: `docs/research/PROJECT-AUDIT-2026-09.md`.
 
@@ -549,6 +569,23 @@ drag-головоломку перед OAuth; это шаг оператора (
     retired on November 9, 2026. Try glm-5.3-flash:cloud` (площадка сама
     называет замену).
   Итог после волны: 276 провайдеров, 2257 моделей (было 2328).
+- **Шестая волна — провайдер стал платным (ADR-026):**
+  - `ollama-cloud` отвечает `402 Add usage credits or subscribe and save up to
+    66%: https://ollama.com/plans` на **все** модели (проверено на
+    `gemma4:31b`, `gpt-oss:20b`, `glm-5.3-flash`, `minimax-m3.1-flash` и ещё
+    на 402 в журнале прогона). Бесплатного тарифа у площадки больше нет,
+    поэтому провайдер вычеркнут из реестра целиком (18 моделей), соединение
+    `ollama-cloud-main` отключено, capability-строки удалены;
+  - `minimax/MiniMax-M3` — `402 insufficient_balance_error: insufficient
+    balance (1008)`, успехов ноль; последняя модель провайдера, поэтому
+    вычеркнут и он (соединение и так было отключено).
+  Итог: 274 провайдера, 2238 моделей.
+
+**Соединение без моделей в реестре — мёртвое соединение.** У `huggingface`
+(все id вычеркнуты волнами выше) и `aihubmix` (провайдера нет в реестре, а
+модель `crouton-alpha-free` площадка сняла сама) соединения были активны, но
+обслуживать им нечего — шлюз писал «1 active connection(s) … are not served».
+Оба отключены.
 
 **Модели Google Flash — по живым пробам 17.11.2026** (через роутер, `say ok`):
 
@@ -578,6 +615,16 @@ API key provided` (все пять соединений отключены: кл
 (`POST https://api.commandcode.ai/chat/completions is not a registered API
 route`), то есть адрес неверный, а не модели мёртвые. Оба соединения
 отключены; чинить нужно ключ/адрес, а не реестр.
+
+**`tool_call` в capability-таблице — измеренный факт, а не пожелание.**
+Сверка всего каталога с журналом (2026-11-17): у
+`ovhcloud/Mistral-Small-3.2-24B-Instruct-2506` стояло `tool_call = 1`, а за
+467 ходов агентного прогона с инструментами модель **ни разу** инструмент не
+вызвала — при том что другие модели в том же прогоне вызывали (gemini 99,
+sealion 59, pollinations 58). Поэтому `tool_call` исправлен на 0: модель
+исключается из запросов с инструментами, а в запросах без них остаётся.
+Обратная правка — одна строка в `model_capabilities`; бэкап БД перед правкой:
+`~/Backups/2026-11-17-heterion-router-db/storage.sqlite.pre-toolcall.sqlite`.
 
 **`base_url` может нести плейсхолдер `{env:ИМЯ}`** — например Cloudflare
 Workers AI требует `account_id` в пути, а он принадлежит аккаунту оператора,

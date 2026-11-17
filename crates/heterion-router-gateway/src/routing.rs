@@ -356,6 +356,37 @@ fn elapsed_ms(started: std::time::Instant) -> u32 {
     started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
 }
 
+/// How many characters the request body carries, the way a platform that
+/// counts characters instead of tokens measures it.
+///
+/// The platform sums the history with the tool schemas and the response
+/// format: oneminai answers `400 Messages, tools and response format exceed
+/// the 100,000 character limit` (probed live 2026-11-17).
+fn payload_chars(request: &ChatCompletionRequest) -> usize {
+    let mut chars = 0usize;
+    for message in &request.messages {
+        chars += message.role.chars().count();
+        match message.content.as_ref() {
+            Some(serde_json::Value::String(text)) => chars += text.chars().count(),
+            Some(other) => chars += other.to_string().chars().count(),
+            None => {}
+        }
+        if let Some(calls) = &message.tool_calls {
+            chars += calls.to_string().chars().count();
+        }
+        if let Some(id) = &message.tool_call_id {
+            chars += id.chars().count();
+        }
+    }
+    if let Some(tools) = &request.tools {
+        chars += tools.to_string().chars().count();
+    }
+    if let Some(format) = &request.response_format {
+        chars += format.to_string().chars().count();
+    }
+    chars
+}
+
 /// One attempt against a named backend: the request leaves without the
 /// internal attribution token, which no upstream may ever see, and without
 /// fields that only the OpenAI platform API defines. `store` (server-side
@@ -393,7 +424,7 @@ fn attempt(
     // A provider whose set of levels is narrower than the client's: the
     // request is pulled down to the strongest level it accepts (probed live
     // 2026-11-16 on groq, which takes `low`, `medium` and `high` only).
-    if let Some(allowed) = crate::provider_caps::allowed_efforts(provider) {
+    if let Some(allowed) = crate::provider_caps::allowed_efforts(provider, model) {
         let clamped =
             crate::provider_caps::clamp_effort(attempt.reasoning_effort.as_deref(), allowed);
         if attempt.reasoning_effort.is_some() && clamped != attempt.reasoning_effort {
@@ -452,6 +483,24 @@ fn attempt(
     {
         let cut = attempt.messages.len() - cap;
         attempt.messages.drain(0..cut);
+    }
+    // A platform that counts the request in characters, not tokens: oneminai
+    // answers `400 Messages, tools and response format exceed the 100,000
+    // character limit` (probed live 2026-11-17). The oldest **turns** go
+    // first — cut at a turn boundary, so a tool call never loses the result
+    // that answers it.
+    if let Some(limit) = crate::provider_caps::max_payload_chars(provider) {
+        while attempt.messages.len() > 1 && payload_chars(&attempt) > limit {
+            let cut = attempt
+                .messages
+                .iter()
+                .enumerate()
+                .skip(1)
+                .find(|(_, message)| message.role == "user")
+                .map(|(index, _)| index)
+                .unwrap_or(1);
+            attempt.messages.drain(0..cut);
+        }
     }
     // The output budget the platform publishes (probed live 2026-11-16 on
     // typhoon and oneminai).
@@ -741,6 +790,83 @@ mod attempt_tests {
         // A provider without a limit keeps the whole history.
         let gemini = attempt(&request, "gemini", "gemini-3.5-flash", None);
         assert_eq!(gemini.messages.len(), 69);
+    }
+
+    /// A platform that counts the request in characters refuses the whole
+    /// request when it is too big ("Messages, tools and response format exceed
+    /// the 100,000 character limit" — probed live 2026-11-17). The oldest
+    /// turns go first, as for the history-length rule.
+    #[test]
+    fn attempt_cuts_the_history_to_the_character_budget() {
+        let big = "x".repeat(40_000);
+        let messages = vec![
+            ChatMessage::plain("user", big.clone()),
+            ChatMessage::plain("assistant", big.clone()),
+            ChatMessage::plain("user", big.clone()),
+        ];
+        let request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages,
+            ..Default::default()
+        };
+        let out = attempt(&request, "oneminai", "gpt-4o-mini", None);
+        // Two turns of 40 000 characters are over the budget. The cut is at a
+        // turn boundary, so the oldest user turn goes together with the
+        // answer it produced.
+        assert_eq!(out.messages.len(), 1);
+        // The recent context stays: the newest turn is kept.
+        assert_eq!(
+            out.messages[0].content,
+            Some(serde_json::json!(big)),
+            "the newest turn is kept"
+        );
+        // Another platform keeps the whole history.
+        let gemini = attempt(&request, "gemini", "gemini-3.5-flash", None);
+        assert_eq!(gemini.messages.len(), 3);
+    }
+
+    /// The cut is made at a turn boundary: a tool call never loses the result
+    /// that answers it (a tool message without its call is refused by every
+    /// platform).
+    #[test]
+    fn attempt_cuts_the_history_at_a_turn_boundary() {
+        let big = "x".repeat(40_000);
+        let messages = vec![
+            ChatMessage::plain("user", big.clone()),
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Some(serde_json::json!([{"id": "c1"}])),
+                tool_call_id: None,
+                name: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(serde_json::json!(big.clone())),
+                reasoning_content: None,
+                tool_calls: None,
+                tool_call_id: Some("c1".into()),
+                name: None,
+            },
+            ChatMessage::plain("user", big.clone()),
+        ];
+        let request = ChatCompletionRequest {
+            model: "combo".into(),
+            messages,
+            ..Default::default()
+        };
+        let out = attempt(&request, "oneminai", "gpt-4o-mini", None);
+        // The tool call and its result went together with the turn they
+        // belong to.
+        assert!(out.messages.iter().all(|message| message.role != "tool"));
+        assert!(
+            out.messages
+                .iter()
+                .all(|message| message.role != "assistant")
+        );
+        assert_eq!(out.messages.len(), 1);
+        assert_eq!(out.messages[0].content, Some(serde_json::json!(big)));
     }
 }
 
@@ -1829,6 +1955,27 @@ impl ChatBackend for RoutingBackend {
                 continue;
             }
 
+            // The request as this provider will see it: the rules of
+            // `attempt()` have already brought it inside the platform's
+            // limits.
+            let attempt_request = attempt(&candidate_req, name, target_model, Some(target_limit));
+            // A platform that counts the request in characters refuses the
+            // whole request when it is too big, and cutting the history is not
+            // always enough — one huge turn or the tool schemas alone are
+            // already over the budget. The refusal is certain, so the ladder
+            // moves on instead of paying for it.
+            if let Some(limit) = crate::provider_caps::max_payload_chars(name)
+                && payload_chars(&attempt_request) > limit
+            {
+                tracing::debug!(
+                    provider = %name,
+                    model = %target_model,
+                    limit,
+                    "skipping candidate: the request is bigger than the platform's character budget"
+                );
+                continue;
+            }
+
             let mut retry_count = 0;
             loop {
                 if !self.lock_breakers().allow(name, Instant::now()) {
@@ -1840,15 +1987,7 @@ impl ChatBackend for RoutingBackend {
                 };
                 attempts += 1;
                 let attempt_started = std::time::Instant::now();
-                match backend
-                    .complete(attempt(
-                        &candidate_req,
-                        name,
-                        target_model,
-                        Some(target_limit),
-                    ))
-                    .await
-                {
+                match backend.complete(attempt_request.clone()).await {
                     Ok(response) => {
                         self.lock_breakers().record_success(name);
                         // Post-flight tool validation.
@@ -2108,6 +2247,22 @@ impl ChatBackend for RoutingBackend {
                     continue;
                 }
 
+                // The request as this provider will see it, and the same
+                // character budget as in the non-streaming path.
+                let attempt_request =
+                    attempt(&candidate_req, name, target_model, Some(target_limit));
+                if let Some(limit) = crate::provider_caps::max_payload_chars(name)
+                    && payload_chars(&attempt_request) > limit
+                {
+                    tracing::debug!(
+                        provider = %name,
+                        model = %target_model,
+                        limit,
+                        "skipping candidate: the request is bigger than the platform's character budget"
+                    );
+                    continue;
+                }
+
                 let mut retry_count = 0;
                 loop {
                     if !this.lock_breakers().allow(name, Instant::now()) {
@@ -2119,12 +2274,7 @@ impl ChatBackend for RoutingBackend {
                     };
                     attempts += 1;
                     let attempt_started = std::time::Instant::now();
-                    let mut stream = backend.stream(attempt(
-                        &candidate_req,
-                        name,
-                        target_model,
-                        Some(target_limit),
-                    ));
+                    let mut stream = backend.stream(attempt_request.clone());
 
                     match stream.next().await {
                         Some(Ok(first)) => {

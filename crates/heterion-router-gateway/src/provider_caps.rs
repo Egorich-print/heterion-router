@@ -18,7 +18,20 @@
 /// `low`, `medium`, or `high`` — a client that sends `xhigh` or `max` loses
 /// the whole turn (measured live 2026-11-16, 50 refusals on
 /// `openai/gpt-oss-120b` and `openai/gpt-oss-20b`).
-pub fn allowed_efforts(provider: &str) -> Option<&'static [&'static str]> {
+///
+/// The set is sometimes the **model's**, not the platform's: Cloudflare
+/// Workers AI routes to different engines behind the same endpoint, and each
+/// engine names its own levels — `gpt-oss` on Harmony takes `high`, `medium`,
+/// `low` («reasoning_effort='max' is not supported by Harmony. Supported
+/// values are: high, medium, low» — 54 refusals on 2026-11-17), while
+/// `qwen3.8` takes `xhigh`, `medium`, `low` and rejects `high` outright
+/// («Unexpected reasoning effort high. Supported types are xhigh (default),
+/// medium, and low» — 60 refusals the same day). The same Qwen3.8 engine
+/// behind sealion answers with that identical wording («Unexpected reasoning
+/// effort max. Supported types are xhigh (default), medium, and low» — 8
+/// refusals), so the rule names the model id, not the platform.
+pub fn allowed_efforts(provider: &str, model: &str) -> Option<&'static [&'static str]> {
+    let model = model.to_ascii_lowercase();
     match provider {
         "groq" => Some(&["low", "medium", "high"]),
         // oneminai knows every OpenAI level except `max` (probed live
@@ -30,6 +43,11 @@ pub fn allowed_efforts(provider: &str) -> Option<&'static [&'static str]> {
         // unknown variant `max`, expected one of `none`, `high`, `medium`,
         // `low`, `minimal`" — 114 refusals).
         "pollinations" => Some(&["none", "minimal", "low", "medium", "high"]),
+        // Cloudflare Workers AI: the engine behind the id names the levels.
+        "cloudflare-ai" if model.contains("qwen3.8") => Some(&["low", "medium", "xhigh"]),
+        "cloudflare-ai" if model.contains("gpt-oss") => Some(&["low", "medium", "high"]),
+        // The same Qwen3.8 engine behind sealion.
+        "sealion" if model.contains("sea-lion-v4-32b") => Some(&["low", "medium", "xhigh"]),
         _ => None,
     }
 }
@@ -40,8 +58,15 @@ pub fn allowed_efforts(provider: &str) -> Option<&'static [&'static str]> {
 /// reasoning_effort` for its Qwen3.8 models — the field is not merely
 /// misvalued there, it is not part of that model's request shape (measured
 /// live 2026-11-16, 11 refusals on `qwen/qwen3.8-27b`).
+///
+/// ovhcloud answers `400 {"message":"feature 'reasoning_effort for this
+/// model' is not currently supported"}` for `Meta-Llama-3_3-70B-Instruct`
+/// (measured live 2026-11-17): the field is not part of that model's request
+/// shape at all, so it is removed instead of being valued.
 pub fn rejects_reasoning_effort_field(provider: &str, model: &str) -> bool {
-    provider == "groq" && model.to_ascii_lowercase().contains("qwen3.8")
+    let model = model.to_ascii_lowercase();
+    (provider == "groq" && model.contains("qwen3.8"))
+        || (provider == "ovhcloud" && model.contains("meta-llama-3_3-70b"))
 }
 
 /// Providers whose API refuses an assistant message that carries
@@ -102,6 +127,28 @@ pub fn max_output_tokens(provider: &str, model: &str) -> Option<u32> {
 pub fn max_prompt_tokens(provider: &str) -> Option<u32> {
     match provider {
         "groq" => Some(8_000),
+        _ => None,
+    }
+}
+
+/// The largest request a platform accepts, counted in **characters**.
+///
+/// Some platforms count characters, not tokens, and sum the history with the
+/// tool schemas and the response format. oneminai answers `400
+/// invalid_request_error: Messages, tools and response format exceed the
+/// 100,000 character limit` (measured live 2026-11-17: 2 refusals in the agent
+/// run, plus a probe — ~110 000 characters of tool schemas alone were refused
+/// the same way).
+///
+/// The same platform caps a single message: `400 Too big: expected string to
+/// have <=100000 characters` with the path `messages.0.content`.
+///
+/// The history is cut first (the oldest turns go, as for typhoon). When even
+/// that is not enough — one huge turn or the tool schemas alone — the ladder
+/// skips the candidate instead of paying for the refusal.
+pub fn max_payload_chars(provider: &str) -> Option<usize> {
+    match provider {
+        "oneminai" => Some(100_000),
         _ => None,
     }
 }
@@ -191,6 +238,7 @@ mod tests {
     use super::clamp_effort;
     use super::max_messages;
     use super::max_output_tokens;
+    use super::max_payload_chars;
     use super::max_prompt_tokens;
     use super::rejects_reasoning_content;
     use super::rejects_reasoning_effort_field;
@@ -200,7 +248,7 @@ mod tests {
     /// strongest of them.
     #[test]
     fn a_stronger_effort_is_pulled_down_to_the_provider_ceiling() {
-        let allowed = allowed_efforts("groq").expect("groq has its own set");
+        let allowed = allowed_efforts("groq", "openai/gpt-oss-120b").expect("groq has its own set");
         assert_eq!(
             clamp_effort(Some("xhigh"), allowed).as_deref(),
             Some("high")
@@ -211,7 +259,7 @@ mod tests {
     /// A level the provider accepts rides along unchanged.
     #[test]
     fn an_accepted_effort_is_left_alone() {
-        let allowed = allowed_efforts("groq").expect("groq has its own set");
+        let allowed = allowed_efforts("groq", "openai/gpt-oss-120b").expect("groq has its own set");
         assert_eq!(clamp_effort(Some("low"), allowed).as_deref(), Some("low"));
         assert_eq!(
             clamp_effort(Some("medium"), allowed).as_deref(),
@@ -225,7 +273,7 @@ mod tests {
     /// client with the provider default instead of the level it asked for.
     #[test]
     fn a_weaker_effort_is_lifted_to_the_provider_floor() {
-        let allowed = allowed_efforts("groq").expect("groq has its own set");
+        let allowed = allowed_efforts("groq", "openai/gpt-oss-120b").expect("groq has its own set");
         assert_eq!(
             clamp_effort(Some("minimal"), allowed).as_deref(),
             Some("low")
@@ -236,7 +284,7 @@ mod tests {
     /// A value the router does not know is dropped rather than guessed.
     #[test]
     fn an_unknown_effort_is_dropped() {
-        let allowed = allowed_efforts("groq").expect("groq has its own set");
+        let allowed = allowed_efforts("groq", "openai/gpt-oss-120b").expect("groq has its own set");
         assert_eq!(clamp_effort(Some("extreme"), allowed), None);
         assert_eq!(clamp_effort(None, allowed), None);
     }
@@ -244,15 +292,16 @@ mod tests {
     /// A provider without its own set keeps the client's value untouched.
     #[test]
     fn a_provider_without_a_set_is_not_touched() {
-        assert!(allowed_efforts("gemini").is_none());
-        assert!(allowed_efforts("kilocode").is_none());
+        assert!(allowed_efforts("gemini", "gemini-3.5-flash").is_none());
+        assert!(allowed_efforts("kilocode", "stealth/glyph-cluster").is_none());
     }
 
     /// pollinations knows five levels: none, minimal, low, medium, high.
     /// A stronger request is pulled down to the strongest of them.
     #[test]
     fn pollinations_knows_five_levels() {
-        let allowed = allowed_efforts("pollinations").expect("pollinations has its own set");
+        let allowed =
+            allowed_efforts("pollinations", "openai-fast").expect("pollinations has its own set");
         assert_eq!(clamp_effort(Some("max"), allowed).as_deref(), Some("high"));
         assert_eq!(
             clamp_effort(Some("xhigh"), allowed).as_deref(),
@@ -275,6 +324,75 @@ mod tests {
         assert!(wants_string_content("cloudflare-ai"));
         assert!(!wants_string_content("gemini"));
         assert!(!wants_string_content("pollinations"));
+    }
+
+    /// Cloudflare's Qwen3.8 engine takes xhigh, medium and low — and refuses
+    /// `high` outright ("Unexpected reasoning effort high. Supported types are
+    /// xhigh (default), medium, and low", measured live 2026-11-17).
+    #[test]
+    fn cloudflare_qwen38_takes_xhigh_medium_low() {
+        let allowed = allowed_efforts("cloudflare-ai", "@cf/qwen/qwen3.8-27b")
+            .expect("the engine has its own set");
+        assert_eq!(clamp_effort(Some("max"), allowed).as_deref(), Some("xhigh"));
+        assert_eq!(
+            clamp_effort(Some("xhigh"), allowed).as_deref(),
+            Some("xhigh")
+        );
+        // `high` is stronger than the platform's `medium`, so it is pulled
+        // down to the strongest level the engine has.
+        assert_eq!(
+            clamp_effort(Some("high"), allowed).as_deref(),
+            Some("medium")
+        );
+        assert_eq!(clamp_effort(Some("low"), allowed).as_deref(), Some("low"));
+    }
+
+    /// Cloudflare's gpt-oss runs on Harmony, which takes high, medium and low
+    /// ("reasoning_effort='max' is not supported by Harmony. Supported values
+    /// are: high, medium, low", measured live 2026-11-17).
+    #[test]
+    fn cloudflare_gpt_oss_takes_high_medium_low() {
+        let allowed = allowed_efforts("cloudflare-ai", "@cf/openai/gpt-oss-120b")
+            .expect("the engine has its own set");
+        assert_eq!(clamp_effort(Some("max"), allowed).as_deref(), Some("high"));
+        assert_eq!(clamp_effort(Some("high"), allowed).as_deref(), Some("high"));
+        assert_eq!(clamp_effort(Some("low"), allowed).as_deref(), Some("low"));
+    }
+
+    /// The same Qwen3.8 engine behind sealion answers with that identical
+    /// wording ("Unexpected reasoning effort max. Supported types are xhigh
+    /// (default), medium, and low", measured live 2026-11-17).
+    #[test]
+    fn sealion_32b_takes_xhigh_medium_low() {
+        let allowed = allowed_efforts("sealion", "aisingapore/Qwen-SEA-LION-v4-32B-IT")
+            .expect("the engine has its own set");
+        assert_eq!(clamp_effort(Some("max"), allowed).as_deref(), Some("xhigh"));
+        assert_eq!(
+            clamp_effort(Some("high"), allowed).as_deref(),
+            Some("medium")
+        );
+    }
+
+    /// ovhcloud's Llama does not have the field at all ("feature
+    /// 'reasoning_effort for this model' is not currently supported", measured
+    /// live 2026-11-17).
+    #[test]
+    fn ovhcloud_llama_refuses_the_field_entirely() {
+        assert!(rejects_reasoning_effort_field(
+            "ovhcloud",
+            "Meta-Llama-3_3-70B-Instruct"
+        ));
+        assert!(!rejects_reasoning_effort_field(
+            "ovhcloud",
+            "Mistral-Small-3.2-24B-Instruct-2506"
+        ));
+    }
+
+    /// oneminai counts the request in characters.
+    #[test]
+    fn oneminai_counts_characters() {
+        assert_eq!(max_payload_chars("oneminai"), Some(100_000));
+        assert_eq!(max_payload_chars("gemini"), None);
     }
 
     /// groq refuses the field outright for its Qwen3.8 models.
@@ -305,7 +423,7 @@ mod tests {
     /// oneminai knows every level except `max`.
     #[test]
     fn oneminai_knows_every_level_but_max() {
-        let allowed = allowed_efforts("oneminai").expect("oneminai has its own set");
+        let allowed = allowed_efforts("oneminai", "gpt-4o-mini").expect("oneminai has its own set");
         assert_eq!(clamp_effort(Some("max"), allowed).as_deref(), Some("xhigh"));
         assert_eq!(
             clamp_effort(Some("xhigh"), allowed).as_deref(),

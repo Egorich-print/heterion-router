@@ -7164,20 +7164,6 @@
     ]
   },
   {
-    "id": "minimax",
-    "alias": "minimax",
-    "format": "openai",
-    "executor": "default",
-    "auth_type": "apikey",
-    "base_url": "https://api.minimax.io/v1/chat/completions",
-    "models": [
-      {
-        "id": "MiniMax-M3",
-        "target_format": null
-      }
-    ]
-  },
-  {
     "id": "minimax-cn",
     "alias": "minimax-cn",
     "format": "openai",
@@ -7892,88 +7878,6 @@
     "auth_type": "apikey",
     "base_url": "https://api.ofox.ai/v1/chat/completions",
     "models": []
-  },
-  {
-    "id": "ollama-cloud",
-    "alias": "ollamacloud",
-    "format": "openai",
-    "executor": "default",
-    "auth_type": "apikey",
-    "base_url": "https://ollama.com/v1/chat/completions",
-    "models": [
-      {
-        "id": "glm-5.3",
-        "target_format": null
-      },
-      {
-        "id": "glm-5.3-flash",
-        "target_format": null
-      },
-      {
-        "id": "glm-5.2",
-        "target_format": null
-      },
-      {
-        "id": "kimi-k3",
-        "target_format": null
-      },
-      {
-        "id": "kimi-k2.7-code",
-        "target_format": null
-      },
-      {
-        "id": "kimi-k2.6",
-        "target_format": null
-      },
-      {
-        "id": "minimax-m3.1-flash",
-        "target_format": null
-      },
-      {
-        "id": "minimax-m3",
-        "target_format": null
-      },
-      {
-        "id": "minimax-m2.7",
-        "target_format": null
-      },
-      {
-        "id": "muse-spark-open",
-        "target_format": null
-      },
-      {
-        "id": "gemma4:31b",
-        "target_format": null
-      },
-      {
-        "id": "gpt-oss:120b",
-        "target_format": null
-      },
-      {
-        "id": "gpt-oss:20b",
-        "target_format": null
-      },
-      {
-        "id": "mistral-large-4",
-        "target_format": null
-      },
-      {
-        "id": "mistral-large-3:675b",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-v4-pro:0813",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-v4.1-flash",
-        "target_format": null
-      },
-      {
-        "id": "deepseek-v4.1-flash:1017",
-        "target_format": null
-      }
-    ]
   },
   {
     "id": "oneminai",
