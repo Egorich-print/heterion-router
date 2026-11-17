@@ -74,10 +74,49 @@ pub async fn fetch_quota(
     model: Option<&str>,
     token: &str,
 ) -> Result<QuotaReading, String> {
-    let Some(url) = crate::provider_status::probe_url(format, base_url, model) else {
+    let candidates: Vec<String> = model
+        .map(|model| vec![model.to_string()])
+        .unwrap_or_default();
+    measure_quota(http, provider, format, base_url, &candidates, token)
+        .await
+        .ok_or_else(|| "the platform said nothing about the quota".to_string())
+}
+
+/// The token budgets a probe may ask for, smallest first.
+///
+/// One token is the smallest request a platform accepts, but not every
+/// platform accepts it: AI Horde's native text API refuses a limit below 16
+/// (measured 17.11.2026 — «the AI Horde refuses a token limit below 16, the
+/// minimum generation length of its native text API»), so a probe that may
+/// only ask for one token never gets an answer there and the platform is
+/// reported as `unknown`. The ladder is climbed only when the platform
+/// complains about the budget itself.
+const PROBE_BUDGETS: [u32; 3] = [1, 16, 64];
+
+/// How many models of the platform's own catalogue a probe may try.
+const CATALOG_CANDIDATES: usize = 3;
+
+/// One probe answer.
+struct ProbeAnswer {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: String,
+}
+
+/// Send one probe request.
+async fn probe_once(
+    http: &reqwest::Client,
+    provider: &str,
+    format: Option<&str>,
+    base_url: &str,
+    model: &str,
+    token: &str,
+    budget: u32,
+) -> Result<ProbeAnswer, String> {
+    let Some(url) = crate::provider_status::probe_url(format, base_url, Some(model)) else {
         return Err("the provider has no probeable endpoint".to_string());
     };
-    let body = crate::provider_status::probe_body(format, model);
+    let body = crate::provider_status::probe_body_with_budget(format, Some(model), budget);
     let mut request = http.post(&url).body(body);
     for (name, value) in catalog::catalog_headers(provider, format, token) {
         request = request.header(name, value);
@@ -102,7 +141,82 @@ pub async fn fetch_quota(
         .text()
         .await
         .map_err(|error| format!("quota answer unreadable: {error}"))?;
-    Ok(quota::reading_from_response(status, &headers, &body))
+    Ok(ProbeAnswer {
+        status,
+        headers,
+        body,
+    })
+}
+
+/// Whether the platform refused because of the token budget, not the quota.
+///
+/// Measured on AI Horde (17.11.2026): a `400` about `max_tokens`. A `429` is
+/// never one of these — that is the quota itself speaking.
+fn refuses_the_budget(status: u16, body: &str) -> bool {
+    if status != 400 && status != 422 {
+        return false;
+    }
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("max_tokens")
+        || lowered.contains("max_output_tokens")
+        || lowered.contains("token limit")
+        || lowered.contains("minimum generation length")
+}
+
+/// Whether the platform says the model itself is not there.
+///
+/// Measured on llm7 («Model '…' is currently unavailable», code
+/// `model_unavailable`) and nvidia (410 Gone, «the model … has reached its
+/// end of life»). The registry still lists both — the platform's own
+/// catalogue is the newer word.
+fn refuses_the_model(status: u16, body: &str) -> bool {
+    let lowered = body.to_ascii_lowercase();
+    lowered.contains("model_unavailable")
+        || lowered.contains("model_not_found")
+        || lowered.contains("not_found_error")
+        || lowered.contains("currently unavailable")
+        || lowered.contains("no longer available")
+        || lowered.contains("end of life")
+        || lowered.contains("does not exist")
+        || lowered.contains("no such model")
+        || (status == 404 && lowered.contains("model"))
+}
+
+/// Measure the quota, trying the models the platform still serves.
+///
+/// The candidates come in order: the model the registry names first, then the
+/// platform's own catalogue. A candidate is dropped only when the platform
+/// says the *model* is not there — a refusal about anything else (budget,
+/// quota, credential) is the answer.
+async fn measure_quota(
+    http: &reqwest::Client,
+    provider: &str,
+    format: Option<&str>,
+    base_url: &str,
+    candidates: &[String],
+    token: &str,
+) -> Option<QuotaReading> {
+    for candidate in candidates {
+        for (index, budget) in PROBE_BUDGETS.iter().enumerate() {
+            let Ok(answer) =
+                probe_once(http, provider, format, base_url, candidate, token, *budget).await
+            else {
+                continue;
+            };
+            if refuses_the_budget(answer.status, &answer.body) && index + 1 < PROBE_BUDGETS.len() {
+                continue;
+            }
+            if refuses_the_model(answer.status, &answer.body) {
+                break;
+            }
+            return Some(quota::reading_from_response(
+                answer.status,
+                &answer.headers,
+                &answer.body,
+            ));
+        }
+    }
+    None
 }
 
 /// Measure one connection: its catalogue and its quota.
@@ -116,12 +230,25 @@ pub async fn sync_connection(
     model: Option<&str>,
 ) -> SyncOutcome {
     let catalog = fetch_catalog(http, provider, format, base_url, token).await;
-    let quota = fetch_quota(http, provider, format, base_url, model, token).await;
     let (catalog, error) = match catalog {
         Ok(catalog) => (catalog, None),
         Err(error) => (Vec::new(), Some(error)),
     };
-    let quota = quota.ok();
+
+    // The model the registry names comes first; the platform's own catalogue
+    // follows it, because the registry still lists models the platform retired
+    // (llm7, nvidia — measured 17.11.2026).
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(model) = model {
+        candidates.push(model.to_string());
+    }
+    for entry in catalog.iter().take(CATALOG_CANDIDATES) {
+        if !candidates.contains(&entry.id) {
+            candidates.push(entry.id.clone());
+        }
+    }
+
+    let quota = measure_quota(http, provider, format, base_url, &candidates, token).await;
     let error = match (error, &quota) {
         (Some(error), _) => Some(error),
         (None, None) => Some("the platform said nothing about the quota".to_string()),

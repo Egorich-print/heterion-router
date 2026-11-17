@@ -11,7 +11,8 @@
 //!    pass that builds a backend without a credential is narrow on purpose.
 
 use heterion_router_gateway::provider_status::{
-    ProviderReason, classify, is_keyless, keyless_candidate, probe, probe_body, probe_url,
+    ProviderReason, classify, is_keyless, keyless_candidate, probe, probe_body,
+    probe_body_with_budget, probe_url,
 };
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
 
@@ -122,6 +123,20 @@ fn the_probe_body_is_per_format() {
 
     let responses = probe_body(Some("openai-responses"), Some("m-1"));
     assert!(responses.contains("\"input\""));
+}
+
+/// The budget of a probe is a parameter: not every platform accepts one token
+/// (AI Horde refuses anything below 16 — measured 17.11.2026).
+#[test]
+fn the_probe_budget_is_a_parameter() {
+    let openai = probe_body_with_budget(Some("openai"), Some("m-1"), 16);
+    assert!(openai.contains("\"max_tokens\":16"));
+
+    let gemini = probe_body_with_budget(Some("gemini"), Some("m-1"), 16);
+    assert!(gemini.contains("\"maxOutputTokens\":16"));
+
+    let responses = probe_body_with_budget(Some("openai-responses"), Some("m-1"), 16);
+    assert!(responses.contains("\"max_output_tokens\":16"));
 }
 
 /// AC3 — the keyless pass is narrow on purpose.

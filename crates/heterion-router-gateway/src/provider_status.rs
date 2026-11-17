@@ -193,28 +193,43 @@ pub fn probe_url(format: Option<&str>, base_url: &str, model: Option<&str>) -> O
 /// It is deliberately trivial: the probe asks whether the platform *talks*,
 /// not whether it can write a poem.
 pub fn probe_body(format: Option<&str>, model: Option<&str>) -> String {
+    probe_body_with_budget(format, model, 1)
+}
+
+/// The smallest request body a probe sends, with an explicit token budget.
+///
+/// The budget is a separate argument because not every platform accepts the
+/// smallest one: AI Horde's native text API refuses a limit below 16 (measured
+/// 17.11.2026). A probe that may only ask for one token therefore has no
+/// answer there — so the budget is a parameter, and the caller decides how far
+/// to climb.
+pub fn probe_body_with_budget(
+    format: Option<&str>,
+    model: Option<&str>,
+    max_tokens: u32,
+) -> String {
     let model = model.unwrap_or("probe");
     match format.unwrap_or("openai") {
         "openai-responses" => serde_json::json!({
             "model": model,
             "input": "ping",
-            "max_output_tokens": 1,
+            "max_output_tokens": max_tokens,
         })
         .to_string(),
         "claude" => serde_json::json!({
             "model": model,
-            "max_tokens": 1,
+            "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": "ping"}],
         })
         .to_string(),
         "gemini" => serde_json::json!({
             "contents": [{"parts": [{"text": "ping"}]}],
-            "generationConfig": {"maxOutputTokens": 1},
+            "generationConfig": {"maxOutputTokens": max_tokens},
         })
         .to_string(),
         _ => serde_json::json!({
             "model": model,
-            "max_tokens": 1,
+            "max_tokens": max_tokens,
             "messages": [{"role": "user", "content": "ping"}],
         })
         .to_string(),
