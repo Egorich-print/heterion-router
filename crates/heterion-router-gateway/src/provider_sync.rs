@@ -44,7 +44,7 @@ pub async fn fetch_catalog(
         return Err("the provider declares no models endpoint".to_string());
     };
     let mut request = http.get(&url);
-    for (name, value) in catalog::catalog_headers(provider, token) {
+    for (name, value) in catalog::catalog_headers(provider, format, token) {
         request = request.header(name, value);
     }
     let response = request
@@ -79,7 +79,7 @@ pub async fn fetch_quota(
     };
     let body = crate::provider_status::probe_body(format, model);
     let mut request = http.post(&url).body(body);
-    for (name, value) in catalog::catalog_headers(provider, token) {
+    for (name, value) in catalog::catalog_headers(provider, format, token) {
         request = request.header(name, value);
     }
     request = request.header("content-type", "application/json");

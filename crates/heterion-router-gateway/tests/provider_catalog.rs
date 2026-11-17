@@ -242,4 +242,43 @@ async fn the_admin_api_reports_both() {
     assert_eq!(payload["providers"][0]["provider"], "sambanova");
     assert_eq!(payload["providers"][0]["exhausted"], true);
     assert_eq!(payload["providers"][0]["remaining_percentage"], 13.7);
+    assert_eq!(
+        payload["providers"][0]["stale"], false,
+        "a reading taken now is not stale"
+    );
+}
+
+#[tokio::test]
+async fn a_reading_from_the_js_era_is_marked_stale() {
+    let db = Db::open_in_memory().unwrap();
+    db.migrate().unwrap();
+    {
+        let guard = db.connection();
+        // The JS server wrote ISO timestamps with a `T` and a `Z`.
+        guard
+            .execute(
+                "INSERT INTO quota_snapshots (provider, connection_id, window_key, is_exhausted, created_at)
+                 VALUES ('deepseek', 'old-1', 'credits_usd', 0, '2026-09-16T23:13:55.320Z')",
+                [],
+            )
+            .unwrap();
+    }
+
+    let router = build_router_with_state(AppState::with_db(Arc::new(EchoBackend), Arc::new(db)));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/providers/quota")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        payload["providers"][0]["stale"], true,
+        "a reading from another era must not pass as a measurement: {payload}"
+    );
 }

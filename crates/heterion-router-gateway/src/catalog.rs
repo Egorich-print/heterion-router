@@ -96,7 +96,11 @@ pub fn parse_catalog(body: &str) -> Vec<CatalogModel> {
 /// The session header matters: OpenCode's Console refuses a request without
 /// `x-opencode-session` outright, so a fetch that omits it would report "no
 /// models" for a platform that has hundreds.
-pub fn catalog_headers(provider: &str, token: &str) -> Vec<(String, String)> {
+pub fn catalog_headers(provider: &str, format: Option<&str>, token: &str) -> Vec<(String, String)> {
+    // Gemini takes the key in its own header, not as a bearer token.
+    if format == Some("gemini") {
+        return vec![("x-goog-api-key".to_string(), token.to_string())];
+    }
     let mut headers = vec![("authorization".to_string(), format!("Bearer {token}"))];
     if provider.starts_with("opencode") {
         // The catalogue request is not part of a conversation, so a stable
@@ -193,14 +197,24 @@ mod tests {
 
     #[test]
     fn the_session_header_is_only_for_opencode() {
-        let opencode = catalog_headers("opencode-go", "token");
+        let opencode = catalog_headers("opencode-go", Some("openai"), "token");
         assert!(
             opencode
                 .iter()
                 .any(|(name, value)| name == "x-opencode-session" && !value.is_empty()),
             "OpenCode refuses a request without a session id: {opencode:?}"
         );
-        let other = catalog_headers("sambanova", "token");
+        let other = catalog_headers("sambanova", Some("openai"), "token");
         assert!(!other.iter().any(|(name, _)| name == "x-opencode-session"));
+    }
+
+    #[test]
+    fn gemini_takes_its_key_in_its_own_header() {
+        let headers = catalog_headers("gemini", Some("gemini"), "key-1");
+        assert_eq!(
+            headers,
+            vec![("x-goog-api-key".to_string(), "key-1".to_string())],
+            "Gemini does not read a bearer token"
+        );
     }
 }

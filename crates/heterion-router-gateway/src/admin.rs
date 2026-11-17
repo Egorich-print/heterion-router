@@ -553,6 +553,11 @@ pub async fn provider_quota(
     };
     let guard = db.connection();
     let rows = repos::latest_quota_snapshots(&guard);
+    // A reading older than a day is history, not a measurement: the table
+    // carries readings from the JS era too, and they must not pass as fresh.
+    let cutoff: String = guard
+        .query_row("SELECT datetime('now', '-1 day')", [], |row| row.get(0))
+        .unwrap_or_default();
     let providers: Vec<Value> = rows
         .iter()
         .map(|row| {
@@ -565,10 +570,24 @@ pub async fn provider_quota(
                 "resets_at": row.next_reset_at,
                 "detail": row.raw_data,
                 "measured_at": row.created_at,
+                "stale": is_stale(&row.created_at, &cutoff),
             })
         })
         .collect();
     Json(json!({ "providers": providers }))
+}
+
+/// Whether a reading was taken before the cutoff.
+///
+/// The two eras write the timestamp differently — SQLite writes
+/// `2026-11-17 17:55:43`, the JS server wrote `2026-11-17T17:55:43.320Z` —
+/// so both are cut to the same shape before they are compared.
+fn is_stale(measured_at: &str, cutoff: &str) -> bool {
+    if cutoff.is_empty() {
+        return false;
+    }
+    let normalized: String = measured_at.replace('T', " ").chars().take(19).collect();
+    normalized.as_str() < cutoff
 }
 
 /// `POST /api/providers/{id}/sync` — measure one provider now.
