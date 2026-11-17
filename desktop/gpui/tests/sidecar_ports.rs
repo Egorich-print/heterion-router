@@ -199,3 +199,39 @@ fn the_instance_lock_is_exclusive() {
 
     panic!("no free port could be found for the instance lock");
 }
+
+#[test]
+fn an_explicit_port_is_never_second_guessed_and_a_silent_one_is_asked() {
+    // Each environment change is scoped on its own: the guard holds the lock
+    // of this file, so the second one must not be taken while the first is
+    // still alive — that would wait for a lock nobody releases.
+    {
+        let _env = Env::apply(&[
+            ("HETERION_ROUTER_PORT", Some("20128")),
+            ("OMNIROUTE_RUST_PORT", None),
+        ]);
+        assert_eq!(
+            sidecar::candidate_ports(),
+            vec![20128],
+            "the operator named the gateway: the shell goes there and nowhere else"
+        );
+    }
+
+    {
+        let _env = Env::apply(&[
+            ("HETERION_ROUTER_PORT", None),
+            ("OMNIROUTE_RUST_PORT", None),
+        ]);
+        assert_eq!(
+            sidecar::candidate_ports(),
+            vec![sidecar::GATEWAY_DEFAULT_PORT, sidecar::SERVICE_PORT],
+            "without an explicit port the shell asks the gateway's own default first \
+             and the installed service second"
+        );
+    }
+    assert_ne!(
+        sidecar::GATEWAY_DEFAULT_PORT,
+        sidecar::SERVICE_PORT,
+        "the two ports must differ, otherwise the second candidate is the first"
+    );
+}

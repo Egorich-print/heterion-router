@@ -643,6 +643,135 @@ pub struct AppLogsResponse {
     pub lines: Vec<String>,
 }
 
+/// `GET /api/routing/plan?model=auto` — the ladder of the `auto` combo.
+///
+/// The plan is what the router would try next, in order, and why a model of
+/// the registry is *not* in it.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct RoutingPlan {
+    /// The model the plan belongs to.
+    #[serde(default)]
+    pub model: String,
+    /// Whether the plan was built for a request with tools.
+    #[serde(default)]
+    pub tools: bool,
+    /// Whether the plan was built for a request with an image.
+    #[serde(default)]
+    pub images: bool,
+    /// The candidates, best first.
+    #[serde(default)]
+    pub candidates: Vec<PlanCandidate>,
+}
+
+/// One candidate of the `auto` plan.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PlanCandidate {
+    /// Provider id the candidate dispatches to.
+    pub provider: String,
+    /// Bare model id.
+    pub model: String,
+    /// The priority the registry gives the model.
+    #[serde(default)]
+    pub base_priority: f64,
+    /// The quality score the router keeps for the model.
+    #[serde(default)]
+    pub quality_score: f64,
+    /// How available the model is, `0.0`–`1.0`.
+    #[serde(default)]
+    pub availability: f64,
+    /// The soft cooldown factor.
+    #[serde(default)]
+    pub soft_cooldown: f64,
+    /// The score the router sorts by — the current priority.
+    #[serde(default)]
+    pub effective: f64,
+    /// Why the candidate is not selectable (`no_backend`, `cooldown`, …).
+    ///
+    /// Empty when the candidate is selectable.
+    #[serde(default)]
+    pub excluded: String,
+}
+
+/// `GET /api/providers/quota` — how much of each platform's budget is left.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct QuotaResponse {
+    /// One row per connection that has a reading.
+    #[serde(default)]
+    pub providers: Vec<QuotaReading>,
+}
+
+/// One quota reading of one connection.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct QuotaReading {
+    /// Provider id.
+    pub provider: String,
+    /// Connection the reading was taken with.
+    #[serde(default)]
+    pub connection_id: String,
+    /// The window the reading describes (`credits`, `rate_limit`, `daily`, …).
+    #[serde(default)]
+    pub window: String,
+    /// The state the reading was taken in: `available`, `exhausted`,
+    /// `credits_required`, `needs_key` or `unknown`.
+    #[serde(default)]
+    pub state: String,
+    /// How much of the window is left, in percent, when the platform says.
+    #[serde(default)]
+    pub remaining_percentage: Option<f64>,
+    /// Whether the platform refused for want of budget.
+    #[serde(default)]
+    pub exhausted: bool,
+    /// When the window resets, when the platform says.
+    #[serde(default)]
+    pub resets_at: Option<String>,
+    /// The platform's own words, when it refused.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// When the reading was taken.
+    #[serde(default)]
+    pub measured_at: Option<String>,
+    /// A reading older than a day is history, not a measurement.
+    #[serde(default)]
+    pub stale: bool,
+}
+
+/// `GET /api/providers/catalog` — the models the platforms serve today.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct CatalogResponse {
+    /// One entry per platform that published a catalogue.
+    #[serde(default)]
+    pub providers: Vec<CatalogProvider>,
+}
+
+/// The catalogue of one platform.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CatalogProvider {
+    /// Provider id.
+    pub provider: String,
+    /// How many models the platform lists.
+    #[serde(default)]
+    pub count: usize,
+    /// When the catalogue was fetched.
+    #[serde(default)]
+    pub fetched_at: Option<String>,
+    /// The models themselves.
+    #[serde(default)]
+    pub models: Vec<CatalogModel>,
+}
+
+/// One model of a platform's catalogue.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct CatalogModel {
+    /// The model id, as the platform writes it.
+    pub id: String,
+    /// The context window, when the platform publishes one.
+    #[serde(default)]
+    pub context_length: Option<i64>,
+    /// The connection the catalogue was fetched with.
+    #[serde(default)]
+    pub connection_id: String,
+}
+
 /// Body of `POST /api/keys`.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateKeyBody {

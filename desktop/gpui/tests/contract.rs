@@ -89,7 +89,35 @@ const EXPECTATIONS: &[Expectation] = &[
         file: "admin.rs",
         handler: "providers",
         response: "ProviderCatalog",
-        rows: &[("provider", "ProviderInfo")],
+        rows: &[
+            ("provider", "ProviderInfo"),
+            ("matrix entry", "MatrixEntry"),
+            ("probe", "ProbeInfo"),
+        ],
+        nested: &[],
+    },
+    Expectation {
+        file: "admin.rs",
+        handler: "routing_plan",
+        response: "RoutingPlan",
+        rows: &[("candidate", "PlanCandidate")],
+        nested: &[],
+    },
+    Expectation {
+        file: "admin.rs",
+        handler: "provider_quota",
+        response: "QuotaResponse",
+        rows: &[("quota reading", "QuotaReading")],
+        nested: &[],
+    },
+    Expectation {
+        file: "admin.rs",
+        handler: "provider_catalog",
+        response: "CatalogResponse",
+        rows: &[
+            ("catalog provider", "CatalogProvider"),
+            ("catalog model", "CatalogModel"),
+        ],
         nested: &[],
     },
     Expectation {

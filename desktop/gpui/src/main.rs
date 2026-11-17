@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    let base = sidecar::base_url();
+    let base = sidecar::target_base_url();
 
     Application::new().run(move |cx: &mut App| {
         cx.set_global(api::Session::new(base.clone()));

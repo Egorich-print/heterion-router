@@ -114,6 +114,62 @@ pub fn base_url() -> String {
     format!("http://127.0.0.1:{}", gateway_port())
 }
 
+/// The ports a debug shell tries, in order.
+///
+/// An explicit choice is never second-guessed: `HETERION_ROUTER_PORT` (or the
+/// legacy spelling) names the gateway the operator runs, and the shell goes
+/// there. Without it the shell asks the ports this machine actually uses —
+/// the gateway's own default first, then the installed launchd service — so a
+/// debug shell finds the running gateway instead of reporting "unreachable".
+pub fn candidate_ports() -> Vec<u16> {
+    if let Some(port) = env_port(&["HETERION_ROUTER_PORT", "OMNIROUTE_RUST_PORT"]) {
+        return vec![port];
+    }
+    let mut ports = vec![GATEWAY_DEFAULT_PORT];
+    if !ports.contains(&SERVICE_PORT) {
+        ports.push(SERVICE_PORT);
+    }
+    ports
+}
+
+/// How long a port probe may take before it counts as "no answer".
+const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(600);
+
+/// Whether something answers `GET /healthz` on that port.
+fn answers_healthz(port: u16) -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(PORT_PROBE_TIMEOUT)
+        .build()
+    else {
+        return false;
+    };
+    let url = format!("http://127.0.0.1:{port}/healthz");
+    client
+        .get(url)
+        .send()
+        .map(|response| response.status().is_success())
+        .unwrap_or(false)
+}
+
+/// The base URL of the gateway the shell should talk to.
+///
+/// A release shell owns its gateway and talks to the sidecar it spawned. A
+/// debug shell talks to the gateway the operator runs, and asks which port
+/// that is when the environment does not say.
+pub fn target_base_url() -> String {
+    if !cfg!(debug_assertions) {
+        return base_url();
+    }
+
+    for port in candidate_ports() {
+        if answers_healthz(port) {
+            tracing::info!(target: "gateway", port, "found the running gateway");
+            return format!("http://127.0.0.1:{port}");
+        }
+    }
+    base_url()
+}
+
 /// The first non-empty value of `keys`, parsed as a port.
 ///
 /// Mirrors the gateway's own resolution (`crates/heterion-router-config`):

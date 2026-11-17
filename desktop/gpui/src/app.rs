@@ -21,6 +21,8 @@ use crate::views;
 /// A section of the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Section {
+    /// The `auto` combo, live: the model ladder and the platforms' quota.
+    Auto,
     /// Gateway identity and row counts.
     Overview,
     /// Routing combos and their entries.
@@ -39,7 +41,8 @@ pub enum Section {
 
 impl Section {
     /// Every section, in sidebar order.
-    pub const ALL: [Section; 7] = [
+    pub const ALL: [Section; 8] = [
+        Section::Auto,
         Section::Overview,
         Section::Combos,
         Section::Providers,
@@ -52,6 +55,7 @@ impl Section {
     /// The label shown in the sidebar.
     pub fn label(self) -> &'static str {
         match self {
+            Section::Auto => "Auto",
             Section::Overview => "Overview",
             Section::Combos => "Combos",
             Section::Providers => "Providers",
@@ -117,7 +121,7 @@ impl AppShell {
         });
 
         let mut shell = Self {
-            section: Section::Overview,
+            section: Section::Auto,
             views: HashMap::new(),
             key_input,
             health: None,
@@ -134,7 +138,7 @@ impl AppShell {
         shell._session_watch = Some(cx.observe_global::<Session>(|shell, cx| {
             if !api::app_mut(cx).global::<Session>().is_authenticated() {
                 shell.views.clear();
-                shell.section = Section::Overview;
+                shell.section = Section::Auto;
                 shell.banner = None;
                 shell.first_run = FirstRunState::Unknown;
             }
@@ -157,6 +161,7 @@ impl AppShell {
             return view.clone();
         }
         let view: AnyView = match section {
+            Section::Auto => cx.new(views::auto::AutoView::new).into(),
             Section::Overview => cx.new(views::overview::OverviewView::new).into(),
             Section::Combos => cx.new(views::combos::CombosView::new).into(),
             Section::Providers => cx.new(views::providers::ProvidersView::new).into(),
@@ -295,7 +300,7 @@ impl AppShell {
         let _ = crate::secret::clear();
         cx.update_global::<Session, _>(|session, _| session.sign_out());
         self.views.clear();
-        self.section = Section::Overview;
+        self.section = Section::Auto;
         self.banner = None;
         self.first_run = FirstRunState::Unknown;
         self.creating_key = false;

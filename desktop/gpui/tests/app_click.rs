@@ -36,7 +36,7 @@ use gpui::prelude::*;
 use gpui::{AppContext, Modifiers, TestAppContext};
 
 use app::AppShell;
-use widgets::button_selector;
+use widgets::{button_selector, nav_selector};
 
 /// The key the fake gateway expects. A fixture, not a credential.
 const OPERATOR_KEY: &str = "test-operator-key";
@@ -179,6 +179,13 @@ fn clicking_refresh_asks_the_gateway_again(cx: &mut TestAppContext) {
 
     let (_shell, cx) = cx.add_window_view(|_window, cx| AppShell::new(cx));
     cx.run_until_parked();
+
+    // The shell opens on the Auto screen, so the Overview is reached the way
+    // the operator reaches it: through the sidebar.
+    let nav = cx
+        .debug_bounds(Box::leak(nav_selector("Overview").into_boxed_str()))
+        .expect("the Overview entry must be findable by its selector");
+    cx.simulate_click(nav.center(), Modifiers::none());
 
     // The first load already asked — but the request runs on a worker
     // thread, so the counter is not filled in the same tick. Wait for it

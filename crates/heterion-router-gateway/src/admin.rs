@@ -240,6 +240,19 @@ pub async fn providers(State(state): State<AppState>, _auth: ManageAuthenticated
                     .map(|row| crate::provider_status::ProviderReason::parse(&row.reason)),
             };
             let reason = crate::provider_status::reason_for(&facts);
+            // The probe of this provider, written out here and not in a helper:
+            // the shape of the answer is part of the contract, and a helper
+            // hides it from everything that reads the handler.
+            let last_probe = match probes.get(entry.id.as_str()) {
+                Some(probe) => json!({
+                    "url": probe.url,
+                    "status": probe.status,
+                    "reason": probe.reason,
+                    "body": probe.body_excerpt,
+                    "at": probe.probed_at,
+                }),
+                None => Value::Null,
+            };
             json!({
                 "id": entry.id,
                 "name": provider_label(&entry.id),
@@ -254,7 +267,7 @@ pub async fn providers(State(state): State<AppState>, _auth: ManageAuthenticated
                 "served": reason.is_served(),
                 "reason": reason.as_str(),
                 "can_add_key": is_key_provider(entry),
-                "last_probe": probe_payload(probes.get(entry.id.as_str())),
+                "last_probe": last_probe,
             })
         })
         .collect();
@@ -289,20 +302,6 @@ fn provider_probe_state(state: &AppState) -> (HashMap<String, ProviderProbeRow>,
 /// The providers the web driver has an adapter for.
 fn web_adapter_ids(state: &AppState) -> HashSet<String> {
     state.web_adapters.iter().cloned().collect()
-}
-
-/// The probe of one provider, as the API shows it.
-fn probe_payload(probe: Option<&ProviderProbeRow>) -> Value {
-    match probe {
-        Some(row) => json!({
-            "url": row.url,
-            "status": row.status,
-            "reason": row.reason,
-            "body": row.body_excerpt,
-            "at": row.probed_at,
-        }),
-        None => Value::Null,
-    }
 }
 
 /// `GET /api/routing/plan?model=auto` — the `auto` plan with its reasons.
@@ -374,7 +373,25 @@ pub async fn routing_plan(
         ..Default::default()
     };
 
-    let candidates = router.auto_plan_debug(&request);
+    // The candidates are written out here, and not taken from the router as a
+    // value: the shape of a row of the plan is part of the contract, and the
+    // client decodes it field by field.
+    let candidates: Vec<Value> = router
+        .auto_plan_debug(&request)
+        .iter()
+        .map(|candidate| {
+            json!({
+                "provider": candidate.provider,
+                "model": candidate.model,
+                "base_priority": candidate.base_priority,
+                "quality_score": candidate.quality_score,
+                "availability": candidate.availability,
+                "soft_cooldown": candidate.soft_cooldown,
+                "effective": candidate.effective,
+                "excluded": candidate.excluded,
+            })
+        })
+        .collect();
     Json(json!({
         "model": model,
         "tools": with_tools,
@@ -570,6 +587,7 @@ pub async fn provider_quota(
                 "provider": row.provider,
                 "connection_id": row.connection_id,
                 "window": row.window_key,
+                "state": quota_state(row.raw_data.as_deref()),
                 "remaining_percentage": row.remaining_percentage,
                 "exhausted": row.is_exhausted,
                 "resets_at": row.next_reset_at,
@@ -580,6 +598,35 @@ pub async fn provider_quota(
         })
         .collect();
     Json(json!({ "providers": providers }))
+}
+
+/// The state a reading was taken in, read out of the stored payload.
+///
+/// The reading is stored as the platform's own answer wrapped in the state it
+/// produced (`{"state":"exhausted","detail":"…"}`), so the state lives inside
+/// that payload. It is lifted into its own field here, so a client does not
+/// have to parse a JSON string inside a JSON response to learn whether a
+/// platform is spent.
+///
+/// The rows of the JS era — and the rows written before the payload became
+/// valid JSON — carry the same field as plain text inside a broken string, so
+/// the reader also looks for it there.
+fn quota_state(raw_data: Option<&str>) -> String {
+    let Some(raw) = raw_data else {
+        return "unknown".to_string();
+    };
+    if let Some(value) = serde_json::from_str::<Value>(raw).ok()
+        && let Some(state) = value.get("state").and_then(Value::as_str)
+    {
+        return state.to_string();
+    }
+    if let Some(start) = raw.find("\"state\":\"") {
+        let tail = &raw[start + "\"state\":\"".len()..];
+        if let Some(end) = tail.find('"') {
+            return tail[..end].to_string();
+        }
+    }
+    "unknown".to_string()
 }
 
 /// Whether a reading was taken before the cutoff.

@@ -328,3 +328,49 @@ async fn the_catalogue_of_a_provider_lists_each_model_once() {
         "each model must be listed once: {payload}"
     );
 }
+
+/// A platform that answers with a pretty-printed body must not lose the state
+/// of its reading: the payload is stored as JSON, and a line break inside it
+/// would break the JSON around it (measured 17.11.2026 — gemini answered with a
+/// multi-line body, and its reading came back as `unknown` instead of
+/// `exhausted`).
+#[tokio::test]
+async fn a_reading_with_a_multiline_answer_keeps_its_state() {
+    let db = Db::open_in_memory().unwrap();
+    db.migrate().unwrap();
+
+    let outcome = provider_sync::SyncOutcome {
+        provider: "gemini".to_string(),
+        connection_id: "connection-1".to_string(),
+        catalog: Vec::new(),
+        quota: Some(heterion_router_gateway::quota::QuotaReading {
+            state: heterion_router_gateway::quota::QuotaState::Exhausted,
+            window_key: "rate_limit".to_string(),
+            remaining_percentage: None,
+            next_reset_at: None,
+            window_duration_ms: None,
+            detail: "{\n  'error': {\n    'code': 429,\n    'message': 'You exceeded your current quota'\n  }\n}"
+                .to_string(),
+        }),
+        error: None,
+    };
+    provider_sync::store_outcome(&db, &outcome);
+
+    let router = build_router_with_state(AppState::with_db(Arc::new(EchoBackend), Arc::new(db)));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/providers/quota")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        payload["providers"][0]["state"], "exhausted",
+        "the state of the reading must survive a multi-line answer: {payload}"
+    );
+}

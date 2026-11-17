@@ -310,6 +310,14 @@ pub fn store_outcome(db: &heterion_router_db::Db, outcome: &SyncOutcome) {
         );
     }
     if let Some(reading) = &outcome.quota {
+        // The payload is written as JSON, not as text: an answer with a line
+        // break in it (a pretty-printed body) would otherwise break the JSON
+        // around it, and the state of the reading would be lost with it.
+        let payload = serde_json::json!({
+            "state": reading.state.as_str(),
+            "detail": reading.detail,
+        })
+        .to_string();
         let _ = repos::insert_quota_snapshot(
             &guard,
             &repos::QuotaSnapshotRow {
@@ -320,11 +328,7 @@ pub fn store_outcome(db: &heterion_router_db::Db, outcome: &SyncOutcome) {
                 is_exhausted: reading.state == quota::QuotaState::Exhausted,
                 next_reset_at: reading.next_reset_at.clone(),
                 window_duration_ms: reading.window_duration_ms,
-                raw_data: Some(format!(
-                    "{{\"state\":\"{}\",\"detail\":\"{}\"}}",
-                    reading.state.as_str(),
-                    reading.detail.replace('"', "'")
-                )),
+                raw_data: Some(payload),
                 created_at: String::new(),
             },
         );
