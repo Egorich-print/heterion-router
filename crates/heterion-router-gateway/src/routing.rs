@@ -324,6 +324,18 @@ fn no_candidate(model: &str) -> GatewayError {
     ))
 }
 
+/// Error for a request that does not fit the platform it named.
+///
+/// The candidate was skipped on purpose: the refusal was certain, so the
+/// router did not pay for it. Saying "unknown model" here would be a lie —
+/// the model is known, the request is simply too big for it, and the client
+/// has to be told which limit it hit.
+fn too_large_error(provider: &str, model: &str, detail: &str) -> GatewayError {
+    GatewayError::InvalidRequest(format!(
+        "request too large for {provider}/{model}: {detail}"
+    ))
+}
+
 /// Error for a plan whose every candidate is in rate-limit cooldown.
 fn all_candidates_cooling(model: &str) -> GatewayError {
     GatewayError::Upstream(format!(
@@ -1869,6 +1881,10 @@ impl ChatBackend for RoutingBackend {
         let request = relayed.unwrap_or(request);
         let mut last_error: Option<GatewayError> = None;
         let mut tripped = false;
+        // Why a candidate was never asked. The request itself does not fit the
+        // platform, so the refusal was certain; the client still has to learn
+        // that, instead of "unknown model".
+        let mut skipped_too_large: Option<GatewayError> = None;
 
         let is_failover_plan = combo_name.is_some() || plan.len() > 1;
         let mut cooled = false;
@@ -1923,6 +1939,13 @@ impl ChatBackend for RoutingBackend {
                         limit = target_limit,
                         "prompt exceeds context window after pruning; skipping candidate"
                     );
+                    skipped_too_large = Some(too_large_error(
+                        name,
+                        target_model,
+                        &format!(
+                            "the prompt is {new_tokens} tokens after pruning, the platform's context window is {target_limit} tokens"
+                        ),
+                    ));
                     continue;
                 }
                 let compressed = orig_tokens.saturating_sub(new_tokens);
@@ -1952,6 +1975,14 @@ impl ChatBackend for RoutingBackend {
                     ceiling = ceiling,
                     "skipping candidate: the prompt is bigger than the provider's budget"
                 );
+                skipped_too_large = Some(too_large_error(
+                    name,
+                    target_model,
+                    &format!(
+                        "the prompt is about {} tokens, the platform's per-minute budget is {ceiling} tokens",
+                        crate::context_pruner::fast_estimate_tokens(&candidate_req)
+                    ),
+                ));
                 continue;
             }
 
@@ -1973,6 +2004,14 @@ impl ChatBackend for RoutingBackend {
                     limit,
                     "skipping candidate: the request is bigger than the platform's character budget"
                 );
+                skipped_too_large = Some(too_large_error(
+                    name,
+                    target_model,
+                    &format!(
+                        "the request is {} characters, the platform's limit is {limit} characters",
+                        payload_chars(&attempt_request)
+                    ),
+                ));
                 continue;
             }
 
@@ -2141,6 +2180,8 @@ impl ChatBackend for RoutingBackend {
                 all_candidates_tripped(&model)
             } else if cooled {
                 all_candidates_cooling(&model)
+            } else if let Some(error) = skipped_too_large {
+                error
             } else {
                 no_candidate(&model)
             }
@@ -2169,6 +2210,9 @@ impl ChatBackend for RoutingBackend {
             };
             let mut last_error: Option<GatewayError> = None;
             let mut tripped = false;
+            // Same reason as in `complete`: the request does not fit the
+            // platform, so the client is told the limit it hit.
+            let mut skipped_too_large: Option<GatewayError> = None;
             let is_failover_plan = combo_name.is_some() || plan.len() > 1;
             let mut cooled = false;
             // Same budget as in `complete`: the pool is the whole catalogue,
@@ -2218,6 +2262,13 @@ impl ChatBackend for RoutingBackend {
                             limit = target_limit,
                             "prompt exceeds context window after pruning; skipping candidate"
                         );
+                        skipped_too_large = Some(too_large_error(
+                            name,
+                            target_model,
+                            &format!(
+                                "the prompt is {new_tokens} tokens after pruning, the platform's context window is {target_limit} tokens"
+                            ),
+                        ));
                         continue;
                     }
                     let compressed = orig_tokens.saturating_sub(new_tokens);
@@ -2244,6 +2295,14 @@ impl ChatBackend for RoutingBackend {
                         ceiling = ceiling,
                         "skipping candidate: the prompt is bigger than the provider's budget"
                     );
+                    skipped_too_large = Some(too_large_error(
+                        name,
+                        target_model,
+                        &format!(
+                            "the prompt is about {} tokens, the platform's per-minute budget is {ceiling} tokens",
+                            crate::context_pruner::fast_estimate_tokens(&candidate_req)
+                        ),
+                    ));
                     continue;
                 }
 
@@ -2260,6 +2319,14 @@ impl ChatBackend for RoutingBackend {
                         limit,
                         "skipping candidate: the request is bigger than the platform's character budget"
                     );
+                    skipped_too_large = Some(too_large_error(
+                        name,
+                        target_model,
+                        &format!(
+                            "the request is {} characters, the platform's limit is {limit} characters",
+                            payload_chars(&attempt_request)
+                        ),
+                    ));
                     continue;
                 }
 
@@ -2407,6 +2474,8 @@ impl ChatBackend for RoutingBackend {
                     all_candidates_tripped(&model)
                 } else if cooled {
                     all_candidates_cooling(&model)
+                } else if let Some(error) = skipped_too_large {
+                    error
                 } else {
                     no_candidate(&model)
                 }

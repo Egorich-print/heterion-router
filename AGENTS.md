@@ -165,6 +165,13 @@ Toolchain закреплён `1.99.1` в `rust-toolchain.toml`, `rust-version = 
     символов даёт «Too big: expected string to have <=100000 characters»).
     Старые ходы уходят (как у typhoon), а когда и этого мало — кандидат
     **не вызывается вовсе**;
+  - **пропущенный по размеру кандидат — это не «unknown model».** Когда
+    кандидат снят из лестницы по потолку (промпт, символы, окно), клиент
+    получает **400 `request too large for provider/model: …`** с указанием
+    предела, а не 404 «no backend can serve it»: модель известна, запрос
+    просто не помещается. Ложь про неизвестную модель прятала настоящую
+    причину (замер 17.11.2026: прямой запрос к oneminai сверх 100 000
+    символов отвечал 404 «unknown model»).
   - роль `developer` переименовывается в `system` для провайдеров, которые
     её отвергают (`developer_role.rs`): Mistral (422 `union_tag_invalid`),
     mixlayer (400 «unknown variant 'developer'»).
