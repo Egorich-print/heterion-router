@@ -267,6 +267,14 @@ pub struct RoutingBackend {
     failed_attempts: Arc<Mutex<FailedAttempts>>,
     cooldowns: Arc<ProviderCooldownSet>,
     quality_tracker: Arc<ModelQualityTracker>,
+    /// The model catalogue each platform published, as measured.
+    ///
+    /// The registry is the curated list; this is what the platforms said
+    /// today (`provider_catalog` in the database). A model the platform lists
+    /// and the registry has never heard of is reachable through `auto` — but
+    /// only as an unverified tail candidate, so a model that answers `404`
+    /// cannot push a model we know works out of the head of the ladder.
+    catalog: Arc<std::sync::RwLock<HashMap<String, Vec<String>>>>,
 }
 
 /// The ladder's class as a number: the lower the class, the cheaper the model.
@@ -289,6 +297,12 @@ const MIN_MODEL_WINDOW: u32 = 4096;
 ///
 /// One failure must not cost the relay: the next candidate gets the picture.
 const VISION_RELAY_DESCRIBERS: usize = 3;
+
+/// How many models one platform's measured catalogue may add to the ladder.
+///
+/// A platform that lists hundreds of models would otherwise bury the curated
+/// candidates; the tail is a fallback, not a catalogue.
+const CATALOG_TAIL_LIMIT: usize = 50;
 
 /// Whether a failure means the backend itself is unhealthy.
 ///
@@ -911,7 +925,28 @@ impl RoutingBackend {
             failed_attempts: Arc::new(Mutex::new(Vec::new())),
             cooldowns: Arc::new(ProviderCooldownSet::new()),
             quality_tracker: Arc::new(ModelQualityTracker::new()),
+            catalog: Arc::new(std::sync::RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Attach the measured catalogue cache.
+    ///
+    /// The cache is shared with the sync pass: it fills it while the gateway
+    /// runs, and the ladder reads it on every plan.
+    pub fn with_catalog_cache(
+        mut self,
+        cache: Arc<std::sync::RwLock<HashMap<String, Vec<String>>>>,
+    ) -> Self {
+        self.catalog = cache;
+        self
+    }
+
+    /// The measured catalogue: provider → the model ids it published.
+    pub fn catalog(&self) -> HashMap<String, Vec<String>> {
+        self.catalog
+            .read()
+            .map(|cache| cache.clone())
+            .unwrap_or_default()
     }
 
     /// Attach a database + registry for combo-name expansion.
@@ -1252,6 +1287,9 @@ impl RoutingBackend {
         };
 
         let mut tail: Vec<PoolCandidate> = Vec::new();
+        // What the registry already lists: the measured catalogue must not
+        // offer the same model twice.
+        let mut listed: HashSet<(String, String)> = HashSet::new();
         for entry in registry.iter() {
             // Only providers with a live backend can serve anything.
             if !self.backends.contains_key(&entry.id) {
@@ -1259,6 +1297,7 @@ impl RoutingBackend {
             }
             let web_executor = entry.executor.as_deref() == Some("web");
             for model in &entry.models {
+                listed.insert((entry.id.clone(), model.id.clone()));
                 // The curated ladder already carries these ids.
                 if curated.contains(&(entry.id.clone(), model.id.clone())) {
                     continue;
@@ -1269,6 +1308,40 @@ impl RoutingBackend {
                     base_priority: self.base_priority_for(
                         &entry.id,
                         &model.id,
+                        AUTO_TAIL_BASE_PRIORITY,
+                        false,
+                    ),
+                    web_executor,
+                });
+            }
+        }
+
+        // What the platforms themselves published: a model the area lists and
+        // the registry has never heard of is still reachable through `auto` —
+        // as an unverified tail candidate, so a model that answers `404`
+        // cannot push a model we know works out of the head of the ladder.
+        for (provider, models) in self.catalog() {
+            if !self.backends.contains_key(&provider) {
+                continue;
+            }
+            let web_executor = self.is_web_executor(&provider);
+            let mut added = 0usize;
+            for model in models {
+                if added >= CATALOG_TAIL_LIMIT {
+                    break;
+                }
+                if curated.contains(&(provider.clone(), model.clone()))
+                    || listed.contains(&(provider.clone(), model.clone()))
+                {
+                    continue;
+                }
+                added += 1;
+                tail.push(PoolCandidate {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    base_priority: self.base_priority_for(
+                        &provider,
+                        &model,
                         AUTO_TAIL_BASE_PRIORITY,
                         false,
                     ),

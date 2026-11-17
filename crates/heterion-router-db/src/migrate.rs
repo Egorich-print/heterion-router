@@ -107,6 +107,22 @@ pub const MIGRATIONS: &[Migration] = &[
                 probed_at TEXT NOT NULL DEFAULT (datetime('now'))
             );",
     },
+    Migration {
+        version: "005",
+        name: "provider_catalog",
+        sql: "CREATE TABLE IF NOT EXISTS provider_catalog (
+                provider TEXT NOT NULL,
+                connection_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                context_length INTEGER,
+                fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (provider, connection_id, model_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_provider_catalog_provider
+                ON provider_catalog (provider);
+            CREATE INDEX IF NOT EXISTS idx_provider_catalog_fetched
+                ON provider_catalog (fetched_at);",
+    },
 ];
 
 /// Columns the combo archive feature (ADR-015) needs on `combos` that
@@ -319,7 +335,8 @@ mod tests {
                 "001".to_string(),
                 "002".to_string(),
                 "003".to_string(),
-                "004".to_string()
+                "004".to_string(),
+                "005".to_string()
             ]
         );
 
@@ -333,8 +350,9 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        // 17 base tables + the three capability tables + the probe table + the ledger.
-        assert_eq!(tables, 22);
+        // 17 base tables + the three capability tables + the probe table +
+        // the catalogue table + the ledger.
+        assert_eq!(tables, 23);
     }
 
     /// The exact schema a database created before ADR-015 has: ledger says
@@ -384,7 +402,12 @@ mod tests {
         let applied = migrate(&mut guard).unwrap();
         assert_eq!(
             applied,
-            vec!["002".to_string(), "003".to_string(), "004".to_string()]
+            vec![
+                "002".to_string(),
+                "003".to_string(),
+                "004".to_string(),
+                "005".to_string()
+            ]
         );
 
         let columns: HashSet<String> = {
@@ -459,7 +482,12 @@ mod tests {
         let applied = migrate(&mut guard).unwrap();
         assert_eq!(
             applied,
-            vec!["002".to_string(), "003".to_string(), "004".to_string()]
+            vec![
+                "002".to_string(),
+                "003".to_string(),
+                "004".to_string(),
+                "005".to_string()
+            ]
         );
     }
 

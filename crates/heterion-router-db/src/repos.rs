@@ -696,6 +696,150 @@ pub fn get_provider_probe(conn: &Connection, provider: &str) -> Option<ProviderP
         .find(|row| row.provider == provider)
 }
 
+/// One model a platform lists for one connection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderCatalogRow {
+    /// Provider id.
+    pub provider: String,
+    /// The connection the catalogue was fetched with.
+    pub connection_id: String,
+    /// The model id, exactly as the platform writes it.
+    pub model_id: String,
+    /// The context window the platform publishes, when it publishes one.
+    pub context_length: Option<i64>,
+    /// When the catalogue was fetched (SQLite timestamp).
+    pub fetched_at: String,
+}
+
+/// Replace the catalogue of one connection with a freshly fetched one.
+///
+/// The replacement is a transaction: a fetch that fails halfway must not
+/// leave half of the old catalogue and half of the new one.
+pub fn replace_provider_catalog(
+    conn: &Connection,
+    provider: &str,
+    connection_id: &str,
+    models: &[(String, Option<i64>)],
+) -> Result<()> {
+    conn.execute(
+        "DELETE FROM provider_catalog WHERE provider = ?1 AND connection_id = ?2",
+        params![provider, connection_id],
+    )?;
+    let mut statement = conn.prepare(
+        "INSERT INTO provider_catalog (provider, connection_id, model_id, context_length)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    for (model_id, context_length) in models {
+        statement.execute(params![provider, connection_id, model_id, context_length])?;
+    }
+    Ok(())
+}
+
+/// Read the whole catalogue.
+pub fn list_provider_catalog(conn: &Connection) -> Vec<ProviderCatalogRow> {
+    let mut statement = match conn.prepare(
+        "SELECT provider, connection_id, model_id, context_length, fetched_at
+         FROM provider_catalog
+         ORDER BY provider, model_id",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = statement.query_map([], |row| {
+        Ok(ProviderCatalogRow {
+            provider: row.get("provider")?,
+            connection_id: row.get("connection_id")?,
+            model_id: row.get("model_id")?,
+            context_length: row.get("context_length")?,
+            fetched_at: row.get("fetched_at")?,
+        })
+    });
+    match rows {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// One measured quota reading.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QuotaSnapshotRow {
+    /// Provider id.
+    pub provider: String,
+    /// The connection the reading belongs to.
+    pub connection_id: String,
+    /// Which window the reading describes (`credits`, `rate_limit`, …).
+    pub window_key: String,
+    /// How much of the window is left, in percent, when the platform says.
+    pub remaining_percentage: Option<f64>,
+    /// Whether the window is spent.
+    pub is_exhausted: bool,
+    /// When the window resets, when the platform says.
+    pub next_reset_at: Option<String>,
+    /// The window length, when the platform publishes it.
+    pub window_duration_ms: Option<i64>,
+    /// The raw answer, as JSON.
+    pub raw_data: Option<String>,
+    /// When the reading was taken (SQLite timestamp).
+    pub created_at: String,
+}
+
+/// Store one quota reading.
+pub fn insert_quota_snapshot(conn: &Connection, row: &QuotaSnapshotRow) -> Result<()> {
+    conn.execute(
+        "INSERT INTO quota_snapshots (
+            provider, connection_id, window_key, remaining_percentage,
+            is_exhausted, next_reset_at, window_duration_ms, raw_data
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            row.provider,
+            row.connection_id,
+            row.window_key,
+            row.remaining_percentage,
+            row.is_exhausted as i64,
+            row.next_reset_at,
+            row.window_duration_ms,
+            row.raw_data
+        ],
+    )?;
+    Ok(())
+}
+
+/// The newest reading of every provider and connection.
+///
+/// The table is append-only (a history), so the newest row per key is the
+/// one the API reports.
+pub fn latest_quota_snapshots(conn: &Connection) -> Vec<QuotaSnapshotRow> {
+    let mut statement = match conn.prepare(
+        "SELECT provider, connection_id, window_key, remaining_percentage,
+                is_exhausted, next_reset_at, window_duration_ms, raw_data, created_at
+         FROM quota_snapshots
+         WHERE id IN (
+             SELECT MAX(id) FROM quota_snapshots GROUP BY provider, connection_id
+         )
+         ORDER BY provider, connection_id",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return Vec::new(),
+    };
+    let rows = statement.query_map([], |row| {
+        Ok(QuotaSnapshotRow {
+            provider: row.get("provider")?,
+            connection_id: row.get("connection_id")?,
+            window_key: row.get("window_key")?,
+            remaining_percentage: row.get("remaining_percentage")?,
+            is_exhausted: row.get::<_, i64>("is_exhausted")? != 0,
+            next_reset_at: row.get("next_reset_at")?,
+            window_duration_ms: row.get("window_duration_ms")?,
+            raw_data: row.get("raw_data")?,
+            created_at: row.get("created_at")?,
+        })
+    });
+    match rows {
+        Ok(rows) => rows.flatten().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
 /// A row in `combos`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComboRow {

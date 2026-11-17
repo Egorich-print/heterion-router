@@ -12,6 +12,7 @@ pub mod backend;
 pub mod budgets;
 pub mod cache;
 pub mod capabilities;
+pub mod catalog;
 pub mod claude;
 pub mod claude_endpoint;
 pub mod client_profile;
@@ -32,6 +33,8 @@ pub mod model_spec;
 pub mod openai;
 pub mod provider_caps;
 pub mod provider_status;
+pub mod provider_sync;
+pub mod quota;
 pub mod reasoning;
 pub mod repetition_guard;
 pub mod resilience;
@@ -254,6 +257,10 @@ pub struct AppState {
     /// only the router knows the scores and the reasons a candidate was
     /// dropped from the `auto` plan.
     pub(crate) router: Option<Arc<routing::RoutingBackend>>,
+    /// The field-encryption key, so the admin API can measure a provider
+    /// with its own credential (the catalogue and the quota are only
+    /// visible to a caller that carries the key).
+    pub(crate) crypto: Option<Arc<heterion_router_crypto::FieldCrypto>>,
 }
 
 /// Seconds since the unix epoch, or 0 when the clock is unavailable.
@@ -280,6 +287,7 @@ impl AppState {
             started_unix: now_unix(),
             max_body_bytes: heterion_router_config::DEFAULT_MAX_BODY_BYTES,
             router: None,
+            crypto: None,
         }
     }
 
@@ -298,6 +306,7 @@ impl AppState {
             started_unix: now_unix(),
             max_body_bytes: heterion_router_config::DEFAULT_MAX_BODY_BYTES,
             router: None,
+            crypto: None,
         }
     }
 
@@ -355,6 +364,13 @@ impl AppState {
         self
     }
 
+    /// Attach the field-encryption key: the admin API needs it to measure a
+    /// provider with its own credential.
+    pub fn with_crypto(mut self, crypto: Option<Arc<heterion_router_crypto::FieldCrypto>>) -> Self {
+        self.crypto = crypto;
+        self
+    }
+
     /// Set the largest request body the router accepts.
     ///
     /// Defaults to [`heterion_router_config::DEFAULT_MAX_BODY_BYTES`]; a value
@@ -400,6 +416,10 @@ pub fn build_router_with(state: AppState, cache_layer: cache::CacheLayer) -> Rou
         .route("/api/connections/{id}", patch(admin::update_connection))
         .route("/api/providers", get(admin::providers))
         .route("/api/providers/{id}/probe", post(admin::probe_provider))
+        .route("/api/providers/catalog", get(admin::provider_catalog))
+        .route("/api/providers/quota", get(admin::provider_quota))
+        .route("/api/providers/sync", post(admin::sync_providers))
+        .route("/api/providers/{id}/sync", post(admin::sync_provider))
         .route("/api/routing/plan", get(admin::routing_plan))
         .route("/api/usage", get(admin::usage))
         .route("/api/logs", get(admin::logs))

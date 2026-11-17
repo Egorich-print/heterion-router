@@ -489,6 +489,224 @@ pub async fn probe_provider(
     )
 }
 
+/// `GET /api/providers/catalog` — the model catalogue the platforms themselves
+/// published.
+///
+/// The registry says what a platform looked like on the day the catalogue was
+/// written; this says what it serves today. The two are kept apart on
+/// purpose: the registry is the curated list, this is the measurement.
+pub async fn provider_catalog(
+    State(state): State<AppState>,
+    _auth: ManageAuthenticated,
+) -> Json<Value> {
+    let Some(db) = state.db.as_ref() else {
+        return Json(json!({ "providers": [] }));
+    };
+    let guard = db.connection();
+    let rows = repos::list_provider_catalog(&guard);
+
+    let mut by_provider: std::collections::BTreeMap<String, Vec<&repos::ProviderCatalogRow>> =
+        std::collections::BTreeMap::new();
+    for row in &rows {
+        by_provider
+            .entry(row.provider.clone())
+            .or_default()
+            .push(row);
+    }
+
+    let providers: Vec<Value> = by_provider
+        .into_iter()
+        .map(|(provider, rows)| {
+            let models: Vec<Value> = rows
+                .iter()
+                .map(|row| {
+                    json!({
+                        "id": row.model_id,
+                        "context_length": row.context_length,
+                        "connection_id": row.connection_id,
+                    })
+                })
+                .collect();
+            json!({
+                "provider": provider,
+                "count": models.len(),
+                "fetched_at": rows.first().map(|row| row.fetched_at.clone()),
+                "models": models,
+            })
+        })
+        .collect();
+    Json(json!({ "providers": providers }))
+}
+
+/// `GET /api/providers/quota` — how much of each provider's budget is left.
+///
+/// The reading is what the platform said: the rate-limit headers of its
+/// answers, the `retry-after` of a refusal, or the sentence in which it names
+/// the remaining credit. A provider that says nothing is `unknown`, never a
+/// guess.
+pub async fn provider_quota(
+    State(state): State<AppState>,
+    _auth: ManageAuthenticated,
+) -> Json<Value> {
+    let Some(db) = state.db.as_ref() else {
+        return Json(json!({ "providers": [] }));
+    };
+    let guard = db.connection();
+    let rows = repos::latest_quota_snapshots(&guard);
+    let providers: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "provider": row.provider,
+                "connection_id": row.connection_id,
+                "window": row.window_key,
+                "remaining_percentage": row.remaining_percentage,
+                "exhausted": row.is_exhausted,
+                "resets_at": row.next_reset_at,
+                "detail": row.raw_data,
+                "measured_at": row.created_at,
+            })
+        })
+        .collect();
+    Json(json!({ "providers": providers }))
+}
+
+/// `POST /api/providers/{id}/sync` — measure one provider now.
+///
+/// It fetches the platform's catalogue and reads its quota with the
+/// connection's own credential, and stores both.
+pub async fn sync_provider(
+    State(state): State<AppState>,
+    Path(provider): Path<String>,
+    _auth: ManageAuthenticated,
+) -> impl IntoResponse {
+    let Some(registry) = state.registry.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "registry unavailable"})),
+        );
+    };
+    let Some(entry) = registry.get(&provider) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown provider: {provider}")})),
+        );
+    };
+    let Some(base_url) = entry.base_url.clone() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the provider declares no base URL"})),
+        );
+    };
+    let Some(db) = state.db.as_ref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "no database"})),
+        );
+    };
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "http client unavailable"})),
+        );
+    };
+
+    let credentials = {
+        let guard = db.connection();
+        crate::credentials::load_credentials(&guard, &provider, state.crypto.as_deref())
+            .unwrap_or_default()
+    };
+    if credentials.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the provider has no active credential"})),
+        );
+    }
+    let model = entry.models.first().map(|model| model.id.clone());
+    let mut outcomes = Vec::new();
+    for credential in credentials {
+        let outcome = crate::provider_sync::sync_connection(
+            &http,
+            &provider,
+            entry.format.as_deref(),
+            &base_url,
+            &credential.connection_id,
+            &credential.token,
+            model.as_deref(),
+        )
+        .await;
+        crate::provider_sync::store_outcome(db, &outcome);
+        outcomes.push(json!({
+            "connection_id": outcome.connection_id,
+            "models": outcome.catalog.len(),
+            "quota": outcome.quota.as_ref().map(|reading| json!({
+                "state": reading.state.as_str(),
+                "window": reading.window_key,
+                "remaining_percentage": reading.remaining_percentage,
+                "resets_at": reading.next_reset_at,
+                "detail": reading.detail,
+            })),
+            "error": outcome.error,
+        }));
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "provider": provider, "results": outcomes })),
+    )
+}
+
+/// `POST /api/providers/sync` — measure every provider that has a credential.
+///
+/// This is the automatic pass, on demand: the same measurement the gateway
+/// makes when it starts.
+pub async fn sync_providers(
+    State(state): State<AppState>,
+    _auth: ManageAuthenticated,
+) -> impl IntoResponse {
+    let (Some(registry), Some(db)) = (state.registry.as_ref(), state.db.as_ref()) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "registry or database unavailable"})),
+        );
+    };
+    let Ok(http) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+    else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "http client unavailable"})),
+        );
+    };
+    let outcomes =
+        crate::provider_sync::sync_all(db, registry, state.crypto.as_deref(), &http).await;
+    let measured = outcomes.len();
+    let models: usize = outcomes.iter().map(|outcome| outcome.catalog.len()).sum();
+    let with_quota = outcomes
+        .iter()
+        .filter(|outcome| outcome.quota.is_some())
+        .count();
+    (
+        StatusCode::OK,
+        Json(json!({
+            "measured": measured,
+            "models": models,
+            "quota_readings": with_quota,
+            "failures": outcomes
+                .iter()
+                .filter_map(|outcome| outcome.error.as_ref().map(|error| json!({
+                    "provider": outcome.provider,
+                    "connection_id": outcome.connection_id,
+                    "error": error,
+                })))
+                .collect::<Vec<_>>(),
+        })),
+    )
+}
+
 /// Whether a registry entry can take a provider credential.
 ///
 /// The gate mirrors what the runtime builds: a base URL the gateway can

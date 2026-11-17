@@ -328,6 +328,7 @@ fn status_aware(backend: Arc<dyn ChatBackend>) -> Arc<dyn ChatBackend> {
 fn select_backend(
     db: Arc<Db>,
     data_dir: &std::path::Path,
+    catalog: Arc<std::sync::RwLock<HashMap<String, Vec<String>>>>,
 ) -> Result<Selected, Box<dyn std::error::Error>> {
     let mut backends: HashMap<String, Arc<dyn ChatBackend>> = HashMap::new();
     let echo_enabled = ["HETERION_ROUTER_ENABLE_ECHO", "OMNIROUTE_ENABLE_ECHO"]
@@ -754,6 +755,7 @@ fn select_backend(
     };
     tracing::info!(models = trust.len(), "trusted models loaded for the ladder");
     let routing = RoutingBackend::new(backends, Router::new(rules, default))
+        .with_catalog_cache(catalog)
         .with_combo_source(db, registry.clone())
         .with_capabilities(Arc::new(capabilities))
         .with_trust(Arc::new(trust))
@@ -928,21 +930,83 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if probed > 0 {
         tracing::info!(probed, "keyless providers probed");
     }
+    // The measured catalogue cache: the sync pass fills it while the gateway
+    // runs, and the ladder reads it on every plan.
+    let catalog_cache = Arc::new(std::sync::RwLock::new(HashMap::new()));
     let (backend, registry, backend_names, web_adapters, router) =
-        select_backend(db.clone(), &config.data_dir)?;
+        select_backend(db.clone(), &config.data_dir, catalog_cache.clone())?;
+    // The field-encryption key: the admin API measures a provider with its
+    // own credential, and the sync pass does the same.
+    let crypto =
+        load_secret(Some(&config.data_dir)).and_then(|secret| FieldCrypto::from_secret(&secret));
     let ui_dir = heterion_router_gateway::ui::ui_dir();
     match ui_dir.as_ref() {
         Some(dir) => tracing::info!("dashboard served from {}", dir.display()),
         None => tracing::info!("dashboard not built (API only)"),
     }
-    let state = AppState::with_db(backend, db)
+    let state = AppState::with_db(backend, db.clone())
         .with_require_auth(config.require_auth)
         .with_max_body_bytes(config.max_body_bytes)
-        .with_catalog(registry, backend_names)
+        .with_catalog(registry.clone(), backend_names)
         .with_router_opt(router)
         .with_web_adapters(web_adapters)
         .with_ui_dir(ui_dir)
-        .with_data_dir(config.data_dir.clone());
+        .with_data_dir(config.data_dir.clone())
+        .with_crypto(crypto.clone().map(Arc::new));
+
+    // The automatic measurement: what the platforms serve today and how much
+    // of their budget is left. It runs in the background — a platform that
+    // hangs must not delay the gateway.
+    {
+        let db = db.clone();
+        let registry = registry.clone();
+        let crypto = crypto.clone();
+        let cache = catalog_cache.clone();
+        tokio::spawn(async move {
+            let Ok(http) = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build()
+            else {
+                return;
+            };
+            let outcomes = heterion_router_gateway::provider_sync::sync_all(
+                &db,
+                &registry,
+                crypto.as_ref(),
+                &http,
+            )
+            .await;
+            let measured = outcomes.len();
+            let models: usize = outcomes.iter().map(|outcome| outcome.catalog.len()).sum();
+            let with_quota = outcomes
+                .iter()
+                .filter(|outcome| outcome.quota.is_some())
+                .count();
+            // The ladder reads the cache: the platforms' own catalogues join
+            // the tail of the `auto` plan.
+            if let Ok(mut guard) = cache.write() {
+                for outcome in &outcomes {
+                    if outcome.catalog.is_empty() {
+                        continue;
+                    }
+                    guard.insert(
+                        outcome.provider.clone(),
+                        outcome
+                            .catalog
+                            .iter()
+                            .map(|model| model.id.clone())
+                            .collect(),
+                    );
+                }
+            }
+            tracing::info!(
+                measured,
+                models,
+                with_quota,
+                "providers measured: catalogue and quota"
+            );
+        });
+    }
     let app = build_router_with_state(state);
 
     let ip: std::net::IpAddr = config.host.parse()?;
@@ -1366,7 +1430,12 @@ mod tests {
         let data_dir = empty_data_dir("unknown");
 
         let logs = capture_warnings(|| {
-            select_backend(std::sync::Arc::new(db), &data_dir).unwrap();
+            select_backend(
+                std::sync::Arc::new(db),
+                &data_dir,
+                std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            )
+            .unwrap();
         });
 
         let lines: Vec<&str> = logs
@@ -1395,7 +1464,12 @@ mod tests {
         let data_dir = empty_data_dir("unsupported");
 
         let logs = capture_warnings(|| {
-            select_backend(std::sync::Arc::new(db), &data_dir).unwrap();
+            select_backend(
+                std::sync::Arc::new(db),
+                &data_dir,
+                std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            )
+            .unwrap();
         });
 
         assert_eq!(logs.matches("are not served").count(), 1, "got {logs}");
@@ -1411,7 +1485,12 @@ mod tests {
         let data_dir = empty_data_dir("known");
 
         let logs = capture_warnings(|| {
-            select_backend(std::sync::Arc::new(db), &data_dir).unwrap();
+            select_backend(
+                std::sync::Arc::new(db),
+                &data_dir,
+                std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+            )
+            .unwrap();
         });
 
         assert!(
