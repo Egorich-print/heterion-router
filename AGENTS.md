@@ -214,10 +214,13 @@ Toolchain закреплён `1.99.1` в `rust-toolchain.toml`, `rust-version = 
   влияет на группу и множитель. Перечень моделей в реестре берётся **из
   площадки**, а не из памяти: устаревшие id в реестре обещают клиенту
   модели, которой нет.
-  **Баланс вернулся 17.11.2026** — живой Responses-вызов по `gpt-5.6-sol`
-  с `originator: codex_cli_rs` дал `status: "completed"`; соединение
-  `Egorich-print` снова включено (`PATCH /api/connections/{id}` →
-  `restart_required: true`, дальше — рестарт шлюза).
+  **Баланс почти кончился (замер 17.11.2026).** Ключ **жив**: Responses-вызов
+  по `gpt-5.6-sol` с `originator: codex_cli_rs` вернул `status: "completed"`.
+  Но денег на работу почти нет: `403 insufficient_user_quota` — «user quota:
+  $0.004456, need quota: $0.032528» (запрос на 4000 токенов). Мелкий запрос
+  (64 токена) ещё проходит. Значит **включать обратно пока нельзя**: соединение
+  снова выключено (`PATCH /api/connections/{id}` → `restart_required: true`,
+  дальше — рестарт шлюза), а вернётся оно после пополнения баланса.
 - **OpenCode Console требует `x-opencode-session`** (`client_profile.rs`).
   Без него площадка отвечает `MissingSessionID` — «Request is missing
   x-opencode-session and cannot be routed efficiently» (замер 17.11.2026),
@@ -474,7 +477,7 @@ JSON-404 → `not_a_chat_api`; HTML-404/410 → `dead_endpoint`; 405 →
 
 | провайдер | адрес в реестре | вердикт ключа | что делать |
 | --- | --- | --- | --- |
-| `agentrouter` | верен | **жив**: Responses `status: completed` | соединение включено обратно (баланс вернулся) |
+| `agentrouter` | верен | **жив, но денег нет**: ключ проходит, `403 insufficient_user_quota` («user quota: $0.004456, need quota: $0.032528») | пополнить баланс; соединение оставлено выключенным (ADR-026) |
 | `command-code` | был неверен (`api.commandcode.ai` → 404) | **истёк**: «Your API key has expired… run `cmd login`» | новый ключ; адрес исправлен на документированный Provider API |
 | `blackbox` | был неверен (`api.blackbox.ai` → 404) | **мёртв**: «Invalid API key» | новый ключ; адрес исправлен на `enterprise.blackbox.ai` |
 | `sambanova` | верен | **мёртвы все пять**: 401 `invalid_api_key` | новые ключи |
