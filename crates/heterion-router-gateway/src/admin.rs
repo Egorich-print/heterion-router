@@ -517,8 +517,13 @@ pub async fn provider_catalog(
     let providers: Vec<Value> = by_provider
         .into_iter()
         .map(|(provider, rows)| {
+            // Several connections of one provider publish the same list, so the
+            // catalogue is deduplicated: the area serves one set of models, the
+            // connections only differ in the key.
+            let mut seen: HashSet<&str> = HashSet::new();
             let models: Vec<Value> = rows
                 .iter()
+                .filter(|row| seen.insert(row.model_id.as_str()))
                 .map(|row| {
                     json!({
                         "id": row.model_id,

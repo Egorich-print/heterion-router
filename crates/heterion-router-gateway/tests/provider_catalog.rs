@@ -282,3 +282,49 @@ async fn a_reading_from_the_js_era_is_marked_stale() {
         "a reading from another era must not pass as a measurement: {payload}"
     );
 }
+
+/// The catalogue of a provider with several connections lists the same models
+/// once: the area publishes one list, the connections only differ in the key.
+#[tokio::test]
+async fn the_catalogue_of_a_provider_lists_each_model_once() {
+    let db = Db::open_in_memory().unwrap();
+    db.migrate().unwrap();
+    {
+        let guard = db.connection();
+        for connection in ["connection-1", "connection-2"] {
+            repos::replace_provider_catalog(
+                &guard,
+                "sealion",
+                connection,
+                &[
+                    ("model-a".to_string(), None),
+                    ("model-b".to_string(), Some(131072)),
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    let router = build_router_with_state(AppState::with_db(Arc::new(EchoBackend), Arc::new(db)));
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/providers/catalog")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        payload["providers"][0]["count"], 2,
+        "two connections of one provider must not double the catalogue: {payload}"
+    );
+    assert_eq!(
+        payload["providers"][0]["models"].as_array().unwrap().len(),
+        2,
+        "each model must be listed once: {payload}"
+    );
+}

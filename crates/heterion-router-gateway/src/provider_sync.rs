@@ -94,7 +94,12 @@ pub async fn fetch_quota(
 const PROBE_BUDGETS: [u32; 3] = [1, 16, 64];
 
 /// How many models of the platform's own catalogue a probe may try.
-const CATALOG_CANDIDATES: usize = 3;
+///
+/// The catalogue is alphabetical, and its first rows are often not chat models
+/// at all (sealion opens with `BAAI/bge-m3` and `BAAI/bge-reranker-v2-m3`,
+/// api-airforce with `BAAI/bge-reranker-v2-m3`), so the probe needs room to
+/// reach a model the area actually serves.
+const CATALOG_CANDIDATES: usize = 8;
 
 /// One probe answer.
 struct ProbeAnswer {
@@ -165,11 +170,25 @@ fn refuses_the_budget(status: u16, body: &str) -> bool {
 
 /// Whether the platform says the model itself is not there.
 ///
-/// Measured on llm7 («Model '…' is currently unavailable», code
-/// `model_unavailable`) and nvidia (410 Gone, «the model … has reached its
-/// end of life»). The registry still lists both — the platform's own
+/// Measured on four platforms (17.11.2026):
+///
+/// * llm7 — «Model 'gpt-4o-mini-2024-07-18' is currently unavailable», code
+///   `model_unavailable`;
+/// * nvidia — a bare «404 page not found» in plain text, without naming the
+///   model at all;
+/// * sealion — «The requested model '…' is not available for this API key, or
+///   the model name is invalid», code `key_model_access_denied`;
+/// * AI Horde — «No worker is currently serving the model '…'. Retry later.»,
+///   code `no_eligible_worker`.
+///
+/// The registry still names models the area retired; the platform's own
 /// catalogue is the newer word.
 fn refuses_the_model(status: u16, body: &str) -> bool {
+    // A chat endpoint answers 404 for a model it does not have, and nvidia
+    // answers it in plain text, without naming anything.
+    if status == 404 {
+        return true;
+    }
     let lowered = body.to_ascii_lowercase();
     lowered.contains("model_unavailable")
         || lowered.contains("model_not_found")
@@ -179,7 +198,11 @@ fn refuses_the_model(status: u16, body: &str) -> bool {
         || lowered.contains("end of life")
         || lowered.contains("does not exist")
         || lowered.contains("no such model")
-        || (status == 404 && lowered.contains("model"))
+        || lowered.contains("is not available for this api key")
+        || lowered.contains("key_model_access_denied")
+        || lowered.contains("model name is invalid")
+        || lowered.contains("no_eligible_worker")
+        || lowered.contains("no worker is currently serving")
 }
 
 /// Measure the quota, trying the models the platform still serves.
@@ -187,7 +210,9 @@ fn refuses_the_model(status: u16, body: &str) -> bool {
 /// The candidates come in order: the model the registry names first, then the
 /// platform's own catalogue. A candidate is dropped only when the platform
 /// says the *model* is not there — a refusal about anything else (budget,
-/// quota, credential) is the answer.
+/// quota, credential) is the answer. When every candidate is refused that way,
+/// the last refusal is returned as the reading: the platform did answer, and
+/// what it said is the evidence.
 async fn measure_quota(
     http: &reqwest::Client,
     provider: &str,
@@ -196,6 +221,7 @@ async fn measure_quota(
     candidates: &[String],
     token: &str,
 ) -> Option<QuotaReading> {
+    let mut refusal: Option<QuotaReading> = None;
     for candidate in candidates {
         for (index, budget) in PROBE_BUDGETS.iter().enumerate() {
             let Ok(answer) =
@@ -206,17 +232,16 @@ async fn measure_quota(
             if refuses_the_budget(answer.status, &answer.body) && index + 1 < PROBE_BUDGETS.len() {
                 continue;
             }
+            let reading =
+                quota::reading_from_response(answer.status, &answer.headers, &answer.body);
             if refuses_the_model(answer.status, &answer.body) {
+                refusal = Some(reading);
                 break;
             }
-            return Some(quota::reading_from_response(
-                answer.status,
-                &answer.headers,
-                &answer.body,
-            ));
+            return Some(reading);
         }
     }
-    None
+    refusal
 }
 
 /// Measure one connection: its catalogue and its quota.
