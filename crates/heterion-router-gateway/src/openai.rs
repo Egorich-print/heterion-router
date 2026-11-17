@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::backend::{ChatBackend, ChunkStream, next_token, openai_request_body};
+use crate::client_profile;
 use crate::continuation;
 use crate::developer_role;
 use crate::ids;
@@ -56,7 +57,15 @@ impl OpenAiBackend {
         request: ChatCompletionRequest,
         tx: mpsc::Sender<Result<StreamChunk, GatewayError>>,
     ) -> Result<(), GatewayError> {
-        drive_openai_sse(&self.http, &self.chat_url(), self.bearer(), request, tx).await
+        drive_openai_sse(
+            &self.http,
+            &self.chat_url(),
+            self.bearer(),
+            &[],
+            request,
+            tx,
+        )
+        .await
     }
 }
 
@@ -69,6 +78,7 @@ async fn drive_openai_sse(
     http: &HttpClient,
     url: &str,
     bearer: Option<&str>,
+    headers: &[(&str, &str)],
     request: ChatCompletionRequest,
     tx: mpsc::Sender<Result<StreamChunk, GatewayError>>,
 ) -> Result<(), GatewayError> {
@@ -78,7 +88,7 @@ async fn drive_openai_sse(
     let mut body = openai_request_body(&request);
     body["stream"] = Value::from(true);
     let response = http
-        .post_json(url, bearer, &body)
+        .post_json_with_headers(url, bearer, headers, &body)
         .await
         .map_err(|error| GatewayError::Upstream(error.to_string()))?;
 
@@ -735,10 +745,18 @@ impl ProviderOpenAiBackend {
     ) -> Result<(), GatewayError> {
         self.adapt_developer_role(&mut request);
         self.adapt_trailing_assistant(&mut request);
+        // The session id is per request, so it cannot live in the static
+        // fingerprint table — it is built from the conversation here.
+        let headers = client_profile::request_headers(&self.provider, &request);
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
         drive_openai_sse(
             &self.http,
             &self.chat_url,
             next_token(&self.tokens, &self.next),
+            &header_refs,
             request,
             tx,
         )
@@ -802,12 +820,22 @@ impl ChatBackend for ProviderOpenAiBackend {
         self.adapt_trailing_assistant(&mut request);
         let mut body = openai_request_body(&request);
         body["stream"] = Value::from(false);
+        let headers = client_profile::request_headers(&self.provider, &request);
+        let header_refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
 
         // A keyless provider gets exactly one attempt, a pool one per key.
         let payload = try_each_credential(&self.provider, self.tokens.len().max(1), || async {
             let response = self
                 .http
-                .post_json(&self.chat_url, next_token(&self.tokens, &self.next), &body)
+                .post_json_with_headers(
+                    &self.chat_url,
+                    next_token(&self.tokens, &self.next),
+                    &header_refs,
+                    &body,
+                )
                 .await
                 .map_err(|error| GatewayError::Upstream(error.to_string()))?;
             response
