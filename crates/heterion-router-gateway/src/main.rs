@@ -219,41 +219,9 @@ fn provider_base_url_from(
 
 /// Fill `{env:NAME}` placeholders in a provider base URL from the environment.
 ///
-/// Some providers address an account-scoped endpoint: Cloudflare Workers AI
-/// wants the account id inside the path
-/// (`/client/v4/accounts/<account_id>/ai/v1`), and that id belongs to the
-/// operator's account, not to the provider — so it cannot live in the static
-/// registry. The registry keeps the placeholder, the environment carries the
-/// value.
-///
-/// A placeholder that the environment does not fill yields `None`: a provider
-/// whose address is half written cannot answer, and a half-filled address
-/// would fail later as an opaque 404 instead of "not configured".
-fn expand_placeholders(url: &str) -> Option<String> {
-    expand_placeholders_with(url, |name| std::env::var(name).ok())
-}
-
-/// The placeholder expansion with an injected lookup, so the tests do not
-/// have to mutate the process environment.
-fn expand_placeholders_with(url: &str, lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
-    let mut out = String::with_capacity(url.len());
-    let mut rest = url;
-    while let Some(start) = rest.find("{env:") {
-        out.push_str(&rest[..start]);
-        let tail = &rest[start..];
-        let Some(end) = tail.find('}') else {
-            // A brace that never closes is not a placeholder: keep the text.
-            out.push_str(tail);
-            return Some(out);
-        };
-        let name = &tail["{env:".len()..end];
-        let value = lookup(name).filter(|value| !value.trim().is_empty())?;
-        out.push_str(&value);
-        rest = &tail[end + 1..];
-    }
-    out.push_str(rest);
-    Some(out)
-}
+/// The expansion lives in the library (`placeholders`), because the measurement
+/// of a platform must reach the same address the backend reaches.
+use heterion_router_gateway::placeholders::expand_placeholders;
 
 /// Active `provider_connections` rows per provider id, ordered by id.
 ///
@@ -1194,54 +1162,6 @@ mod tests {
     /// address an account-scoped endpoint (Cloudflare Workers AI needs the
     /// account id in the path), and that id belongs to the operator, not to the
     /// provider. The placeholder is filled from the environment.
-    #[test]
-    fn env_placeholders_in_a_base_url_are_filled_from_the_environment() {
-        let filled = expand_placeholders_with(
-            "https://api.example/client/v4/accounts/{env:ACCOUNT}/ai/v1",
-            |name| (name == "ACCOUNT").then(|| "acct-1".to_string()),
-        );
-        assert_eq!(
-            filled.as_deref(),
-            Some("https://api.example/client/v4/accounts/acct-1/ai/v1")
-        );
-    }
-
-    /// A URL without a placeholder is returned as it is.
-    #[test]
-    fn a_base_url_without_placeholders_is_unchanged() {
-        assert_eq!(
-            expand_placeholders_with("https://api.example/v1", |_| None).as_deref(),
-            Some("https://api.example/v1")
-        );
-    }
-
-    /// An unresolved placeholder is not a URL: the provider cannot answer, so
-    /// it must not be built with a half-filled address.
-    #[test]
-    fn an_unresolved_placeholder_yields_no_url() {
-        assert_eq!(
-            expand_placeholders_with("https://api.example/accounts/{env:MISSING}/ai/v1", |_| None),
-            None
-        );
-        assert_eq!(
-            expand_placeholders_with("https://api.example/accounts/{env:EMPTY}", |_| {
-                Some(String::new())
-            }),
-            None
-        );
-    }
-
-    /// Several placeholders in one URL are all filled.
-    #[test]
-    fn every_placeholder_in_a_url_is_filled() {
-        let filled = expand_placeholders_with("https://{env:HOST}/{env:PATH}", |name| match name {
-            "HOST" => Some("api.example".to_string()),
-            "PATH" => Some("v1".to_string()),
-            _ => None,
-        });
-        assert_eq!(filled.as_deref(), Some("https://api.example/v1"));
-    }
-
     #[test]
     fn non_loopback_requires_a_key_before_startup() {
         let db = Db::open_in_memory().unwrap();

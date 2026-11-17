@@ -372,3 +372,68 @@ async fn a_bare_404_means_the_model_is_not_there() {
     assert_eq!(reading.remaining_percentage, Some(75.0));
     upstream.verify().await;
 }
+
+/// An embedding model on a chat endpoint is a refusal about the model —
+/// measured on sealion (17.11.2026): their litellm gateway answers «litellm.
+/// BadRequestError: Unmapped LLM provider for this endpoint» for
+/// `BAAI/bge-m3`. The catalogue opens with such models, so the probe has to
+/// step over them.
+#[tokio::test]
+async fn a_model_that_is_not_a_chat_model_does_not_end_the_measurement() {
+    let upstream = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"data":[{"id":"live-model"}]}"#),
+        )
+        .mount(&upstream)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({"model": "registry-model"})))
+        .respond_with(ResponseTemplate::new(400).set_body_string(
+            r#"{"error":{"message":"litellm.BadRequestError: Unmapped LLM provider for this endpoint","type":"invalid_request_error"}}"#,
+        ))
+        .mount(&upstream)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(
+            serde_json::json!({"model": "live-model"}),
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-ratelimit-remaining-requests", "5")
+                .insert_header("x-ratelimit-limit-requests", "10")
+                .set_body_string(r#"{"id":"x","choices":[]}"#),
+        )
+        .mount(&upstream)
+        .await;
+
+    let http = reqwest::Client::new();
+    let outcome = provider_sync::sync_connection(
+        &http,
+        "sealion",
+        Some("openai"),
+        &format!("{}/v1", upstream.uri()),
+        "connection-1",
+        "sk-test",
+        Some("registry-model"),
+    )
+    .await;
+
+    let reading = outcome
+        .quota
+        .expect("the platform answered with a chat model it serves");
+    assert_eq!(
+        reading.state.as_str(),
+        "available",
+        "a model that is not a chat model is not a quota problem: {}",
+        reading.detail
+    );
+    assert_eq!(reading.remaining_percentage, Some(50.0));
+    upstream.verify().await;
+}

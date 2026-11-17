@@ -527,12 +527,23 @@ JSON-404 → `not_a_chat_api`; HTML-404/410 → `dead_endpoint`; 405 →
   (17.11.2026): llm7 «is currently unavailable» (`model_unavailable`),
   nvidia — голый `404 page not found` без слова «model», sealion «is not
   available for this API key» (`key_model_access_denied`), AI Horde «No
-  worker is currently serving the model» (`no_eligible_worker`). Если модели
-  не отвечает **вся** площадка, последний отказ сохраняется как чтение
-  (`unknown`) — доказательство остаётся, провайдер не исчезает из отчёта.
-  Каталог площадки перечислен в алфавитном порядке, и первые строки — часто
-  не чат-модели (`BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` у sealion и
+  worker is currently serving the model» (`no_eligible_worker`), и litellm-
+  шлюз sealion «Unmapped LLM provider for this endpoint» (на чат-эндпоинте
+  это эмбеддинг-модель — `BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`). Если
+  модели не отвечает **вся** площадка, последний отказ сохраняется как
+  чтение (`unknown`) — доказательство остаётся, провайдер не исчезает из
+  отчёта. Каталог площадки перечислен в алфавитном порядке, и первые строки —
+  часто не чат-модели (`BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3` у sealion и
   api-airforce), поэтому проба берёт до **8** моделей каталога.
+- **Измерение идёт по тому же адресу, что и бэкенд.** Адрес площадки может
+  нести плейсхолдер `{env:NAME}` (Cloudflare Workers AI требует account id
+  внутри пути, и он принадлежит оператору, а не площадке), значение — в
+  окружении. Проба и каталог обязаны подставить его так же, как бэкенд: без
+  подстановки cloudflare-ai отвечал «Could not route to
+  /client/v4/accounts/%7Benv:HETERION_ROUTER_CLOUDFLARE_ACCOUNT_ID%7D/ai/v1/
+  chat/completions» — то есть измерялась площадка, которой не существует.
+  Подстановка живёт в библиотеке (`placeholders.rs`), а не в бинаре, и
+  незаполненный плейсхолдер даёт **нет адреса**, а не адрес наполовину.
 - **Когда меряется:** автоматически при старте шлюза (фоновая задача, восемь
   площадок одновременно) и по требованию — `POST /api/providers/sync` (все) и
   `POST /api/providers/{id}/sync` (одна).

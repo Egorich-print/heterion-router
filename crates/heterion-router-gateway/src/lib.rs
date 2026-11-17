@@ -31,6 +31,7 @@ pub mod ids;
 pub mod inspector;
 pub mod model_spec;
 pub mod openai;
+pub mod placeholders;
 pub mod provider_caps;
 pub mod provider_status;
 pub mod provider_sync;

@@ -179,7 +179,10 @@ fn refuses_the_budget(status: u16, body: &str) -> bool {
 /// * sealion — «The requested model '…' is not available for this API key, or
 ///   the model name is invalid», code `key_model_access_denied`;
 /// * AI Horde — «No worker is currently serving the model '…'. Retry later.»,
-///   code `no_eligible_worker`.
+///   code `no_eligible_worker`;
+/// * sealion (their litellm gateway) — «Unmapped LLM provider for this
+///   endpoint», which is what an embedding model answers on a chat endpoint
+///   (`BAAI/bge-m3`, `BAAI/bge-reranker-v2-m3`).
 ///
 /// The registry still names models the area retired; the platform's own
 /// catalogue is the newer word.
@@ -203,6 +206,7 @@ fn refuses_the_model(status: u16, body: &str) -> bool {
         || lowered.contains("model name is invalid")
         || lowered.contains("no_eligible_worker")
         || lowered.contains("no worker is currently serving")
+        || lowered.contains("unmapped llm provider")
 }
 
 /// Measure the quota, trying the models the platform still serves.
@@ -347,7 +351,15 @@ pub async fn sync_all(
         let Some(entry) = registry.get(&connection.provider) else {
             continue;
         };
-        let Some(base_url) = entry.base_url.clone() else {
+        // The measurement must reach the same address the backend reaches: a
+        // registry URL may carry an `{env:NAME}` placeholder (Cloudflare wants
+        // the account id in the path), and a probe that went out with the
+        // placeholder unresolved measured nothing (measured 17.11.2026).
+        let Some(base_url) = entry
+            .base_url
+            .as_ref()
+            .and_then(|url| crate::placeholders::expand_placeholders(url))
+        else {
             continue;
         };
         let model = entry.models.first().map(|model| model.id.clone());
