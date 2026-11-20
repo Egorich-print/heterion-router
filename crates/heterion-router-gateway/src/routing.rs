@@ -26,9 +26,10 @@ use crate::backend::{
     ATTRIBUTION_TOKEN, Attribution, ChatBackend, ChunkStream, FailedAttempt, request_token,
 };
 use crate::capabilities::{CapabilityStore, ModelCapabilities, ladder_priority};
-use crate::combos::{ComboConfig, load_combos, plan_steps};
+use crate::combos::{ComboConfig, WeightedStep, load_combos, plan_weighted_steps};
 use crate::model_spec::{ModelSpec, ModelTier, ToolSupport};
 use crate::resilience::{ModelQualityTracker, ProviderCooldownSet};
+use crate::spread;
 use crate::trust::TrustStore;
 use crate::upstream_status_or_recovered;
 
@@ -186,6 +187,15 @@ pub const AUTO_FAILURE_FACTOR: f64 = 0.1;
 /// the pool rotates instead of hammering the same head.
 pub const AUTO_MAX_ATTEMPTS: usize = 24;
 
+/// How close a candidate must stand to the head of the ladder to share the
+/// traffic with it.
+///
+/// The peers of the head are the models of its class that are almost as good
+/// as it. A candidate far below the head is a fallback, not a peer: it must
+/// not take the head away from a better model just because they belong to
+/// the same class.
+pub const AUTO_SPREAD_PEER_RATIO: f64 = 0.8;
+
 /// When a model served, and how often inside the cooldown window.
 #[derive(Debug, Clone, Copy)]
 struct ServeRecord {
@@ -211,6 +221,29 @@ struct PoolCandidate {
     /// Served by the web executor: a browser session that answers with page
     /// text and has no tool head at all.
     web_executor: bool,
+}
+
+/// One scored candidate of the `auto` plan: the candidate plus the numbers
+/// that decided its place.
+///
+/// The plan says which models are tried and in which order; this carries the
+/// numbers the spread needs — what the candidate is worth, what it is worth
+/// intrinsically, which class it belongs to and whether it just served.
+#[derive(Debug, Clone)]
+struct Scored<T> {
+    /// The candidate itself: a step for the plan, a row for the debug view.
+    item: T,
+    /// What the candidate is worth right now.
+    effective: f64,
+    /// The intrinsic priority of the candidate.
+    base_priority: f64,
+    /// The class of the candidate.
+    tier: ModelTier,
+    /// Whether the candidate served recently.
+    ///
+    /// The rotation demotes such a candidate, and the traffic must not go
+    /// straight back to it.
+    cooling: bool,
 }
 
 /// Backend router with failover.
@@ -1223,11 +1256,11 @@ impl RoutingBackend {
             return Ok(prefix_plan());
         };
         let available: HashSet<String> = self.backends.keys().cloned().collect();
-        let steps = plan_steps(combo, registry, &available);
+        let weighted = plan_weighted_steps(combo, registry, &available);
         let config = combo.config.clone();
         // No servable entry: fall through to prefix routing so an
         // under-provisioned combo degrades like an unknown model.
-        if steps.is_empty() {
+        if weighted.is_empty() {
             return Ok(Plan {
                 config,
                 steps: self.prefix_plan(model),
@@ -1236,9 +1269,31 @@ impl RoutingBackend {
         }
         Ok(Plan {
             config,
-            steps,
+            steps: self.spread_combo(weighted, request),
             combo_name: Some(model.to_string()),
         })
+    }
+
+    /// The order a combo's entries are tried in.
+    ///
+    /// The entries are spread by the weight the author gave them: the
+    /// traffic of a combo is shared by the models it contains, instead of
+    /// always starting at the same entry until that model runs out of
+    /// quota. The set of entries never changes — only the order they are
+    /// tried in — and an entry without a weight stays at the back as a
+    /// fallback.
+    fn spread_combo(
+        &self,
+        steps: Vec<WeightedStep>,
+        request: &ChatCompletionRequest,
+    ) -> Vec<(String, String)> {
+        let weighted: Vec<spread::Weighted<(String, String)>> = steps
+            .into_iter()
+            .map(|step| {
+                spread::Weighted::new((step.backend, step.model), step.weight.max(0) as f64)
+            })
+            .collect();
+        spread::spread_by_weight(&weighted, spread::request_seed(request))
     }
 
     /// Candidates from the explicit route rules (no combos involved).
@@ -1726,22 +1781,37 @@ impl RoutingBackend {
     /// Build a dynamic Switchyard candidate plan with deterministic time injection.
     pub fn auto_plan_at(&self, request: &ChatCompletionRequest, now: Instant) -> Plan {
         let inspection = crate::inspector::inspect_request(request);
-        let mut scored_candidates: Vec<((String, String), f64)> = Vec::new();
+        let mut scored_candidates: Vec<Scored<(String, String)>> = Vec::new();
 
         for candidate in self.auto_pool() {
             let row = self.evaluate_candidate(&candidate, request, &inspection, now);
             if row.excluded.is_empty() && row.effective > 0.0 {
-                scored_candidates.push(((row.provider, row.model), row.effective));
+                let tier = self.spec_for(&row.provider, &row.model).tier;
+                scored_candidates.push(Scored {
+                    item: (row.provider, row.model),
+                    effective: row.effective,
+                    base_priority: row.base_priority,
+                    tier,
+                    cooling: row.soft_cooldown < 1.0,
+                });
             }
         }
 
         // Sort by effective priority descending
-        scored_candidates
-            .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored_candidates.sort_by(|a, b| {
+            b.effective
+                .partial_cmp(&a.effective)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // The head of the ladder is shared by the models of its own class, so
+        // one model does not burn the quota of the account while its
+        // siblings stand idle.
+        let scored_candidates = self.spread_head(scored_candidates, request);
 
         let steps: Vec<(String, String)> = scored_candidates
             .into_iter()
-            .map(|(step, _)| step)
+            .map(|candidate| candidate.item)
             .collect();
 
         Plan {
@@ -1749,6 +1819,64 @@ impl RoutingBackend {
             steps,
             combo_name: Some(AUTO_COMBO_NAME.to_string()),
         }
+    }
+
+    /// Draw the head of the ladder among the models of its own class.
+    ///
+    /// The ladder says which model is *best suited*; the head says who
+    /// answers *now*. Without the spread the same model takes every request
+    /// until its quota is gone, while the models of its class stand idle.
+    /// The spread lets the weight of the class decide who takes the head.
+    ///
+    /// Three rules keep the contracts:
+    ///
+    /// - only the head's own class takes part, and only the models that
+    ///   stand right next to it: a model of another class between them
+    ///   keeps its place, so the order of the classes never changes;
+    /// - a candidate that just served is no peer: the rotation has already
+    ///   demoted it, and the traffic must not go straight back to it;
+    /// - a peer stands next to the head: a candidate far below the head is a
+    ///   fallback, not a peer, and must not take the head from a better
+    ///   model.
+    ///
+    /// With the rotation layer off the ladder order is pinned, so the spread
+    /// is off as well.
+    fn spread_head<T: Clone>(
+        &self,
+        scored: Vec<Scored<T>>,
+        request: &ChatCompletionRequest,
+    ) -> Vec<Scored<T>> {
+        if !self.rotation || scored.len() < 2 {
+            return scored;
+        }
+        let head = &scored[0];
+        let floor = head.effective * AUTO_SPREAD_PEER_RATIO;
+        // The peers of the head: the run of models that stand next to it and
+        // belong to its class.
+        let mut peers: Vec<usize> = Vec::new();
+        for (index, candidate) in scored.iter().enumerate() {
+            if candidate.tier != head.tier || candidate.effective < floor || candidate.cooling {
+                break;
+            }
+            peers.push(index);
+        }
+        if peers.len() < 2 {
+            return scored;
+        }
+        let weighted: Vec<spread::Weighted<usize>> = peers
+            .iter()
+            .map(|&index| spread::Weighted::new(index, scored[index].base_priority.max(0.0)))
+            .collect();
+        let order = spread::weighted_shuffle(&weighted, spread::request_seed(request));
+        let chosen = order[0];
+        let mut spread: Vec<Scored<T>> = Vec::with_capacity(scored.len());
+        spread.push(scored[chosen].clone());
+        for (index, candidate) in scored.into_iter().enumerate() {
+            if index != chosen {
+                spread.push(candidate);
+            }
+        }
+        spread
     }
 
     /// The `auto` plan with the numbers that decided every candidate.
@@ -1763,17 +1891,31 @@ impl RoutingBackend {
     pub fn auto_plan_debug(&self, request: &ChatCompletionRequest) -> Vec<PlanCandidate> {
         let inspection = crate::inspector::inspect_request(request);
         let now = Instant::now();
-        let mut rows: Vec<PlanCandidate> = self
+        let mut rows: Vec<Scored<PlanCandidate>> = self
             .auto_pool()
             .iter()
-            .map(|candidate| self.evaluate_candidate(candidate, request, &inspection, now))
+            .map(|candidate| {
+                let row = self.evaluate_candidate(candidate, request, &inspection, now);
+                Scored {
+                    tier: self.spec_for(&row.provider, &row.model).tier,
+                    cooling: row.soft_cooldown < 1.0,
+                    effective: row.effective,
+                    base_priority: row.base_priority,
+                    item: row,
+                }
+            })
             .collect();
         rows.sort_by(|a, b| {
             b.effective
                 .partial_cmp(&a.effective)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        rows
+        // The same spread the plan uses, so the debug view and the plan do
+        // not disagree about who answers.
+        self.spread_head(rows, request)
+            .into_iter()
+            .map(|row| row.item)
+            .collect()
     }
 
     /// Score one candidate of the pool — or say why it cannot be scored.

@@ -58,8 +58,24 @@ pub struct ComboDef {
     pub strategy: String,
     /// Ordered entries.
     pub entries: Vec<ComboEntry>,
+    /// The authoring weight of every entry, parallel to `entries`.
+    ///
+    /// The router spreads the traffic of a combo by these weights, so they
+    /// have to survive the parse: an entry the author gave no weight is a
+    /// fallback, not a candidate for the head of the plan.
+    pub weights: Vec<i64>,
     /// Retry/failover configuration.
     pub config: ComboConfig,
+}
+
+impl ComboDef {
+    /// The weight of the entry at `index`.
+    ///
+    /// An entry without a weight counts as weightless: the router keeps it
+    /// available as a fallback instead of giving it traffic.
+    pub fn weight_at(&self, index: usize) -> i64 {
+        self.weights.get(index).copied().unwrap_or(0)
+    }
 }
 
 /// Split a `"provider/model"` ref. A bare `"model"` yields an empty provider
@@ -73,8 +89,8 @@ fn split_model_ref(model_ref: &str) -> (String, String) {
 
 /// One combo entry with the dashboard metadata the router ignores.
 ///
-/// `weight` steers the JS dashboard's autorouting; the Rust router honours
-/// listed order for every strategy, so it only round-trips the value.
+/// `weight` steers the traffic of the combo: the router draws the head of
+/// the plan by these weights, so a weightless entry stays a fallback.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RichEntry {
     /// Provider plus bare model id, as the router sees them.
@@ -164,7 +180,8 @@ pub fn parse_combo(name: &str, data: &Value) -> Option<ComboDef> {
     Some(ComboDef {
         name: name.to_string(),
         strategy,
-        entries: rich.into_iter().map(|item| item.entry).collect(),
+        entries: rich.iter().map(|item| item.entry.clone()).collect(),
+        weights: rich.iter().map(|item| item.weight).collect(),
         config,
     })
 }
@@ -218,6 +235,41 @@ pub fn load_combos(conn: &Connection) -> heterion_router_db::Result<HashMap<Stri
     Ok(map)
 }
 
+/// One servable combo step: the backend that would serve it, the model id
+/// and the weight of the entry it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WeightedStep {
+    /// Backend name the step dispatches to.
+    pub backend: String,
+    /// Bare model id passed upstream.
+    pub model: String,
+    /// The authoring weight of the entry (0..=100 by convention).
+    pub weight: i64,
+}
+
+/// Resolve a combo to its servable steps, with the weight of every entry.
+///
+/// The weights travel with the steps because the router spreads the traffic
+/// of a combo by them: an entry the author gave no weight is a fallback and
+/// must not become the head of the plan.
+pub fn plan_weighted_steps(
+    combo: &ComboDef,
+    registry: &ProviderRegistry,
+    available: &HashSet<String>,
+) -> Vec<WeightedStep> {
+    let mut steps = Vec::new();
+    for (index, entry) in combo.entries.iter().enumerate() {
+        if let Some(backend) = dispatch_backend(entry, registry, available) {
+            steps.push(WeightedStep {
+                backend: backend.to_string(),
+                model: entry.model.clone(),
+                weight: combo.weight_at(index),
+            });
+        }
+    }
+    steps
+}
+
 /// Resolve a combo to ordered `(backend, model)` steps.
 ///
 /// `available` holds the backend names the gateway actually runs. A ref maps
@@ -229,13 +281,10 @@ pub fn plan_steps(
     registry: &ProviderRegistry,
     available: &HashSet<String>,
 ) -> Vec<(String, String)> {
-    let mut steps = Vec::new();
-    for entry in &combo.entries {
-        if let Some(backend) = dispatch_backend(entry, registry, available) {
-            steps.push((backend.to_string(), entry.model.clone()));
-        }
-    }
-    steps
+    plan_weighted_steps(combo, registry, available)
+        .into_iter()
+        .map(|step| (step.backend, step.model))
+        .collect()
 }
 
 /// Backend that would serve one combo entry, given the live backends.

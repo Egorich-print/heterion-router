@@ -861,7 +861,10 @@ async fn test_challenge_cascade_when_all_tier1_models_in_probation() {
     backends.insert("agentrouter".into(), agentrouter.clone());
     backends.insert("mistral".into(), mistral.clone());
 
-    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]))
+        // The ladder order is pinned: the spread lets the models of one class
+        // share the head, and this test asserts which candidate served.
+        .with_rotation(false);
     let t0 = Instant::now();
 
     // Force ALL Tier 1 candidates into 15-minute probation:

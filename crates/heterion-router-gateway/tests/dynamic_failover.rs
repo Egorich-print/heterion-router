@@ -902,7 +902,11 @@ async fn test_challenge_403_and_402_freeze_with_strict_breaker_isolation() {
 
     // Breaker threshold = 1: if 4xx ever counted as a failure, breaker would trip immediately!
     let routing =
-        RoutingBackend::with_breaker_settings(backends, Router::new(vec![], vec![]), 1, 3600);
+        RoutingBackend::with_breaker_settings(backends, Router::new(vec![], vec![]), 1, 3600)
+            // The ladder order is pinned: the spread lets the models of one
+            // class share the head, and this test asserts which candidate the
+            // quota error came from.
+            .with_rotation(false);
 
     // 1. Simulate 403 quota error on Candidate 1 (gemini)
     gemini.push_response(Err(GatewayError::Upstream(

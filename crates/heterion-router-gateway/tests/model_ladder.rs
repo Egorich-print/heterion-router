@@ -385,7 +385,14 @@ async fn an_untrusted_model_stays_below_a_trusted_one() {
 
     // Without the trust evidence the better-looking model would win — that is
     // exactly the mistake the trust band prevents.
-    let (untrusted, _registry) = router_with(rows);
+    //
+    // The ladder order is pinned: the spread lets the models of one class
+    // share the head, and this test asserts which model leads.
+    let (untrusted, _registry, _served) = build_router(RouterSpec {
+        rows,
+        rotation: false,
+        ..Default::default()
+    });
     let plan = untrusted.auto_plan(&request());
     assert_eq!(
         plan.steps.first(),

@@ -42,6 +42,7 @@ pub mod resilience;
 pub mod responses;
 pub mod restart;
 pub mod routing;
+pub mod spread;
 pub mod trust;
 pub mod ui;
 pub mod usage_estimate;

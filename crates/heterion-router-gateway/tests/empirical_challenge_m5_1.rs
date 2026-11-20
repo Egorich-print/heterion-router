@@ -1140,7 +1140,11 @@ async fn test_challenge_catalog_never_lists_the_same_model_twice() {
 async fn test_challenge_zero_quota_pruning_makes_no_extra_upstream_call() {
     let ledger = Ledger::default();
     let (backends, probes) = setup_backends(&ledger, &["gemini", "agentrouter", "mistral"]);
-    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]));
+    let routing = RoutingBackend::new(backends, Router::new(vec![], vec![]))
+        // The ladder order is pinned: the spread lets the models of one class
+        // share the head, and this test compares the plan it builds with the
+        // attempts the request makes.
+        .with_rotation(false);
 
     let request = large_history_request();
     let original_ids = tool_call_ids(&request);
