@@ -18,6 +18,53 @@ pub struct CatalogModel {
     pub id: String,
     /// The context window the platform publishes, when it publishes one.
     pub context_length: Option<i64>,
+    /// The price of one input token, as the platform publishes it.
+    ///
+    /// `None` means the platform said nothing about the price — not that the
+    /// model is free.
+    pub cost_input: Option<f64>,
+}
+
+impl CatalogModel {
+    /// Whether the platform prices this model at zero.
+    ///
+    /// A model whose price the platform did not publish is *not* free: the
+    /// anonymous access of OpenCode Zen serves the models it prices at zero
+    /// and refuses the rest with `401 Missing API key` (probed live
+    /// 2026-11-20), so an unknown price must not be treated as a free one.
+    pub fn is_free(&self) -> bool {
+        self.cost_input == Some(0.0)
+    }
+}
+
+/// The price of one input token in a price container.
+///
+/// Platforms write it either as a number (`"input": 0.25`) or as an object
+/// with a `price` field (`"input": {"price": 0.25}`).
+fn price_from(container: &serde_json::Map<String, Value>) -> Option<f64> {
+    match container.get("input")? {
+        Value::Number(number) => number.as_f64(),
+        Value::Object(object) => object.get("price").and_then(Value::as_f64),
+        _ => None,
+    }
+}
+
+/// The price of one input token, wherever the platform keeps it.
+fn input_price(object: &serde_json::Map<String, Value>) -> Option<f64> {
+    for key in ["cost", "pricing"] {
+        let Some(Value::Object(container)) = object.get(key) else {
+            continue;
+        };
+        if let Some(price) = price_from(container) {
+            return Some(price);
+        }
+        if let Some(Value::Object(text)) = container.get("text")
+            && let Some(price) = price_from(text)
+        {
+            return Some(price);
+        }
+    }
+    None
 }
 
 /// The URL a platform lists its models at.
@@ -67,6 +114,7 @@ pub fn parse_catalog(body: &str) -> Vec<CatalogModel> {
             Value::String(id) => Some(CatalogModel {
                 id: id.clone(),
                 context_length: None,
+                cost_input: None,
             }),
             Value::Object(object) => {
                 let raw = object
@@ -80,6 +128,7 @@ pub fn parse_catalog(body: &str) -> Vec<CatalogModel> {
                         .or_else(|| object.get("context_window"))
                         .or_else(|| object.get("max_context_length"))
                         .and_then(Value::as_i64),
+                    cost_input: input_price(object),
                 })
             }
             _ => None,
@@ -156,6 +205,40 @@ mod tests {
     #[test]
     fn a_non_http_base_url_has_no_models_url() {
         assert!(models_url(Some("openai"), "not-a-url").is_none());
+    }
+
+    /// The price the platform publishes decides whether a model is reachable
+    /// for an anonymous client: OpenCode Zen serves the models it prices at
+    /// zero and refuses the rest (probed live 2026-11-20).
+    #[test]
+    fn the_published_price_decides_whether_a_model_is_free() {
+        let body = r#"{"data":[
+            {"id":"big-pickle","cost":{"text":{"input":{"price":0},"output":{"price":0}}}},
+            {"id":"gpt-5.4","cost":{"text":{"input":{"price":2.5},"output":{"price":15}}}},
+            {"id":"flat","cost":{"input":0.5}},
+            {"id":"mystery"}
+        ]}"#;
+        let models = parse_catalog(body);
+        let by_id = |id: &str| {
+            models
+                .iter()
+                .find(|model| model.id == id)
+                .unwrap_or_else(|| panic!("{id} parsed"))
+        };
+        assert_eq!(by_id("big-pickle").cost_input, Some(0.0));
+        assert!(by_id("big-pickle").is_free());
+        assert_eq!(by_id("gpt-5.4").cost_input, Some(2.5));
+        assert!(!by_id("gpt-5.4").is_free());
+        assert_eq!(by_id("flat").cost_input, Some(0.5));
+        assert_eq!(
+            by_id("mystery").cost_input,
+            None,
+            "an unpublished price is not a free one"
+        );
+        assert!(
+            !by_id("mystery").is_free(),
+            "a model of unknown price must not be offered as free"
+        );
     }
 
     #[test]

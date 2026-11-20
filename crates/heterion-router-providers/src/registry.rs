@@ -25,6 +25,15 @@ pub struct ProviderEntry {
     pub auth_type: Option<String>,
     /// Upstream chat-completions URL, when the provider declares one.
     pub base_url: Option<String>,
+    /// Whether only the models the platform prices at zero are usable.
+    ///
+    /// An anonymous area (OpenCode Zen's `public` access) serves the free
+    /// models and refuses the rest with `401 Missing API key` (probed live
+    /// 2026-11-20). For such a provider the measured catalogue keeps only the
+    /// zero-priced models, so the ladder does not offer models that cannot
+    /// answer.
+    #[serde(default)]
+    pub free_only: Option<bool>,
     #[serde(default)]
     pub models: Vec<RegistryModel>,
 }
@@ -132,6 +141,16 @@ impl ProviderRegistry {
             .is_some_and(|auth_type| matches!(auth_type, "optional" | "none"))
     }
 
+    /// Whether only the free models of this platform are usable.
+    ///
+    /// An anonymous area serves the models it prices at zero and refuses the
+    /// rest, so its measured catalogue keeps only those.
+    pub fn is_free_only(&self, provider: &str) -> bool {
+        self.get(provider)
+            .and_then(|entry| entry.free_only)
+            .unwrap_or(false)
+    }
+
     /// Effective target format for a model: the model's explicit
     /// `target_format`, falling back to the provider `format`.
     pub fn model_target_format(&self, provider_id: &str, model_id: &str) -> Option<&str> {
@@ -213,6 +232,7 @@ mod tests {
                 executor: Some("default".to_string()),
                 auth_type: Some("apikey".to_string()),
                 base_url: Some("https://alpha.example/v1".to_string()),
+                free_only: None,
                 models: Vec::new(),
             },
             ProviderEntry {
@@ -222,6 +242,7 @@ mod tests {
                 executor: Some("default".to_string()),
                 auth_type: Some("apikey".to_string()),
                 base_url: Some("https://beta.example/v1".to_string()),
+                free_only: None,
                 models: Vec::new(),
             },
         ];
@@ -343,6 +364,46 @@ mod tests {
         assert_eq!(parse_wire_format("clova"), None);
         assert_eq!(parse_wire_format("kiro"), None);
         assert_eq!(parse_wire_format(""), None);
+    }
+
+    /// The anonymous Zen pool is a *separate* provider entry.
+    ///
+    /// The platform serves it without a key — the opencode client sends the
+    /// literal `public` — but only the free models: a paid model answers
+    /// `401 Missing API key` (probed live 2026-11-20, 12 of 103 models cost
+    /// zero). Keeping the free models in their own entry means the paid Zen
+    /// models stay reachable for a connection that has a real key.
+    #[test]
+    fn the_anonymous_zen_pool_is_keyless_and_free_only() {
+        let registry = registry();
+        let entry = registry
+            .get("opencode-free")
+            .expect("opencode-free registered");
+        assert_eq!(entry.format.as_deref(), Some("openai"));
+        assert_eq!(entry.auth_type.as_deref(), Some("optional"));
+        assert!(registry.allows_keyless("opencode-free"));
+        assert!(
+            registry.is_free_only("opencode-free"),
+            "the measured catalogue of an anonymous area keeps only the free models"
+        );
+        assert!(!registry.is_free_only("opencode"));
+        assert!(!registry.is_free_only("nope"));
+        assert_eq!(
+            registry.base_url("opencode-free"),
+            Some("https://opencode.ai/inference/openai/v1")
+        );
+        assert_eq!(
+            entry.models.len(),
+            12,
+            "the free models measured on 2026-11-20"
+        );
+        for model in &entry.models {
+            assert!(
+                model.id == "big-pickle" || model.id.ends_with("-free"),
+                "a paid model would answer 401 Missing API key: {}",
+                model.id
+            );
+        }
     }
 
     #[test]

@@ -248,28 +248,67 @@ async fn measure_quota(
     refusal
 }
 
+/// Keep only the models the platform prices at zero.
+///
+/// A model whose price the platform did not publish is dropped as well: it is
+/// not known to be free, and an unknown price must not be offered as one.
+fn only_free(catalog: Vec<crate::catalog::CatalogModel>) -> Vec<crate::catalog::CatalogModel> {
+    catalog
+        .into_iter()
+        .filter(|entry| entry.is_free())
+        .collect()
+}
+
+/// One connection to measure: where it goes, with what credential, and what
+/// the registry says about it.
+#[derive(Debug, Clone)]
+pub struct SyncTarget {
+    /// The provider id, as the registry spells it.
+    pub provider: String,
+    /// The wire format the provider speaks.
+    pub format: String,
+    /// The address the backend reaches — placeholders already expanded.
+    pub base_url: String,
+    /// The model the registry names, when it names one.
+    pub model: Option<String>,
+    /// The connection this measurement belongs to.
+    pub connection_id: String,
+    /// The credential the measurement goes out with.
+    pub token: String,
+    /// Whether only the platform's zero-priced models are usable.
+    pub free_only: bool,
+}
+
 /// Measure one connection: its catalogue and its quota.
-pub async fn sync_connection(
-    http: &reqwest::Client,
-    provider: &str,
-    format: Option<&str>,
-    base_url: &str,
-    connection_id: &str,
-    token: &str,
-    model: Option<&str>,
-) -> SyncOutcome {
-    let catalog = fetch_catalog(http, provider, format, base_url, token).await;
-    let (catalog, error) = match catalog {
+pub async fn sync_connection(http: &reqwest::Client, target: &SyncTarget) -> SyncOutcome {
+    let SyncTarget {
+        provider,
+        format,
+        base_url,
+        model,
+        connection_id,
+        token,
+        free_only,
+    } = target;
+    let catalog = fetch_catalog(http, provider, Some(format.as_str()), base_url, token).await;
+    let (mut catalog, error) = match catalog {
         Ok(catalog) => (catalog, None),
         Err(error) => (Vec::new(), Some(error)),
     };
+    // An anonymous area serves the models it prices at zero and refuses the
+    // rest with `401 Missing API key` (OpenCode Zen, probed live 2026-11-20).
+    // Keeping the priced models out of the catalogue keeps them out of the
+    // ladder too: a model that cannot answer must not be offered.
+    if *free_only {
+        catalog = only_free(catalog);
+    }
 
     // The model the registry names comes first; the platform's own catalogue
     // follows it, because the registry still lists models the platform retired
     // (llm7, nvidia — measured 17.11.2026).
     let mut candidates: Vec<String> = Vec::new();
-    if let Some(model) = model {
-        candidates.push(model.to_string());
+    if let Some(model) = model.as_ref() {
+        candidates.push(model.clone());
     }
     for entry in catalog.iter().take(CATALOG_CANDIDATES) {
         if !candidates.contains(&entry.id) {
@@ -277,15 +316,23 @@ pub async fn sync_connection(
         }
     }
 
-    let quota = measure_quota(http, provider, format, base_url, &candidates, token).await;
+    let quota = measure_quota(
+        http,
+        provider,
+        Some(format.as_str()),
+        base_url,
+        &candidates,
+        token,
+    )
+    .await;
     let error = match (error, &quota) {
         (Some(error), _) => Some(error),
         (None, None) => Some("the platform said nothing about the quota".to_string()),
         (None, Some(_)) => None,
     };
     SyncOutcome {
-        provider: provider.to_string(),
-        connection_id: connection_id.to_string(),
+        provider: provider.clone(),
+        connection_id: connection_id.clone(),
         catalog,
         quota,
         error,
@@ -347,7 +394,7 @@ pub async fn sync_all(
         repos::list_connections(&guard).unwrap_or_default()
     };
 
-    let mut targets: Vec<(String, String, String, Option<String>, String, String)> = Vec::new();
+    let mut targets: Vec<SyncTarget> = Vec::new();
     for connection in connections {
         if !connection.is_active {
             continue;
@@ -367,43 +414,32 @@ pub async fn sync_all(
             continue;
         };
         let model = entry.models.first().map(|model| model.id.clone());
+        let free_only = entry.free_only.unwrap_or(false);
         let credentials = {
             let guard = db.connection();
             crate::credentials::load_credentials(&guard, &connection.provider, crypto)
                 .unwrap_or_default()
         };
         for credential in credentials {
-            targets.push((
-                connection.provider.clone(),
-                entry.format.clone().unwrap_or_default(),
-                base_url.clone(),
-                model.clone(),
-                credential.connection_id.clone(),
-                credential.token.clone(),
-            ));
+            targets.push(SyncTarget {
+                provider: connection.provider.clone(),
+                format: entry.format.clone().unwrap_or_default(),
+                base_url: base_url.clone(),
+                model: model.clone(),
+                connection_id: credential.connection_id.clone(),
+                token: credential.token.clone(),
+                free_only,
+            });
         }
     }
 
     // Eight at a time: one provider that hangs must not hold the rest of the
     // catalogue hostage.
     let outcomes = futures::stream::iter(targets)
-        .map(
-            |(provider, format, base_url, model, connection_id, token)| {
-                let http = &*http;
-                async move {
-                    sync_connection(
-                        http,
-                        &provider,
-                        Some(format.as_str()),
-                        &base_url,
-                        &connection_id,
-                        &token,
-                        model.as_deref(),
-                    )
-                    .await
-                }
-            },
-        )
+        .map(|target| {
+            let http = &*http;
+            async move { sync_connection(http, &target).await }
+        })
         .buffer_unordered(8)
         .collect::<Vec<_>>()
         .await;

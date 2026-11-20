@@ -697,16 +697,20 @@ pub async fn sync_provider(
         );
     }
     let model = entry.models.first().map(|model| model.id.clone());
+    let free_only = entry.free_only.unwrap_or(false);
     let mut outcomes = Vec::new();
     for credential in credentials {
         let outcome = crate::provider_sync::sync_connection(
             &http,
-            &provider,
-            entry.format.as_deref(),
-            &base_url,
-            &credential.connection_id,
-            &credential.token,
-            model.as_deref(),
+            &crate::provider_sync::SyncTarget {
+                provider: provider.clone(),
+                format: entry.format.clone().unwrap_or_default(),
+                base_url: base_url.clone(),
+                model: model.clone(),
+                connection_id: credential.connection_id.clone(),
+                token: credential.token.clone(),
+                free_only,
+            },
         )
         .await;
         crate::provider_sync::store_outcome(db, &outcome);

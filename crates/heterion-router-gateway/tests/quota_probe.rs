@@ -63,12 +63,15 @@ async fn a_platform_that_refuses_a_tiny_budget_is_probed_again() {
     let http = reqwest::Client::new();
     let outcome = provider_sync::sync_connection(
         &http,
-        "aihorde",
-        Some("openai"),
-        &format!("{}/v1", upstream.uri()),
-        "connection-1",
-        "sk-test",
-        Some("registry-model"),
+        &provider_sync::SyncTarget {
+            provider: "aihorde".to_string(),
+            format: "openai".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("registry-model".to_string()),
+            connection_id: "connection-1".to_string(),
+            token: "sk-test".to_string(),
+            free_only: false,
+        },
     )
     .await;
 
@@ -123,12 +126,15 @@ async fn a_probe_falls_back_to_a_model_the_platform_still_lists() {
     let http = reqwest::Client::new();
     let outcome = provider_sync::sync_connection(
         &http,
-        "llm7",
-        Some("openai"),
-        &format!("{}/v1", upstream.uri()),
-        "connection-1",
-        "sk-test",
-        Some("registry-model"),
+        &provider_sync::SyncTarget {
+            provider: "llm7".to_string(),
+            format: "openai".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("registry-model".to_string()),
+            connection_id: "connection-1".to_string(),
+            token: "sk-test".to_string(),
+            free_only: false,
+        },
     )
     .await;
 
@@ -160,12 +166,15 @@ async fn a_refusal_about_neither_stays_unknown() {
     let http = reqwest::Client::new();
     let outcome = provider_sync::sync_connection(
         &http,
-        "mystery",
-        Some("openai"),
-        &format!("{}/v1", upstream.uri()),
-        "connection-1",
-        "sk-test",
-        Some("registry-model"),
+        &provider_sync::SyncTarget {
+            provider: "mystery".to_string(),
+            format: "openai".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("registry-model".to_string()),
+            connection_id: "connection-1".to_string(),
+            token: "sk-test".to_string(),
+            free_only: false,
+        },
     )
     .await;
 
@@ -224,12 +233,15 @@ async fn a_model_the_key_may_not_use_does_not_end_the_measurement() {
     let http = reqwest::Client::new();
     let outcome = provider_sync::sync_connection(
         &http,
-        "sealion",
-        Some("openai"),
-        &format!("{}/v1", upstream.uri()),
-        "connection-1",
-        "sk-test",
-        Some("registry-model"),
+        &provider_sync::SyncTarget {
+            provider: "sealion".to_string(),
+            format: "openai".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("registry-model".to_string()),
+            connection_id: "connection-1".to_string(),
+            token: "sk-test".to_string(),
+            free_only: false,
+        },
     )
     .await;
 
@@ -288,12 +300,15 @@ async fn a_model_without_a_worker_is_probed_with_another_one() {
     let http = reqwest::Client::new();
     let outcome = provider_sync::sync_connection(
         &http,
-        "aihorde",
-        Some("openai"),
-        &format!("{}/v1", upstream.uri()),
-        "connection-1",
-        "sk-test",
-        Some("registry-model"),
+        &provider_sync::SyncTarget {
+            provider: "aihorde".to_string(),
+            format: "openai".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("registry-model".to_string()),
+            connection_id: "connection-1".to_string(),
+            token: "sk-test".to_string(),
+            free_only: false,
+        },
     )
     .await;
 
@@ -351,12 +366,15 @@ async fn a_bare_404_means_the_model_is_not_there() {
     let http = reqwest::Client::new();
     let outcome = provider_sync::sync_connection(
         &http,
-        "nvidia",
-        Some("openai"),
-        &format!("{}/v1", upstream.uri()),
-        "connection-1",
-        "sk-test",
-        Some("registry-model"),
+        &provider_sync::SyncTarget {
+            provider: "nvidia".to_string(),
+            format: "openai".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("registry-model".to_string()),
+            connection_id: "connection-1".to_string(),
+            token: "sk-test".to_string(),
+            free_only: false,
+        },
     )
     .await;
 
@@ -416,12 +434,15 @@ async fn a_model_that_is_not_a_chat_model_does_not_end_the_measurement() {
     let http = reqwest::Client::new();
     let outcome = provider_sync::sync_connection(
         &http,
-        "sealion",
-        Some("openai"),
-        &format!("{}/v1", upstream.uri()),
-        "connection-1",
-        "sk-test",
-        Some("registry-model"),
+        &provider_sync::SyncTarget {
+            provider: "sealion".to_string(),
+            format: "openai".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("registry-model".to_string()),
+            connection_id: "connection-1".to_string(),
+            token: "sk-test".to_string(),
+            free_only: false,
+        },
     )
     .await;
 

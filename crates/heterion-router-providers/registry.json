@@ -8640,6 +8640,65 @@
     ]
   },
   {
+    "id": "opencode-free",
+    "alias": "oc-free",
+    "format": "openai",
+    "executor": "opencode",
+    "auth_type": "optional",
+    "free_only": true,
+    "base_url": "https://opencode.ai/inference/openai/v1",
+    "models": [
+      {
+        "id": "big-pickle",
+        "target_format": null
+      },
+      {
+        "id": "mimo-v2.6-flash-free",
+        "target_format": null
+      },
+      {
+        "id": "deepseek-v4.1-flash-free",
+        "target_format": null
+      },
+      {
+        "id": "longcat-2.5-free",
+        "target_format": null
+      },
+      {
+        "id": "iceman-free",
+        "target_format": null
+      },
+      {
+        "id": "beam-free",
+        "target_format": null
+      },
+      {
+        "id": "flint-40b-free",
+        "target_format": null
+      },
+      {
+        "id": "nemotron-3.5-super-vl-free",
+        "target_format": null
+      },
+      {
+        "id": "jev-1.13-free",
+        "target_format": null
+      },
+      {
+        "id": "nemotron-3.5-lightning-free",
+        "target_format": null
+      },
+      {
+        "id": "hy4-flash-free",
+        "target_format": null
+      },
+      {
+        "id": "tidepool-alpha-free",
+        "target_format": null
+      }
+    ]
+  },
+  {
     "id": "opencode-go",
     "alias": "opencode-go",
     "format": "openai",

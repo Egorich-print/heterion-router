@@ -59,12 +59,15 @@ async fn a_measured_catalogue_is_stored_as_it_arrived() {
 
     let outcome = provider_sync::sync_connection(
         &http,
-        "sambanova",
-        Some("openai"),
-        &format!("{}/v1", upstream.uri()),
-        "connection-1",
-        "sk-test",
-        Some("model-a"),
+        &provider_sync::SyncTarget {
+            provider: "sambanova".to_string(),
+            format: "openai".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("model-a".to_string()),
+            connection_id: "connection-1".to_string(),
+            token: "sk-test".to_string(),
+            free_only: false,
+        },
     )
     .await;
 
@@ -91,12 +94,15 @@ async fn a_quota_reading_is_read_from_the_answer() {
 
     let outcome = provider_sync::sync_connection(
         &http,
-        "sambanova",
-        Some("openai"),
-        &format!("{}/v1", upstream.uri()),
-        "connection-1",
-        "sk-test",
-        Some("model-a"),
+        &provider_sync::SyncTarget {
+            provider: "sambanova".to_string(),
+            format: "openai".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("model-a".to_string()),
+            connection_id: "connection-1".to_string(),
+            token: "sk-test".to_string(),
+            free_only: false,
+        },
     )
     .await;
 
@@ -127,12 +133,15 @@ async fn a_refusal_names_the_remaining_budget() {
 
     let outcome = provider_sync::sync_connection(
         &http,
-        "agentrouter",
-        Some("openai-responses"),
-        &format!("{}/v1", upstream.uri()),
-        "connection-2",
-        "sk-test",
-        Some("gpt-5.6-sol"),
+        &provider_sync::SyncTarget {
+            provider: "agentrouter".to_string(),
+            format: "openai-responses".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("gpt-5.6-sol".to_string()),
+            connection_id: "connection-2".to_string(),
+            token: "sk-test".to_string(),
+            free_only: false,
+        },
     )
     .await;
 
@@ -372,5 +381,56 @@ async fn a_reading_with_a_multiline_answer_keeps_its_state() {
     assert_eq!(
         payload["providers"][0]["state"], "exhausted",
         "the state of the reading must survive a multi-line answer: {payload}"
+    );
+}
+
+/// An anonymous area serves the models it prices at zero and refuses the rest
+/// (`401 Missing API key`, OpenCode Zen, probed live 2026-11-20). The
+/// measured catalogue of such a provider keeps only the free models, so the
+/// ladder does not offer models that cannot answer.
+#[tokio::test]
+async fn a_free_only_provider_keeps_only_the_models_the_platform_prices_at_zero() {
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[
+                {"id":"free-model","cost":{"text":{"input":{"price":0}}}},
+                {"id":"paid-model","cost":{"text":{"input":{"price":2.5}}}},
+                {"id":"unpriced-model"}
+            ]}"#,
+        ))
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"id":"x","choices":[]}"#))
+        .mount(&upstream)
+        .await;
+
+    let http = reqwest::Client::new();
+    let outcome = provider_sync::sync_connection(
+        &http,
+        &provider_sync::SyncTarget {
+            provider: "opencode-free".to_string(),
+            format: "openai".to_string(),
+            base_url: format!("{}/v1", upstream.uri()),
+            model: Some("free-model".to_string()),
+            connection_id: "connection-1".to_string(),
+            token: "public".to_string(),
+            free_only: true,
+        },
+    )
+    .await;
+
+    let ids: Vec<&str> = outcome
+        .catalog
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["free-model"],
+        "only the zero-priced model may be offered: {ids:?}"
     );
 }
