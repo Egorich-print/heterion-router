@@ -241,10 +241,15 @@ Toolchain закреплён `1.99.1` в `rust-toolchain.toml`, `rust-version = 
   платной модели → 401 «Missing API key.»; на бесплатной → 429
   `FreeUsageLimitError` («Free usage limit reached… subscribe to OpenCode Go»)
   с `Retry-After: 51509` (≈14 ч). Без заголовка вообще — то же самое (сервер
-  сам считает запрос анонимным). Анонимная квота **общая на клиента**: ни
-  `x-opencode-session`, ни `x-opencode-client`, ни `x-opencode-project`, ни
-  `x-opencode-request` её не меняют (проверено 6 вариантов) — «наплодить»
-  анонимных ключей бессмысленно.
+  сам считает запрос анонимным). Анонимная квота **общая на всех анонимов, а
+  не по клиенту**: проверено на разных сетевых идентичностях — IPv4
+  37.120.49.34 и IPv6 2a02:2455:… (тот же счётчик, `Retry-After` отличается на
+  секунду), внешние прокси с exit-IP из разных стран и разных PoP Cloudflare
+  (FRA, SIN) — везде один и тот же 429 `FreeUsageLimitError` с одним и тем же
+  обратным отсчётом. Заголовки `x-opencode-session`, `x-opencode-client`,
+  `x-opencode-project`, `x-opencode-request` тоже не влияют (6 вариантов).
+  Итог: **резидентские прокси не помогают** — анонимный пул один на всех,
+  «несколько бесплатных клиентов» в анонимном режиме не существует.
 - **Настоящие ключи выпускает консоль под учётной записью.** Device-flow:
   `POST https://opencode.ai/console/auth/device/code` {`client_id`: `opencode-cli`}
   → `user_code` + `verification_uri_complete` (`/console/device?user_code=…`,
