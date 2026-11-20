@@ -10,6 +10,7 @@ use heterion_router_crypto::{FieldCrypto, load_secret};
 use heterion_router_db::Db;
 use heterion_router_gateway::{
     AppState, StatusAwareBackend,
+    antigravity::{self, AntigravityBackend},
     backend::ChatBackend,
     backend::EchoBackend,
     build_router_with_state,
@@ -223,6 +224,41 @@ fn provider_base_url_from(
 /// of a platform must reach the same address the backend reaches.
 use heterion_router_gateway::placeholders::expand_placeholders;
 
+/// Credentials for the Antigravity executor.
+///
+/// The Antigravity IDE keeps its Google credential in the macOS keychain, so
+/// that is where the router looks first; a `provider_connections` row for the
+/// `antigravity` provider wins when one exists, because an operator who
+/// pasted a token into the router meant that token to be used.
+fn antigravity_credentials(
+    db: &Db,
+    crypto: Option<&FieldCrypto>,
+) -> Vec<heterion_router_gateway::antigravity::Credential> {
+    let stored: Vec<heterion_router_gateway::antigravity::Credential> = {
+        let guard = db.connection();
+        load_credentials(&guard, "antigravity", crypto)
+            .unwrap_or_default()
+            .into_iter()
+            .map(
+                |credential| heterion_router_gateway::antigravity::Credential {
+                    token: credential.token,
+                    refresh_token: credential.refresh_token,
+                },
+            )
+            .collect()
+    };
+    if !stored.is_empty() {
+        return stored;
+    }
+    match heterion_router_gateway::antigravity::read_keychain_credential() {
+        Ok(credential) => vec![credential],
+        Err(error) => {
+            tracing::info!("antigravity credential unavailable: {error}");
+            Vec::new()
+        }
+    }
+}
+
 /// Active `provider_connections` rows per provider id, ordered by id.
 ///
 /// The counts are what makes a dropped connection visible: a provider id
@@ -360,6 +396,47 @@ fn select_backend(
     ));
     let providers = active_connection_counts(&db);
     let mut unserved: BTreeMap<String, usize> = BTreeMap::new();
+
+    // Antigravity (Google AI Code / Cloud Code). The credential is not a
+    // database row but the macOS keychain item the Antigravity IDE writes,
+    // so the provider is wired up from the keychain instead of from
+    // `provider_connections`. The registry lists the platform twice — under
+    // its own id and under the short `agy` alias — and both have to resolve,
+    // or a stored reference to either one finds no executor.
+    //
+    // The executor is **off unless it is asked for**. The wire contract is
+    // measured (auth, refresh, the Cloud Code endpoints), but the model
+    // reference the inference endpoint accepts is not settled yet: the daily
+    // host answers `404 Requested entity was not found` and the production
+    // host answers `429` on an exhausted quota. A provider that cannot serve
+    // a request must not sit in the live ladder, so the wiring waits for
+    // `HETERION_ROUTER_ANTIGRAVITY=1`.
+    if std::env::var("HETERION_ROUTER_ANTIGRAVITY").ok().as_deref() == Some("1") {
+        for provider in ["antigravity", "agy"] {
+            if registry.get(provider).is_none() {
+                continue;
+            }
+            let credentials = antigravity_credentials(&db, crypto.as_ref());
+            if credentials.is_empty() {
+                tracing::info!(
+                    "backend unavailable: {provider} (no credential in the keychain or the database)"
+                );
+                continue;
+            }
+            let base_url = provider_base_url_from(&registry, provider, None)
+                .unwrap_or_else(|| antigravity::DEFAULT_BASE_URL.to_string());
+            let project = std::env::var("HETERION_ROUTER_ANTIGRAVITY_PROJECT")
+                .unwrap_or_else(|_| antigravity::DEFAULT_PROJECT.to_string());
+            match AntigravityBackend::new(base_url.clone(), project, credentials, None) {
+                Ok(backend) => {
+                    tracing::info!("backend available: {provider} (cloud code, {base_url})");
+                    backends.insert(provider.to_string(), status_aware(Arc::new(backend)));
+                }
+                Err(error) => tracing::warn!("backend {provider} skipped: {error}"),
+            }
+        }
+    }
+
     for provider in providers.keys() {
         if backends.contains_key(provider) {
             continue;

@@ -6,6 +6,7 @@
 //! translation layer in front of [`backend::ChatBackend`] later.
 
 pub mod admin;
+pub mod antigravity;
 pub mod apikeys;
 pub mod auth;
 pub mod backend;

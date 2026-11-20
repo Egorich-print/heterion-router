@@ -109,30 +109,26 @@
     "format": "antigravity",
     "executor": "antigravity",
     "auth_type": "oauth",
-    "base_url": null,
+    "base_url": "https://daily-cloudcode-pa.googleapis.com",
     "models": [
       {
-        "id": "gemini-3.7-flash-high",
+        "id": "gemini-3.8-flash-high",
         "target_format": null
       },
       {
-        "id": "gemini-3.7-flash-medium",
+        "id": "gemini-3.8-flash-medium",
         "target_format": null
       },
       {
-        "id": "gemini-3.7-flash-low",
+        "id": "gemini-3.8-flash-low",
         "target_format": null
       },
       {
-        "id": "gemini-3.7-flash-tiered",
+        "id": "gemini-3.8-flash-tiered",
         "target_format": null
       },
       {
-        "id": "gemini-pro-agent",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.1-pro-low",
+        "id": "gemini-3.5-flash-lite",
         "target_format": null
       },
       {
@@ -140,11 +136,11 @@
         "target_format": null
       },
       {
-        "id": "claude-opus-4-6-thinking",
+        "id": "claude-sonnet-4-6",
         "target_format": null
       },
       {
-        "id": "claude-sonnet-4-6",
+        "id": "claude-opus-4-6-thinking",
         "target_format": null
       },
       {
@@ -513,30 +509,26 @@
     "format": "antigravity",
     "executor": "antigravity",
     "auth_type": "oauth",
-    "base_url": null,
+    "base_url": "https://daily-cloudcode-pa.googleapis.com",
     "models": [
       {
-        "id": "gemini-3.7-flash-high",
+        "id": "gemini-3.8-flash-high",
         "target_format": null
       },
       {
-        "id": "gemini-3.7-flash-medium",
+        "id": "gemini-3.8-flash-medium",
         "target_format": null
       },
       {
-        "id": "gemini-3.7-flash-low",
+        "id": "gemini-3.8-flash-low",
         "target_format": null
       },
       {
-        "id": "gemini-3.7-flash-tiered",
+        "id": "gemini-3.8-flash-tiered",
         "target_format": null
       },
       {
-        "id": "gemini-pro-agent",
-        "target_format": null
-      },
-      {
-        "id": "gemini-3.1-pro-low",
+        "id": "gemini-3.5-flash-lite",
         "target_format": null
       },
       {
@@ -544,11 +536,11 @@
         "target_format": null
       },
       {
-        "id": "claude-opus-4-6-thinking",
+        "id": "claude-sonnet-4-6",
         "target_format": null
       },
       {
-        "id": "claude-sonnet-4-6",
+        "id": "claude-opus-4-6-thinking",
         "target_format": null
       },
       {

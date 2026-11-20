@@ -1013,6 +1013,71 @@ budgets → cache. Слой, который блокирует запрос, о�
   Совпадение никогда не попадает в тело, заголовок или лог — только имя
   проверки и маска.
 
+## Antigravity как клиент Heterion (замер 21.11.2026)
+
+Antigravity 2.32.1 умеет работать через **LLM gateway** — это штатный env, а не
+хак. Ключи (разобраны реверсом `language_server`, пакет `admincontrols`):
+
+- `AGY_LLM_GATEWAY_URL` — базовый URL **без** `/v1` (хвост `/v1` тоже
+  допустим); plain http разрешён только для loopback
+  (`localhost`, `127.0.0.0/8`, `::1`), иначе IDE требует https.
+- `AGY_LLM_GATEWAY_API_KEY` → заголовок `Authorization: Bearer <key>`.
+- `AGY_LLM_GATEWAY_WIRE_PROTOCOL` — ровно `openai` или `genai` (регистр
+  сравнивается без учёта регистра при разборе запроса). При `openai` IDE
+  шлёт `POST {base}/v1/chat/completions`, при `genai` —
+  `{base}/v1beta/models/{model}:streamGenerateContent?alt=sse`.
+- `AGY_LLM_GATEWAY_MODELS` — список id через запятую (без пробелов вокруг,
+  `id=display` не поддерживается).
+- `AGY_LLM_GATEWAY_TIER_PRO` / `_TIER_FLASH` / `_TIER_FLASH_LITE` — по одному
+  id модели на тир (без запятых!). Тир — это класс модели: `flash_lite`
+  (саб-агенты и быстрые вызовы), `flash`, `pro`.
+- `AGY_LLM_GATEWAY_HEADERS` — JSON-объект либо CSV-строки `Key: Value`;
+  значение должно состоять только из букв, цифр, `-` и `_`.
+
+Env читает **language server**, поэтому переменные надо выставить **до**
+запуска IDE: `launchctl setenv AGY_LLM_GATEWAY_URL …` (GUI-приложения
+наследуют env launchd) — и перезапустить Antigravity.
+
+**Контракт, который ломает ожидания: каталог моделей в IDE один.**
+`GetModelCatalog` выбирает ровно один источник, по очереди:
+Tier 1 — inline `models.list` (то есть `AGY_LLM_GATEWAY_MODELS`),
+Tier 2 — удалённый каталог Google (родные модели),
+Tier 3 — discovery шлюза (`GET {base}/v1/models`),
+Tier 4 — встроенный каталог по умолчанию. Пока задан `AGY_LLM_GATEWAY_URL`,
+родные модели Google из пикера **исчезают**, а их место занимают модели
+роутера (замер: в пикере остались только `auto`, `auto-subagent`,
+`auto-fast`, `auto-free`). Локальная запись в
+`~/.gemini/antigravity/antigravity_state.pbtxt`
+(`custom_models_config.custom_models`) файл переживает, но в пикер **не
+попадает** — IDE берёт `appState` от сервера.
+
+Чтобы «родные и auto-комбо» были в одном списке, родные модели должен
+обслуживать сам роутер: в реестре есть провайдер `antigravity`
+(`format: antigravity`, `executor: antigravity`, `auth: oauth`), и исполнитель
+теперь написан — `crates/heterion-router-gateway/src/antigravity.rs` (Code
+Assist, `daily-cloudcode-pa.googleapis.com`; протокол разобран и измерен —
+`docs/research/ANTIGRAVITY-CODEASSIST-PROTOCOL-2026-11-21.md`).
+
+**Но включать его в живой шлюз пока нельзя:** auth, refresh и сами endpoints
+измерены, а **ссылка на модель**, которую принимает endpoint инференции, — нет:
+на daily-хосте `404 Requested entity was not found`, на прод-хосте `429`
+(квота аккаунта исчерпана). Провайдер, который не может обслужить запрос, не
+должен стоять в живой лестнице, поэтому обвязка включается только явно:
+`HETERION_ROUTER_ANTIGRAVITY=1` (по умолчанию выключено).
+
+Креды Antigravity берутся из **keychain** (service `gemini`, account
+`antigravity`), OAuth-секрет клиента — из установленного IDE в рантайме; в
+репозитории, логах и сообщениях об ошибках их нет (`Debug` у `Credential`,
+`OAuthClient` и `AntigravityBackend` их маскирует).
+
+Ключ роутера для Antigravity лежит **вне репозитория**:
+`~/.config/heterion/antigravity-gateway.key` (0600, выдан через
+`POST /api/keys`, показывается один раз). В чат и в логи он не попадает.
+
+Откат к родным моделям — снять переменные и перезапустить IDE:
+`launchctl unsetenv AGY_LLM_GATEWAY_URL` (и `…_API_KEY`, `…_MODELS`,
+`…_TIER_*`), затем перезапуск Antigravity.
+
 ## Аудит 2026-10
 
 Шесть read-only-отчётов в `docs/research/audit-2026-10/` (слабые места, паритет
