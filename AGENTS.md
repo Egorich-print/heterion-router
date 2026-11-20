@@ -232,6 +232,45 @@ Toolchain закреплён `1.99.1` в `rust-toolchain.toml`, `rust-version = 
   pay-as-you-go — `https://opencode.ai/inference/openai/v1`, Go —
   `https://opencode.ai/inference/go/openai/v1`; старые `zen/v1` и `zen/go/v1`
   ещё отвечают, но это не документированные пути.
+- **«Ключ без входа» у OpenCode — это литерал `public`, а не ключ.** Механизм
+  в бинаре клиента (`~/.opencode/bin/opencode`, 1.18.35): если нет
+  `OPENCODE_API_KEY`, нет подключённой учётки и в провайдере нет ключа, клиент
+  подставляет в тело запроса строку `apiKey = "public"` и отключает все модели
+  с ненулевой ценой входа. Площадка принимает такой «ключ» как **анонимный
+  доступ — только бесплатные модели Zen**. Замер 20.11.2026: `Bearer public` на
+  платной модели → 401 «Missing API key.»; на бесплатной → 429
+  `FreeUsageLimitError` («Free usage limit reached… subscribe to OpenCode Go»)
+  с `Retry-After: 51509` (≈14 ч). Без заголовка вообще — то же самое (сервер
+  сам считает запрос анонимным). Анонимная квота **общая на клиента**: ни
+  `x-opencode-session`, ни `x-opencode-client`, ни `x-opencode-project`, ни
+  `x-opencode-request` её не меняют (проверено 6 вариантов) — «наплодить»
+  анонимных ключей бессмысленно.
+- **Настоящие ключи выпускает консоль под учётной записью.** Device-flow:
+  `POST https://opencode.ai/console/auth/device/code` {`client_id`: `opencode-cli`}
+  → `user_code` + `verification_uri_complete` (`/console/device?user_code=…`,
+  600 с); обмен — `POST /console/auth/device/token`
+  (`grant_type=urn:ietf:params:oauth:grant-type:device_code`). Код выдаётся
+  **без входа**, но подтвердить его без сессии нельзя:
+  `GET /console/auth/device/details` → 401 «Invalid or expired session»,
+  `POST /console/auth/device/approve` → 400 `DeviceApproveFailed`. Регистрация
+  консоли — `POST /console/auth/register` (email + password + challengeToken).
+- **Формат ключей консоли:** `oc_sk_<12 hex>_<32 симв.>` либо `sk-<64 симв.>`;
+  у ключа есть `permissions` (`all`/`read`/`restricted`/`inference-only`),
+  `scopes` (в том числе `keys:write`), `expiresAt`, `ipAllowlist`. API выпуска:
+  `POST /console/api/service-accounts` → `POST
+  /console/api/service-accounts/{id}/keys` (ответ содержит `token` — он
+  показывается один раз). Без сессии эти пути отвечают 401 (то есть
+  существуют), а `/console/api/keys` → 404 (такого пути нет).
+- **Go — платная подписка; квота привязана к подписке, а не к числу ключей.**
+  Страница `/console/go` (замер 20.11.2026): Go $10/мес, Go Plus $40/мес, у
+  каждой модели «Relative request allowances» на 5 ч и месячный лимит. Площадка:
+  `Bearer public` → 401 «OpenCode Go requires an API key»; без
+  `x-opencode-session` → 400 «Request is missing x-opencode-session and cannot
+  be routed efficiently».
+- **Инструмент:** `scripts/opencode_keys.py` — `list` / `mint --count N` /
+  `probe` через свою сессию консоли (`OPENCODE_CONSOLE_TOKEN` или
+  `OPENCODE_CONSOLE_COOKIE`). Учётные записи не создаёт: только ключи внутри
+  уже оплаченной подписки.
 - **Для агентной работы по умолчанию — `gpt-5.6-sol`.** Замер 2026-10-28
   (по 8 вызовов на модель, вперемешку, обычная задача + стрим): `gpt-5.6-sol`
   — 8/8 успех, медиана 9.0 с; `gpt-6-astra` — 8/8, медиана 19.8 с;
@@ -481,8 +520,8 @@ JSON-404 → `not_a_chat_api`; HTML-404/410 → `dead_endpoint`; 405 →
 | `command-code` | был неверен (`api.commandcode.ai` → 404) | **истёк**: «Your API key has expired… run `cmd login`» | новый ключ; адрес исправлен на документированный Provider API |
 | `blackbox` | был неверен (`api.blackbox.ai` → 404) | **мёртв**: «Invalid API key» | новый ключ; адрес исправлен на `enterprise.blackbox.ai` |
 | `sambanova` | верен | **мёртвы все пять**: 401 `invalid_api_key` | новые ключи |
-| `opencode-go` | верен | **мёртв**: «Invalid credential» | новый ключ формата `oc_sk_…`; заголовок `x-opencode-session` роутер теперь шлёт |
-| `opencode` | — | ключа в соединении **нет** вовсе | нужен ключ |
+| `opencode-go` | верен | **мёртв**: «Invalid credential» (проверено 20.11.2026 и на `/zen/v1/models`, и на `/zen/go/v1/models`; формат ключа в БД верный — `sk-<64>`) | новый ключ формата `oc_sk_…` из консоли; заголовок `x-opencode-session` роутер теперь шлёт |
+| `opencode` | — | ключа в соединении **нет** вовсе; без ключа площадка работает анонимно (`public`) — только бесплатные модели Zen, квота общая на клиента | можно оставить без ключа (аноним) либо вписать `public` явно; платные модели Zen без ключа недоступны |
 | `kimi-coding` | верен | OAuth-токен истёк 17.09.2026 | вход владельца: автоматического refresh в Rust-шлюзе нет |
 
 **Правило «только по измеренным отказам» работает и здесь:** адрес площадки
