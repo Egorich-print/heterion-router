@@ -39,11 +39,11 @@
 |---|---|---|
 | Реестр и провайдеры | работает; враньё в документации | 275 провайдеров / 2373 модели; 46 served, 182 needs_key, 14 dead_endpoint |
 | Маршрутизация и деградация | пороги зафиксированы; 429-баланс трактуется как квота | кулдаун 30→60→120 с; breaker 3 подряд / 60 с; фриз баланса 1 ч только на 402/403 |
-| Responses-контракт | частичный, fail-closed не доведён | reasoning-items теряются; нет `output_item.done`/`response.created`; storage key = upstream id |
+| Responses-контракт | частичный, fail-closed не доведён | reasoning-items теряются; в мосте chat→Responses нет `output_item.done`/`response.created`; storage key = upstream id |
 | GPUI-десктоп | впереди веб-дашборда, но вне CI | 8 экранов против 7; 82 теста не идут ни в одном контуре |
 | CI и релиз | единственный живой контур — Jenkins; macOS-артефакт не собирает никто | `REPO_HAS_RELEASE='no'`; `REPO_RELEASE_HOOK` пуст; тулчейн 1.99.0 против пина 1.99.1 |
-| Документация | врёт в числах, ссылках и статусах | 13 расхождений; индекс ADR обрывается на ADR-024 |
-| Тестовое покрытие | 1049 атрибутов в workspace, 82 — вне гейта | 781 unit + 268 интеграционных; `sync_all()` — 451 строка без тестов |
+| Документация | врёт в числах, ссылках и статусах | 11 пунктов в §3.5; индекс ADR обрывается на ADR-024 |
+| Тестовое покрытие | 1049 атрибутов в workspace, 82 — вне гейта | 781 unit + 268 интеграционных; `provider_sync.rs` (451 строка) — без тестов |
 
 ## 3. Найденные факты
 
@@ -66,7 +66,7 @@
 |---|---|
 | 1049 тест-атрибутов: 781 unit + 268 интеграционных; в `gateway/tests/` — 33 файла | подсчёт по `crates/*/src` и `crates/*/tests` |
 | **82 теста `desktop/gpui` (76 `#[test]` + 6 `#[gpui::test]`) не выполняются ни в одном CI**: крейт вне workspace, гейт делает для него только fmt | `Cargo.toml:23-24`, `scripts/ci/check.sh:27`, `.github/workflows/ci.yml:49-63` |
-| `sync_all()` — 451 строка, **ни одного теста**; `repos::list_connections(&guard).unwrap_or_default()` превращает ошибку БД в «нет соединений» — sweep тихо ничего не измеряет | `provider_sync.rs:386`, `:394` |
+| Файл `provider_sync.rs` — 451 строка, функция `sync_all` — `:386-451` (66 строк), **ни одного теста**; `repos::list_connections(&guard).unwrap_or_default()` превращает ошибку БД в «нет соединений» — sweep тихо ничего не измеряет | `provider_sync.rs:386`, `:394` |
 | Конкурентная запись в БД (`buffer_unordered(8)`) при съедаемой ошибке ⇒ каталог молча устаревает | `provider_sync.rs:443` |
 
 ### 3.3 Код: риски
@@ -88,7 +88,7 @@
 |---|---|
 | **275 провайдеров / 2373 модели**. Форматы: openai 252, claude 9, openai-responses 6, gemini 3, antigravity 2, clova 1, custom 1, kiro 1. Auth: apikey 225, oauth 20, none 19, optional 10, cookie 1. `free_only: true` — ровно один (`opencode-free`) | `crates/heterion-router-providers/registry.json` |
 | Живая классификация площадок: 46 served, 182 needs_key, 14 dead_endpoint, 14 not_a_chat_api, 5 credits_required, 6 not_served | `docs/research/provider-matrix-2026-11-16.md:5-15` |
-| Выключены: `agentrouter` — 403 insufficient_user_quota («user quota: $0.004456, need quota: $0.032528», 17.11); `sambanova` (5 ключей) — 401; `blackbox`, `command-code` — 404; `kimi-coding` — 401, OAuth-токен истёк 17.09; `grok-cli` — 400 client_id is required; `opencode-go` — «Invalid credential»; `minimax` — 402; `ollama-cloud-main` — 402 | `AGENTS.md:539-545`, `:681`, `:746-756` |
+| Выключены: `agentrouter` — 403 insufficient_user_quota («user quota: $0.004456, need quota: $0.032528», 17.11); `sambanova` (5 ключей) — 401; `blackbox`, `command-code` — 404; `kimi-coding` — 401, OAuth-токен истёк 17.09; `grok-cli` — 400 client_id is required; `opencode-go` — «Invalid credential»; `minimax` — 402; `ollama-cloud-main` — 402 | `AGENTS.md:539-545`, `:681`, `:699`, `:738`, `:752` |
 | **Пробел в правилах:** `zai` отдаёт 429 «Insufficient balance or no resource package» (баланс, не квота), а любой 429 трактуется как модельный кулдаун ⇒ площадка остаётся в ротации и платит отказом каждый запрос. Правила «баланс → провайдерский фриз» нет; есть только 402/403 → фриз на час | `docs/research/COMBO-REBUILD-2026-11-05.md:88`, `routing.rs:2301`, `:2592`, `resilience.rs:188` |
 | `sealion` — измерен 400 ContextWindowExceededError при `max_completion_tokens=32000` и промпте 110 761 символ. Потолок **вывода** есть (32 000), потолок **входа** (`max_payload_chars`) — только у oneminai | `AGENTS.md:867-868`, `provider_caps.rs:112`, `:149-153` |
 | `max_output_tokens` сравнивает id модели **регистрозависимо** (`"SEA-LION-v4-32B"`), а `allowed_efforts` — нормализованно ⇒ клиент с другим регистром молча теряет потолок 32 000 и получает 400 площадки | `provider_caps.rs:102`, `:112`, `:34` |
@@ -126,9 +126,10 @@
 
 | Факт | Доказательство |
 |---|---|
-| Objective: «честный шлюз под агентным циклом и воспроизводимый как артефакт». Закрыто: B1, B3, B7, C6, D2, D3, D4, D5, E3, E4, E6, E7, E9, F8, F10, H3, H4. Не закрыто: B2, B4, C1, C4, C5, D6–D10, E1, E2, E5, E8, F1–F3, F6, G2–G12, H1 | `docs/MISSION-2026-10.md:180-281` |
-| Дыры: **B2** — `reasoning`-items выбрасываются молча, кода `unsupported_capability` нет; **B4** — `output_item.added` с `call_id:""`, нет `output_item.done`/`response.created`; **C1** — ключ storage = upstream-id ⇒ провайдер, вернувший чужой id, перезаписывает чужую запись; **D10** — в `usage_history.status` живут два словаря; **E2** — `PATCH /api/keys/{id}` отсутствует; **E5** — 0600 не гарантирован для `gateway.log` и signature-файла | `lib.rs:2367-2369`, `:2644-2651`, `:2490-2493`, `:946`, `docs/MISSION-2026-10.md:93`, `lib.rs:430-432`, `main.rs:941`, `gemini.rs:117` |
-| Остаток ≈ **15–22 человеко-дня** против заявленной полосы миссии 20.5–32 дня; план писался до перевода десктопа на GPUI (F2, F3, F7, F12 ссылаются на `desktop/src-tauri`) | `docs/MISSION-2026-10.md:294`, `:239-251` |
+| Objective: «честный шлюз под агентным циклом и воспроизводимый как артефакт». Закрыто: B1, B3, B7, C6, D2, D3, D4, D5, E3, E4, E6, E7, E9, F8, F10, H3, H4. Не закрыто: B2, B4, C1, C4, C5, D6–D10, E1, E2, E5, E8, F1–F3, F6, G2–G12, H1; G1 — частично (42 вызова `.verify()` против 71 wiremock-`.expect(...)`: ассерты не все верифицируются) | `docs/MISSION-2026-10.md:180-281` (план и DoD) |
+| Дыры: **B2** — `reasoning`-items выбрасываются молча, кода `unsupported_capability` нет; **B4** — `output_item.added` с `call_id:""`, в мосте chat→Responses нет `output_item.done`/`response.created` (в отдельном Responses-потоке `grok_cli.rs:710` событие `response.output_item.done` есть); **C1** — ключ storage = upstream-id ⇒ провайдер, вернувший чужой id, перезаписывает чужую запись; **D10** — в `usage_history.status` живут два словаря; **E2** — `PATCH /api/keys/{id}` отсутствует; **E5** — 0600 не гарантирован для `gateway.log` и signature-файла | `lib.rs:2367-2369`, `:2644-2651`, `:2490-2493`, `:946`, `docs/MISSION-2026-10.md:93`, `lib.rs:430-432`, `main.rs:941`, `gemini.rs:117`, `grok_cli.rs:710` |
+| Статусы пунктов ниже — сверка с кодом, а не выписка из документа: в самом `MISSION-2026-10.md` отметок выполнения нет, статус делегирован ADR-012 | `docs/MISSION-2026-10.md:180-281` (план и DoD), `:53` (отсылка к ADR-012) |
+| Остаток ≈ **15–22 человеко-дня** против заявленной полосы миссии 20.5–32 дня; план писался до перевода десктопа на GPUI: **F8** и **F9** ссылаются на `desktop/src-tauri`, F2/F3/F7 — на `tauri dev` и `tauri.conf.json`, F12 — на `stage-sidecar.sh` (всё это удалено) | `docs/MISSION-2026-10.md:294`, `:239-251` |
 
 ## 4. Проблемы
 
@@ -229,7 +230,7 @@ Responses нечем будет ловить. Оценка остатка — 15
 | `jq` по `registry.json` с фильтром `is_key_provider` (`admin.rs:791-807`) | 220 провайдеров / 2042 модели в каталоге |
 | подсчёт `#\[test\]\|#\[tokio::test\]` по `crates/*/src` и `crates/*/tests` | 781 unit + 268 интеграционных |
 | тот же подсчёт по `desktop/gpui` | 82 (76 `#[test]` + 6 `#[gpui::test]`) |
-| `wc -l crates/heterion-router-gateway/src/provider_sync.rs` | 451 строка без тестов |
+| `wc -l crates/heterion-router-gateway/src/provider_sync.rs` | 451 строка, `sync_all` — `:386-451`; тестов нет |
 | `scripts/ci/check.sh` | родной гейт: fmt (включая `desktop/gpui`), clippy `-D warnings`, `cargo test --workspace` |
 | `cargo fmt --manifest-path desktop/gpui/Cargo.toml -- --check` | единственное, что CI делает для десктопа |
 | `npm --prefix desktop/ui ci && npm --prefix desktop/ui run build` | сборка веб-дашборда |
